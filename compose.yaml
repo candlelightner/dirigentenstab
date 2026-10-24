@@ -16,6 +16,8 @@ services:
       APP_TLS_CERT: /run/secrets/tls_cert
       APP_TLS_KEY: /run/secrets/tls_key
       SSH_NETWORKS: ${SSH_NETWORKS:-10.253.80.0/24}
+      SSH_SOURCE_CIDR: ${SSH_SOURCE_CIDR:-10.253.80.1/32}
+      MAX_HIERARCHY_DEPTH: ${MAX_HIERARCHY_DEPTH:-10}
       PYTHONDONTWRITEBYTECODE: '1'
     volumes:
       - app_data:/data
@@ -50,6 +52,7 @@ services:
 volumes:
   app_data:
     name: dirigentenstab_data
+    external: true
 networks:
   management:
     ipam:

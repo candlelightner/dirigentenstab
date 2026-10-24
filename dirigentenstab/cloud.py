@@ -14,7 +14,9 @@ from uuid import UUID
 
 
 class CloudError(RuntimeError):
-    pass
+    def __init__(self, message, *, rejected=False):
+        super().__init__(message)
+        self.rejected = rejected
 
 
 # This is an authorization policy, not an API specification. Signatures come from listApis.
@@ -137,10 +139,37 @@ class Cloud:
         readers = [asyncio.create_task(read(proc.stdout)), asyncio.create_task(read(proc.stderr))]
         try:
             async with asyncio.timeout(90):
-                stdout, _ = await asyncio.gather(*readers)
+                stdout, stderr = await asyncio.gather(*readers)
                 await proc.wait()
             if proc.returncode:
-                raise CloudError('CloudStack rejected the operation or could not be reached')
+                message = 'CloudStack rejected the operation or could not be reached'
+                rejected = False
+                text = stdout.decode(errors='replace') + '\n' + stderr.decode(errors='replace')
+                hidden = list(self.credentials.values())
+                for arg in args:
+                    if '=' in arg:
+                        key, value = arg.split('=', 1)
+                        if SENSITIVE_FIELD.search(key) or len(value) > 64:
+                            hidden.append(value)
+                try:
+                    error = json.JSONDecoder().raw_decode(text[text.index('{'):])[0]
+                    if 'errorresponse' in error:
+                        error = error['errorresponse']
+                    if 'errorcode' not in error:
+                        error = next(value for value in error.values()
+                                     if isinstance(value, dict) and 'errorcode' in value)
+                    code = int(error['errorcode'])
+                    detail = str(error.get('errortext', ''))
+                    detail = str(redact(detail, hidden))[:400]
+                    message = f'CloudStack error {code}: {detail}'
+                    rejected = code in {400, 401, 403, 431, 435, 436, 535}
+                except (ValueError, KeyError, TypeError, UnicodeError, StopIteration):
+                    match = re.search(r'\(HTTP (\d{3}), error code \d+\)\s*(.*)', text, re.S)
+                    if match:
+                        status = int(match[1])
+                        message = f'CloudStack HTTP {status}: ' + str(redact(match[2], hidden))[:400]
+                        rejected = status in {400, 401, 403, 431, 435, 436, 535}
+                raise CloudError(message, rejected=rejected)
             return stdout
         finally:
             for reader in readers:
@@ -179,7 +208,8 @@ class Cloud:
                     config.write(handle)
                 # cmk sync populates its maintained catalogue; never invoke its interactive shell.
                 await self._process(directory, ['sync'], 8192)
-                data = await self._process(directory, [command, *args], 4 * 1024 * 1024)
+                limit = 16 * 1024 * 1024 if command == 'listApis' else 4 * 1024 * 1024
+                data = await self._process(directory, [command, *args], limit)
         try:
             result = json.loads(data) if data.strip() else {}
         except (ValueError, UnicodeError):

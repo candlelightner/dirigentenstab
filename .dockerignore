@@ -9,4 +9,5 @@ __pycache__
 .ruff_cache
 *.db*
 tests
-docs
+docs/*
+!docs/THIRD_PARTY.md

@@ -25,6 +25,12 @@ class Settings:
     session_seconds: int = 3600
     max_output: int = 65536
     ssh_networks: str = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+    ssh_source_cidr: str = '10.253.80.1/32'
+    max_hierarchy_depth: int = 10
+
+    def __post_init__(self):
+        if type(self.max_hierarchy_depth) is not int or self.max_hierarchy_depth < 1:
+            raise ValueError('MAX_HIERARCHY_DEPTH must be a positive integer')
 
     @classmethod
     def load(cls):
@@ -37,4 +43,6 @@ class Settings:
                    key_file=os.getenv('MASTER_KEY_FILE', '/run/secrets/master_key'),
                    cmk=os.getenv('CMK_BINARY', '/usr/local/bin/cmk'),
                    workspace=os.getenv('TRANSFER_WORKSPACE', '/data/transfers'),
-                   ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'))
+                   ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'),
+                   ssh_source_cidr=os.getenv('SSH_SOURCE_CIDR', '10.253.80.1/32'),
+                   max_hierarchy_depth=int(os.getenv('MAX_HIERARCHY_DEPTH', '10')))

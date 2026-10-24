@@ -47,6 +47,7 @@ class Auth:
                 raise PermissionError('Invalid CloudStack login') from None
         if private['type'] not in {1, 2}:
             raise PermissionError('Use a CloudStack root or domain administrator account')
+        self.store.execute('DELETE FROM login_attempts WHERE bucket IN (?,?)', tuple(buckets))
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         self.store.execute('DELETE FROM sessions WHERE expires<?', (now,))
         self.store.execute('INSERT INTO sessions(token_hash,csrf,identity,expires) VALUES(?,?,?,?)',

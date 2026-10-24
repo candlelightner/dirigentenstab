@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import time
@@ -10,6 +11,8 @@ import httpx
 
 from .cloud import Cloud, CloudError, PROVISION_APIS, RUNTIME_APIS, redact, validate
 from .settings import endpoint
+from .hierarchy import validate_child
+from .limits import VM_POLICY_COMMANDS, check_vm_policy
 
 
 def first(response, key):
@@ -146,6 +149,12 @@ class Service:
         agent = await self.agent(agent_id)
         cloud = await self.cloud_client(agent)
         try:
+            if command in VM_POLICY_COMMANDS:
+                metadata = (await cloud.catalogue()).get(command)
+                if not metadata:
+                    raise PermissionError('VM operation unavailable to this CloudStack identity')
+                validate(metadata, params)
+                await check_vm_policy(self, agent, params, command=command)
             if command == 'deployVirtualMachine' and isinstance(params, dict) and self.store.one(
                     'SELECT id FROM managed_templates WHERE id=?', (params.get('templateid'),)):
                 async with self._deploy_lock:
@@ -176,11 +185,16 @@ class Service:
         validate(metadata, params)
         if 'userdata' in params or 'userdataid' in params:
             raise ValueError('Managed templates receive trusted SSH cloud-init; custom userdata is unavailable in v0.1')
+        if params.get('securitygroupnames'):
+            raise ValueError('Use securitygroupids for additional managed VM security groups')
+        group_id = await self._ssh_security_group(cloud)
         op_id = uuid.uuid4().hex
         guest = Guest(self)
         cloud_init, access = await guest.prepare_vm_config(agent['id'])
         name = 'ds-vm-' + op_id[:20]
-        request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode()}
+        groups = [group_id, *str(params.get('securitygroupids', '')).split(',')]
+        request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode(),
+                   'securitygroupids': ','.join(dict.fromkeys(group for group in groups if group))}
         with self.store.connect() as conn:
             conn.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',
                          (op_id, agent['id'], name, self.store.seal(request), 'prepared', time.time()))
@@ -192,7 +206,12 @@ class Service:
         # Keep a returned job ID durable: never redeploy after an ambiguous timeout or crash.
         try:
             result = await cloud.raw('deployVirtualMachine', request)
-        except (CloudError, TimeoutError, OSError):
+        except CloudError as exc:
+            if exc.rejected:
+                self.store.execute("UPDATE vm_deployments SET phase='failed' WHERE id=?", (op_id,))
+                raise
+            raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying') from None
+        except (TimeoutError, OSError):
             raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying') from None
         self.store.execute('UPDATE vm_deployments SET params=?,updated=? WHERE id=?',
                            (self.store.seal({'request': request, 'result': result}), time.time(), op_id))
@@ -212,6 +231,23 @@ class Service:
         vm = first(result, 'virtualmachine')
         self._bind_vm(op_id, vm['id'])
         return result
+
+    async def _ssh_security_group(self, cloud):
+        source = ipaddress.ip_network(self.settings.ssh_source_cidr)
+        if source.prefixlen != source.max_prefixlen or not source.is_private or source.is_loopback:
+            raise ValueError('SSH_SOURCE_CIDR must be one approved private application egress address')
+        name = 'dirigentenstab-managed-ssh'
+        groups = (await cloud.execute('listSecurityGroups', {'securitygroupname': name})).get('securitygroup', [])
+        group = next((g for g in groups if g['name'] == name), None)
+        if not group:
+            group = first(await cloud.execute('createSecurityGroup', {'name': name,
+                          'description': 'SSH only from the private Dirigentenstab application egress'}), 'securitygroup')
+        rules = group.get('ingressrule', [])
+        if not any(r.get('protocol') == 'tcp' and str(r.get('startport')) == '22'
+                   and str(r.get('endport')) == '22' and r.get('cidr') == str(source) for r in rules):
+            await cloud.execute('authorizeSecurityGroupIngress', {'securitygroupid': group['id'], 'protocol': 'tcp',
+                                'startport': 22, 'endport': 22, 'cidrlist': str(source)})
+        return group['id']
 
     def _bind_vm(self, op_id, vm_id):
         with self.store.connect() as conn:
@@ -282,6 +318,8 @@ class Service:
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, cloud, user_id, name, allowed):
+        if not allowed:
+            raise PermissionError('Refusing to issue a key without explicit restricted permissions')
         params = {'id': user_id, 'name': name, 'enddate': time.strftime('%Y-%m-%dT%H:%M:%S+0000',
                                                                      time.gmtime(time.time() + 90 * 86400))}
         for index, api in enumerate(sorted(allowed)):
@@ -290,17 +328,23 @@ class Service:
         value = first(await cloud.raw('registerUserKeys', params), 'userkeys')
         return {'id': value['id'], 'apikey': value['apikey'], 'secretkey': value['secretkey']}
 
-    async def _credentials(self, cloud, user_id, operation_id):
+    async def _credentials(self, cloud, user_id, operation_id, runtime_allowed=None):
         # On a retry, delete any previously issued keys whose response was lost before persistence.
         keys = (await cloud.raw('listUserKeys', {'userid': user_id})).get('userapikey', [])
         for key in keys:
             if key.get('name', '').startswith('ds-' + operation_id):
                 await cloud.raw('deleteUserKeys', {'keypairid': key['id']})
-        runtime = await self._key(cloud, user_id, 'ds-' + operation_id + '-runtime', RUNTIME_APIS)
-        provisioning = await self._key(cloud, user_id, 'ds-' + operation_id + '-provision', PROVISION_APIS)
+        issuer = set(await cloud.catalogue())
+        allowed = RUNTIME_APIS & issuer
+        if runtime_allowed is not None:
+            allowed &= set(runtime_allowed)
+        runtime = await self._key(cloud, user_id, 'ds-' + operation_id + '-runtime', allowed)
+        # CloudStack 4.23 requires a signing key to cover every permission it delegates to a child.
+        envelope = (PROVISION_APIS | allowed) & issuer
+        provisioning = await self._key(cloud, user_id, 'ds-' + operation_id + '-provision', envelope)
         self._remember(runtime)
         self._remember(provisioning)
-        return {'runtime': runtime, 'provisioning': provisioning}
+        return {'runtime': runtime, 'provisioning': provisioning, 'runtime_policy': sorted(allowed)}
 
     async def create_subgroup(self, agent_id, name, model=None, instructions=None):
         parent = await self.agent(agent_id)
@@ -314,15 +358,17 @@ class Service:
             op = self.store.one('SELECT * FROM provisioning WHERE parent_id=? AND name=?', (agent_id, name))
             if not op:
                 op_id = uuid.uuid4().hex
-                self.store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) '
-                                   'VALUES(?,?,?,?,?,?)',
+                self.store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated,provider_id) '
+                                   'VALUES(?,?,?,?,?,?,?)',
                                    (op_id, agent_id, name, model if model is not None else parent['model'],
-                                    instructions if instructions is not None else parent['instructions'], time.time()))
+                                    instructions if instructions is not None else parent['instructions'],
+                                    time.time(), parent['provider_id']))
                 op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
+            runtime_allowed = set(await (await self.cloud_client(parent)).catalogue())
             return await self._provision(op, await self.cloud_client(parent, 'provisioning'),
-                                         parent['domain_id'], parent['provider_id'])
+                                         parent['domain_id'], runtime_allowed)
 
-    async def _provision(self, op, cloud, parent_domain, provider_id):
+    async def _provision(self, op, cloud, parent_domain, runtime_allowed=None):
         op_id, resource = op['id'], 'ds-' + op['id'][:20]
         def save(phase, **fields):
             fields = {'phase': phase, 'updated': time.time(), 'error': None, **fields}
@@ -334,8 +380,13 @@ class Service:
                 row = await self.agent(op_id)
                 return {k: row[k] for k in ('id', 'name', 'domain_id', 'model')}
             if not op['domain_id']:
-                save('creating-domain')
                 name = op['name'] + '--' + resource
+                parents = (await cloud.raw('listDomains', {'id': parent_domain, 'listall': True})).get('domain', [])
+                parent = next((d for d in parents if d['id'] == parent_domain), None)
+                if not parent:
+                    raise PermissionError('Parent domain no longer accessible')
+                validate_child(parent, name, getattr(self.settings, 'max_hierarchy_depth', 10))
+                save('creating-domain')
                 domains = (await cloud.raw('listDomains', {'name': name, 'listall': True})).get('domain', [])
                 domain = next((d for d in domains if d['name'] == name
                                and d.get('parentdomainid') == parent_domain), None)
@@ -363,7 +414,7 @@ class Service:
                 save('account', account_id=account['id'], user_id=user['id'])
             if not op['credentials']:
                 save('issuing-credentials')
-                credentials = await self._credentials(cloud, op['user_id'], op_id)
+                credentials = await self._credentials(cloud, op['user_id'], op_id, runtime_allowed)
                 save('credentials', credentials=self.store.seal(credentials))
             credentials = self.store.open(op['credentials'])
             for purpose in ('runtime', 'provisioning'):
@@ -372,11 +423,11 @@ class Service:
                     raise PermissionError('New credentials failed domain validation')
             with self.store.connect() as conn:
                 conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,'
-                             'provider_id,model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,?,1) '
+                             'provider_id,model,instructions,can_provision,runtime_policy) VALUES(?,?,?,?,?,?,?,?,?,?,1,?) '
                              'ON CONFLICT(id) DO NOTHING',
                              (op_id, op['name'], op['domain_id'], op['account_id'], op['user_id'],
                               self.store.seal(credentials['runtime']), self.store.seal(credentials['provisioning']),
-                              provider_id, op['model'], op['instructions']))
+                              op['provider_id'], op['model'], op['instructions'], json.dumps(credentials['runtime_policy'])))
                 conn.execute("UPDATE provisioning SET phase='complete',credentials=NULL,error=NULL,updated=? WHERE id=?",
                              (time.time(), op_id))
             self.store.audit(op['parent_id'] or 'bootstrap', 'create-subgroup', op_id)
@@ -397,12 +448,21 @@ class Service:
                            (op_id, 'Agents', '', 'Manage this domain safely. Delegate only to subordinate agents.',
                             time.time()))
         op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
-        return await self._provision(op, cloud, root['id'], None)
+        return await self._provision(op, cloud, root['id'])
 
     async def rotate_credentials(self, identity, agent_id):
         agent = await self.authorize(identity, agent_id)
         async with self._provision_lock:
-            cloud = await self.cloud_client(agent, 'provisioning')
+            service = self
+            class HumanIssuer:
+                async def raw(self, command, params=None):
+                    if command not in PROVISION_APIS:
+                        raise PermissionError('API unavailable to credential rotation')
+                    return await service.human_call(identity, command, params)
+
+                async def catalogue(self):
+                    return {a['name']: a for a in (await self.raw('listApis')).get('api', [])}
+            cloud = HumanIssuer()
             rotation = self.store.one('SELECT * FROM credential_rotations WHERE agent_id=?', (agent_id,))
             if not rotation:
                 current = {p: self.store.open(agent[p]) for p in ('runtime', 'provisioning')}
@@ -413,15 +473,22 @@ class Service:
             if rotation['replacement']:
                 keys = self.store.open(rotation['replacement'])
             else:
-                keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'])
+                try:
+                    current_policy = set(await (await self.cloud_client(agent)).catalogue())
+                except CloudError:
+                    current_policy = set(json.loads(agent['runtime_policy']))
+                    if not current_policy:
+                        raise PermissionError('Previous runtime policy unknown; restore or review it before rotation') from None
+                keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'], current_policy)
                 self.store.execute("UPDATE credential_rotations SET replacement=?,phase='validating',updated=? WHERE agent_id=?",
                                    (self.store.seal(keys), time.time(), agent_id))
-            for purpose in keys:
+            for purpose in ('runtime', 'provisioning'):
                 check = await self.client(keys[purpose]).raw('listDomains', {'id': agent['domain_id']})
                 if not any(d['id'] == agent['domain_id'] for d in check.get('domain', [])):
                     raise PermissionError('Replacement credentials failed domain validation; old keys retained')
-            self.store.execute('UPDATE agents SET runtime=?,provisioning=? WHERE id=?',
-                               (self.store.seal(keys['runtime']), self.store.seal(keys['provisioning']), agent_id))
+            self.store.execute('UPDATE agents SET runtime=?,provisioning=?,runtime_policy=? WHERE id=?',
+                               (self.store.seal(keys['runtime']), self.store.seal(keys['provisioning']),
+                                json.dumps(keys['runtime_policy']), agent_id))
             new_cloud = self.client(keys['provisioning'])
             for key in current.values():
                 if key.get('id'):
@@ -449,7 +516,8 @@ class Service:
         if rotation:
             for field in ('previous', 'replacement'):
                 if rotation[field]:
-                    known.update(k.get('id') for k in self.store.open(rotation[field]).values())
+                    tracked = self.store.open(rotation[field])
+                    known.update(tracked[p].get('id') for p in ('runtime', 'provisioning'))
         # Include keys from interrupted provisioning/rotation, and revoke the active signing key last.
         targets = [item for item in available if item.get('name', '').startswith('ds-') or item['id'] in known]
         targets.sort(key=lambda item: item['id'] == current.get('id'))

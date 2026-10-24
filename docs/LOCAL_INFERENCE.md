@@ -1,5 +1,7 @@
 # Local inference
 
+The optional two-network Compose overlay requires Docker Compose 2.33.1 or newer. It assigns the management network the higher gateway priority so CloudStack and guest traffic use the application's approved management address.
+
 Dirigentenstab connects to an existing OpenAI-compatible inference service. It does
 not install one inside the application image. In **Model providers**, select
 **Chat Completions**, enter the server's `/v1` base URL and API key, and run

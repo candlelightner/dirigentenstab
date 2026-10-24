@@ -29,10 +29,10 @@ def add_parent(store):
         for purpose in ('runtime', 'provisioning')
     }
     store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,'
-                  'model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                  'model,instructions,can_provision,runtime_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                   ('parent', 'Parent', 'parent-domain', 'parent-account', 'parent-user',
                    store.seal(credentials['runtime']), store.seal(credentials['provisioning']),
-                   'provider', 'parent-model', 'Parent instructions', 1))
+                   'provider', 'parent-model', 'Parent instructions', 1, json.dumps(sorted(RUNTIME_APIS))))
     return credentials
 
 
@@ -58,6 +58,13 @@ if command=='sync': print('synced')
 elif command=='overflow': print('x'*8000000,flush=True);time.sleep(30)
 elif command=='slow': time.sleep(30)
 elif command=='rejected': print('private backend secret',file=sys.stderr);sys.exit(1)
+elif command=='quotaReject':
+    print(json.dumps({'deployvirtualmachineresponse':{'errorcode':535,
+          'errortext':'GPU limit exceeded unit-api-key unit-secret-key '+sys.argv[2].split('=',1)[1]}}))
+    sys.exit(1)
+elif command=='quotaTextReject':
+    print('🙈 Error: (HTTP 535, error code 9999) Maximum gpu limit exceeded unit-api-key '+sys.argv[2].split('=',1)[1])
+    sys.exit(1)
 else: print(json.dumps({'listvirtualmachinesresponse':{'virtualmachine':[], 'arguments':sys.argv[2:]}}))
 ''')
     executable.chmod(0o700)
@@ -105,6 +112,17 @@ async def test_subprocess_limit_and_timeout_reap_children(fake_cmk, monkeypatch,
         assert not await asyncio.to_thread(os.path.exists, record['config'])
 
 
+@pytest.mark.parametrize('command', ['quotaReject', 'quotaTextReject'])
+async def test_native_quota_error_is_useful_and_redacts_credentials_and_userdata(fake_cmk, command):
+    cloud, _ = fake_cmk
+    userdata = 'private-guest-host-key-material' * 4
+    with pytest.raises(CloudError, match='(?i)gpu limit exceeded') as error:
+        await cloud.raw(command, {'userdata': userdata})
+    assert error.value.rejected
+    assert '535' in str(error.value)
+    assert all(secret not in str(error.value) for secret in ('unit-api-key', 'unit-secret-key', userdata))
+
+
 def test_redaction_covers_nested_unknown_keys_known_values_and_private_key_blocks():
     secret = 'unit-known-secret'
     result = redact({'apiKey': 'other-user-key', 'nested': [{'sessionkey': 'unknown-session',
@@ -147,14 +165,23 @@ class ProvisioningCloud:
         self.domains = []
         self.accounts = []
         self.keys = {}
+        self.key_rules = {}
         self.key_number = 0
         self.validation_failed = False
         self.invalid_replacement = False
+        self.parent_domain = {'id': 'parent-domain', 'name': 'Parent', 'path': 'ROOT/Parent', 'level': 1}
+        self.available = RUNTIME_APIS | PROVISION_APIS
+        self.runtime_available = RUNTIME_APIS
+
+    async def catalogue(self):
+        return {name: {'name': name} for name in self.available}
 
     async def raw(self, command, params=None):
         params = params or {}
         self.calls.append((command, params.copy()))
         if command == 'listDomains':
+            if params.get('id') == 'parent-domain':
+                return {'domain': [self.parent_domain]}
             return {'domain': self.domains}
         if command == 'createDomain':
             result = {'id': 'child-domain', 'name': params['name'], 'parentdomainid': params['parentdomainid']}
@@ -170,11 +197,15 @@ class ProvisioningCloud:
         elif command == 'listUserKeys':
             return {'userapikey': list(self.keys.values())}
         elif command == 'registerUserKeys':
+            requested = {value for key, value in params.items() if key.endswith('.rule')}
+            if not requested <= self.available:
+                raise PermissionError('New key permissions exceed the calling key')
             self.key_number += 1
             key_id = 'key-' + str(self.key_number)
             result = {'id': key_id, 'name': params['name'], 'apikey': key_id + '-api',
                       'secretkey': key_id + '-secret'}
             self.keys[key_id] = result
+            self.key_rules[key_id] = requested
             response = {'userkeys': result}
         elif command == 'deleteUserKeys':
             del self.keys[params['keypairid']]
@@ -193,12 +224,23 @@ class ProvisioningCloud:
 def provisioning_service(store, cloud):
     service = Service(store, SimpleNamespace(max_output=65536))
 
+    class RuntimeCloud:
+        async def catalogue(self):
+            return {name: {'name': name} for name in cloud.runtime_available}
+
+        async def raw(self, command, params):
+            return await cloud.raw(command, params)
+
     async def cloud_client(agent, purpose='runtime'):
-        return cloud
+        return RuntimeCloud() if purpose == 'runtime' else cloud
 
     class CredentialClient:
         def __init__(self, credentials):
             self.credentials = credentials
+
+        async def catalogue(self):
+            allowed = cloud.key_rules.get(self.credentials.get('id'), cloud.available)
+            return {name: {'name': name} for name in allowed}
 
         async def raw(self, command, params):
             if cloud.fail_after == 'validation' and not cloud.validation_failed:
@@ -211,6 +253,34 @@ def provisioning_service(store, cloud):
     service.cloud_client = cloud_client
     service.client = CredentialClient
     return service
+
+
+@pytest.mark.parametrize('limit,parent_name,error', [(1, 'Parent', 'hierarchy depth'),
+                                                    (10, 'A' * 220, 'domain path')])
+async def test_subgroup_checks_depth_and_actual_generated_path_before_cloud_creation(store, limit, parent_name, error):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    cloud.parent_domain.update(name=parent_name, path='ROOT/' + parent_name)
+    service = provisioning_service(store, cloud)
+    service.settings.max_hierarchy_depth = limit
+    with pytest.raises(ValueError, match=error):
+        await service.create_subgroup('parent', 'Research')
+    assert not cloud.domains and not cloud.accounts and not cloud.keys
+    assert not any(command.startswith('create') for command, _ in cloud.calls)
+
+
+async def test_retry_keeps_inherited_provider_and_model_together_when_parent_configuration_changes(store):
+    add_parent(store)
+    cloud = ProvisioningCloud('createDomain')
+    service = provisioning_service(store, cloud)
+    with pytest.raises(CloudError):
+        await service.create_subgroup('parent', 'Research')
+    store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+                  ('new-provider', 'New local', 'chat', 'http://other/v1', store.seal('new-key'), 'new-model'))
+    store.execute('UPDATE agents SET provider_id=?,model=? WHERE id=?', ('new-provider', 'new-model', 'parent'))
+    child = await provisioning_service(store, cloud).create_subgroup('parent', 'Research')
+    row = store.one('SELECT provider_id,model FROM agents WHERE id=?', (child['id'],))
+    assert row == {'provider_id': 'provider', 'model': 'parent-model'}
 
 
 @pytest.mark.parametrize('failure', ['createDomain', 'createAccount', 'second-key', 'validation'])
@@ -230,6 +300,7 @@ async def test_provisioning_survives_lost_responses_and_restart_without_duplicat
     row = store.one('SELECT * FROM agents WHERE id=?', (child['id'],))
     assert row['provider_id'] == 'provider' and row['instructions'] == 'Parent instructions'
     assert row['domain_id'] == 'child-domain' and row['can_provision'] == 1
+    assert set(json.loads(row['runtime_policy'])) == RUNTIME_APIS
     assert store.open(row['runtime'])['id'] in cloud.keys
     assert store.open(row['provisioning'])['id'] in cloud.keys
     counts = collections.Counter(command for command, _ in cloud.calls)
@@ -242,11 +313,42 @@ async def test_provisioning_survives_lost_responses_and_restart_without_duplicat
     key_requests = [params for command, params in cloud.calls if command == 'registerUserKeys']
     runtime_request = next(params for params in key_requests if params['name'].endswith('-runtime'))
     provisioning_request = next(params for params in key_requests if params['name'].endswith('-provision'))
-    for request, expected in ((runtime_request, RUNTIME_APIS), (provisioning_request, PROVISION_APIS)):
+    for request, expected in ((runtime_request, RUNTIME_APIS),
+                              (provisioning_request, RUNTIME_APIS | PROVISION_APIS)):
         assert {value for key, value in request.items() if key.endswith('.rule')} == expected
         assert {value for key, value in request.items() if key.endswith('.permission')} == {'allow'}
         assert 'enddate' in request
     assert 'createDomain' not in RUNTIME_APIS and 'registerUserKeys' not in RUNTIME_APIS
+
+
+async def test_child_permissions_are_limited_by_parent_runtime_even_with_broader_provisioning_key(store):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    cloud.runtime_available = {'listApis', 'listDomains', 'listVirtualMachines'}
+    service = provisioning_service(store, cloud)
+    child = await service.create_subgroup('parent', 'Limited child')
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', (child['id'],))
+    runtime_rules = cloud.key_rules[store.open(row['runtime'])['id']]
+    provisioning_rules = cloud.key_rules[store.open(row['provisioning'])['id']]
+    assert runtime_rules == cloud.runtime_available
+    assert provisioning_rules == cloud.runtime_available | PROVISION_APIS
+    assert 'deployVirtualMachine' in cloud.available
+    assert 'deployVirtualMachine' not in runtime_rules | provisioning_rules
+    assert runtime_rules <= provisioning_rules <= cloud.available
+
+
+async def test_credential_permissions_also_intersect_the_issuing_keys_live_catalogue(store):
+    cloud = ProvisioningCloud()
+    cloud.available = {'listApis', 'listDomains', 'listVirtualMachines', 'createDomain', 'createAccount',
+                       'registerUserKeys', 'listUserKeys', 'deleteUserKeys'}
+    service = provisioning_service(store, cloud)
+    credentials = await service._credentials(cloud, 'child-user', 'operation', runtime_allowed=RUNTIME_APIS)
+    runtime_rules = cloud.key_rules[credentials['runtime']['id']]
+    provisioning_rules = cloud.key_rules[credentials['provisioning']['id']]
+    assert runtime_rules == RUNTIME_APIS & cloud.available
+    assert provisioning_rules == (RUNTIME_APIS | PROVISION_APIS) & cloud.available
+    assert all(rules <= cloud.available for rules in cloud.key_rules.values())
+    assert set(credentials['runtime_policy']) == runtime_rules
 
 
 async def test_failed_replacement_domain_validation_preserves_active_credentials(store):
@@ -258,13 +360,52 @@ async def test_failed_replacement_domain_validation_preserves_active_credentials
     async def authorized(identity, agent_id, **kwargs):
         return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
 
+    async def human_call(identity, command, params=None):
+        if command == 'listApis':
+            return {'api': list((await cloud.catalogue()).values())}
+        return await cloud.raw(command, params)
+
     service.authorize = authorized
+    service.human_call = human_call
     with pytest.raises(PermissionError, match='domain validation'):
         await service.rotate_credentials({'userid': 'human'}, 'parent')
     row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
     assert {purpose: store.open(row[purpose]) for purpose in original} == original
     assert not any(command == 'deleteUserKeys' for command, _ in cloud.calls)
     assert store.one('SELECT * FROM credential_rotations WHERE agent_id=?', ('parent',))
+
+
+@pytest.mark.parametrize('policy', [[], ['listApis', 'listDomains', 'listVirtualMachines']])
+async def test_expired_runtime_credentials_preserve_stored_restrictions_or_fail_closed(store, policy):
+    add_parent(store)
+    store.execute('UPDATE agents SET runtime_policy=? WHERE id=?', (json.dumps(policy), 'parent'))
+    cloud = ProvisioningCloud()
+    service = provisioning_service(store, cloud)
+
+    async def authorized(identity, agent_id, **kwargs):
+        return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
+
+    async def expired_runtime(agent, purpose='runtime'):
+        raise CloudError('Runtime key has expired')
+
+    async def human_call(identity, command, params=None):
+        if command == 'listApis':
+            return {'api': list((await cloud.catalogue()).values())}
+        return await cloud.raw(command, params)
+
+    service.authorize, service.cloud_client, service.human_call = authorized, expired_runtime, human_call
+    if not policy:
+        with pytest.raises(PermissionError, match='policy unknown'):
+            await service.rotate_credentials({'userid': 'human'}, 'parent')
+        assert not any(command == 'registerUserKeys' for command, _ in cloud.calls)
+        return
+    await service.rotate_credentials({'userid': 'human'}, 'parent')
+    row = store.one('SELECT runtime,provisioning,runtime_policy FROM agents WHERE id=?', ('parent',))
+    runtime_rules = cloud.key_rules[store.open(row['runtime'])['id']]
+    provisioning_rules = cloud.key_rules[store.open(row['provisioning'])['id']]
+    assert runtime_rules == set(policy) == set(json.loads(row['runtime_policy']))
+    assert provisioning_rules == set(policy) | PROVISION_APIS
+    assert 'deployVirtualMachine' not in runtime_rules | provisioning_rules
 
 
 async def test_revoke_retry_keeps_agent_disabled_and_finishes_remote_deletion(store, monkeypatch):
@@ -309,8 +450,10 @@ async def test_revoke_tracks_rotation_orphans_deletes_signing_key_last_and_recov
     tracked = {name: {'id': name, 'apikey': name + '-api', 'secretkey': name + '-secret'}
                for name in ('previous-runtime', 'previous-provision', 'replacement-runtime', 'replacement-provision')}
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)',
-                  ('parent', 'rotation', store.seal({key: tracked[key] for key in tracked if key.startswith('previous')}),
-                   store.seal({key: tracked[key] for key in tracked if key.startswith('replacement')}), 'validating', 1))
+                  ('parent', 'rotation', store.seal({'runtime': tracked['previous-runtime'],
+                                                    'provisioning': tracked['previous-provision']}),
+                   store.seal({'runtime': tracked['replacement-runtime'], 'provisioning': tracked['replacement-provision'],
+                               'runtime_policy': ['listDomains']}), 'validating', 1))
     keys = {value['id']: {**value, 'name': value['id']} for value in [*original.values(), *tracked.values()]}
     keys['lost-orphan'] = {'id': 'lost-orphan', 'name': 'ds-interrupted-provision-runtime'}
     keys['unrelated'] = {'id': 'unrelated', 'name': 'operator-managed-unrelated-key'}
@@ -370,6 +513,8 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
             ]}}
 
         async def raw(self, command, request):
+            if command == 'listServiceOfferings':
+                return {'serviceoffering': [{'id': request['id'], 'gpucount': 0}]}
             if command == 'deployVirtualMachine':
                 self.deployments += 1
                 pending = store.one('SELECT * FROM vm_deployments')
@@ -387,7 +532,11 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
     async def client(agent, purpose='runtime'):
         return cloud
 
+    async def ssh_group(cloud):
+        return 'ssh-group'
+
     service.cloud_client = client
+    service._ssh_security_group = ssh_group
     with pytest.raises(CloudError):
         await service.execute('parent', 'deployVirtualMachine', params)
     with pytest.raises(CloudError, match='recovery'):
@@ -399,3 +548,48 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
     assert store.one('SELECT * FROM vm_deployments')['phase'] == 'complete'
     assert store.one('SELECT vm_id FROM vm_access')['vm_id'] == 'actual-vm-id'
     assert b'BEGIN OPENSSH PRIVATE KEY' not in store.path.read_bytes()
+
+
+@pytest.mark.parametrize('source', ['0.0.0.0/0', '::/0', '10.0.0.0/8', '127.0.0.1/32', '8.8.8.8/32'])
+async def test_managed_ssh_ingress_refuses_public_or_shared_source_ranges_before_cloud_calls(store, source):
+    service = Service(store, SimpleNamespace(ssh_source_cidr=source))
+
+    class NoCloudCalls:
+        async def execute(self, command, params):
+            raise AssertionError('Invalid SSH source must be rejected before infrastructure changes')
+
+    with pytest.raises(ValueError, match='one approved private'):
+        await service._ssh_security_group(NoCloudCalls())
+
+
+async def test_managed_ssh_ingress_uses_one_private_egress_address_and_reuses_the_rule(store):
+    service = Service(store, SimpleNamespace(ssh_source_cidr='10.253.80.1/32'))
+
+    class SecurityGroups:
+        def __init__(self):
+            self.groups = []
+            self.calls = []
+
+        async def execute(self, command, params):
+            self.calls.append((command, params.copy()))
+            if command == 'listSecurityGroups':
+                return {'securitygroup': self.groups}
+            if command == 'createSecurityGroup':
+                group = {'id': 'ssh-group', 'name': params['name'], 'ingressrule': []}
+                self.groups.append(group)
+                return {'securitygroup': group}
+            assert command == 'authorizeSecurityGroupIngress'
+            self.groups[0]['ingressrule'].append({'protocol': params['protocol'], 'startport': params['startport'],
+                                                'endport': params['endport'], 'cidr': params['cidrlist']})
+            return {'success': True}
+
+        async def raw(self, command, params):
+            raise AssertionError('Managed SSH ingress must use the validated runtime API path')
+
+    cloud = SecurityGroups()
+    assert await service._ssh_security_group(cloud) == 'ssh-group'
+    assert await service._ssh_security_group(cloud) == 'ssh-group'
+    ingress = [params for command, params in cloud.calls if command == 'authorizeSecurityGroupIngress']
+    assert ingress == [{'securitygroupid': 'ssh-group', 'protocol': 'tcp', 'startport': 22,
+                        'endport': 22, 'cidrlist': '10.253.80.1/32'}]
+    assert sum(command == 'createSecurityGroup' for command, _ in cloud.calls) == 1

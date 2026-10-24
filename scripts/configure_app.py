@@ -41,7 +41,7 @@ def configure(args):
     env_path.chmod(0o600)
     values = dotenv_values(env_path)
     origin, api = values['PUBLIC_ORIGIN'], values['CLOUDSTACK_URL']
-    settings = Settings(api, origin)
+    settings = Settings(api, origin, max_hierarchy_depth=int(values.get('MAX_HIERARCHY_DEPTH', '10')))
     if urlsplit(origin).scheme != 'https':
         raise SystemExit('PUBLIC_ORIGIN must use HTTPS. See docs/INSTALLATION.md.')
     for net in json.loads(subprocess.check_output(['ip', '-json', 'route'])):
@@ -52,12 +52,22 @@ def configure(args):
         with socket.socket() as listener:
             listener.bind((values.get('BIND_ADDRESS', '127.0.0.1'), port))
     except OSError:
-        if not args.resume:
+        containers = json.loads(subprocess.check_output(['docker', 'ps', '--filter',
+                                 'label=com.docker.compose.project=dirigentenstab', '--filter',
+                                 'label=com.docker.compose.service=app', '--format', '{{json .}}']).decode()
+                                .strip() or '{}')
+        owned = bool(containers and f':{port}->8088/tcp' in containers.get('Ports', ''))
+        if not args.resume or not owned:
             raise SystemExit(f'Application port {port} is occupied. Set BIND_PORT and PUBLIC_ORIGIN to a free port.') from None
     secret_dir = ROOT / 'secrets'
     secret_dir.mkdir(mode=0o700, exist_ok=True)
     master = Path(values.get('MASTER_KEY_PATH', './secrets/master_key'))
     master = master if master.is_absolute() else ROOT / master
+    subprocess.run(['docker', 'volume', 'create', 'dirigentenstab_data'], check=True, stdout=subprocess.DEVNULL)
+    volume = json.loads(subprocess.check_output(['docker', 'volume', 'inspect', 'dirigentenstab_data']))[0]
+    data = Path(volume['Mountpoint'])
+    if (data / 'dirigentenstab.db').exists() and not master.exists():
+        raise SystemExit('Existing database has no master key. Restore its matching key; no replacement was generated.')
     master.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     private(master, Fernet.generate_key() + b'\n')
     cert_path = ROOT / values.get('TLS_CERT_PATH', './secrets/tls.crt')
@@ -82,9 +92,6 @@ def configure(args):
         private(cert_path, cert.public_bytes(serialization.Encoding.PEM))
     if not cert_path.exists() or not tls_path.exists():
         raise SystemExit('TLS certificate/key pair is incomplete; restore the missing file before continuing.')
-    subprocess.run(['docker', 'volume', 'create', 'dirigentenstab_data'], check=True, stdout=subprocess.DEVNULL)
-    volume = json.loads(subprocess.check_output(['docker', 'volume', 'inspect', 'dirigentenstab_data']))[0]
-    data = Path(volume['Mountpoint'])
     settings.database, settings.key_file = str(data / 'dirigentenstab.db'), str(master)
     settings.cmk = '/usr/local/bin/cmk'
     store = Store(settings.database, settings.key_file)

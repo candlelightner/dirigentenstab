@@ -22,7 +22,8 @@ def service():
     volume = json.loads(subprocess.check_output(['docker', 'volume', 'inspect', 'dirigentenstab_data']))[0]
     return Service(Store(volume['Mountpoint'] + '/dirigentenstab.db',
                          str(root / env.get('MASTER_KEY_PATH', 'secrets/master_key'))),
-                   Settings(env['CLOUDSTACK_URL'], env['PUBLIC_ORIGIN'], cmk='/usr/local/bin/cmk'))
+                   Settings(env['CLOUDSTACK_URL'], env['PUBLIC_ORIGIN'], cmk='/usr/local/bin/cmk',
+                            max_hierarchy_depth=int(env.get('MAX_HIERARCHY_DEPTH', '10'))))
 
 
 async def perform(options, app, login=None):
@@ -34,6 +35,24 @@ async def perform(options, app, login=None):
     if options.command == 'recover-deployments':
         await app.recover_deployments()
         print('Recovery queried CloudStack and bound discovered VMs; unresolved operations remain pending.')
+        return
+    if options.command == 'resolve-rejection':
+        if not options.confirmed_rejection:
+            raise SystemExit('Requires --confirmed-rejection after verifying a definitive server rejection in private logs.')
+        op = app.store.one("SELECT * FROM vm_deployments WHERE id=? AND phase IN ('prepared','dispatched')",
+                           (options.identifier,))
+        if not op:
+            raise SystemExit('No unresolved deployment with that ID.')
+        cloud = await app.cloud_client(await app.agent(op['agent_id']))
+        vms = (await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})).get('virtualmachine', [])
+        if vms:
+            raise SystemExit('A VM exists; use recover-deployments instead. No state changed.')
+        jobs = (await cloud.raw('listAsyncJobs', {'listall': True})).get('asyncjobs', [])
+        if any(job.get('jobstatus') == 0 for job in jobs):
+            raise SystemExit('An asynchronous job is pending; no state changed.')
+        app.store.execute("UPDATE vm_deployments SET phase='failed' WHERE id=?", (op['id'],))
+        app.store.audit('local-platform-admin', 'resolve-confirmed-deployment-rejection', op['id'])
+        print('Confirmed rejected deployment marked failed. No VM was created or deleted.')
         return
     auth = Auth(app)
     token, _ = await auth.login(login['username'], login['password'], login.get('domain', '/'), 'local-admin')
@@ -57,16 +76,18 @@ async def perform(options, app, login=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['status', 'recover-deployments', 'rotate', 'revoke', 'repair-provisioning'])
+    parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
+                                            'rotate', 'revoke', 'repair-provisioning'])
     parser.add_argument('identifier', nargs='?')
     parser.add_argument('--login-file')
+    parser.add_argument('--confirmed-rejection', action='store_true')
     options = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root; this command reads the private application master key.')
-    if options.command in {'rotate', 'revoke', 'repair-provisioning'} and not options.identifier:
+    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'resolve-rejection'} and not options.identifier:
         parser.error('This command requires an identifier from status output.')
     login = None
-    if options.command not in {'status', 'recover-deployments'}:
+    if options.command not in {'status', 'recover-deployments', 'resolve-rejection'}:
         if options.login_file:
             path = Path(options.login_file)
             if path.stat().st_mode & 0o077:

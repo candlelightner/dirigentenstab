@@ -23,6 +23,9 @@ from native_setup import ADDRESS, BRIDGE, STATE, properties, run, save
 
 API = f'http://{ADDRESS}:8080/client/api'
 ZONE, POD, CLUSTER = 'Dirigentenstab', 'Dirigentenstab-private', 'Dirigentenstab-KVM'
+GUEST_TEMPLATE_NAME = 'Ubuntu-24.04-20261017'
+GUEST_TEMPLATE_URL = 'https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img'
+GUEST_TEMPLATE_SHA256 = '04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94'
 
 
 class Cloud:
@@ -48,8 +51,16 @@ class Cloud:
             with self.opener.open(request, timeout=180) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as exc:
-            # Error bodies can repeat supplied credentials; retain status only.
-            raise RuntimeError(f'{command}: HTTP {exc.code}; inspect private CloudStack Events') from None
+            detail = 'inspect private CloudStack Events'
+            if exc.code not in {401, 403} and command in {'createNetwork', 'createZone', 'createPod', 'addCluster', 'addImageStore', 'registerTemplate'}:
+                try:
+                    detail = next(iter(json.load(exc).values())).get('errortext', detail)
+                    for value in [params.get('apiKey'), params.get('signature')]:
+                        if value:
+                            detail = detail.replace(value, '[redacted]')
+                except (ValueError, StopIteration, AttributeError):
+                    pass
+            raise RuntimeError(f'{command}: HTTP {exc.code}; {detail}') from None
         result = next(iter(body.values()))
         if result.get('errorcode'):
             raise RuntimeError(f'{command}: CloudStack error {result["errorcode"]}')
@@ -129,13 +140,25 @@ def configure_storage():
     save('/etc/exports.d/dirigentenstab.exports',
          f'{directory} 10.253.80.1({options}) 10.253.80.16/28({options}) 10.253.80.32/28({options})\n')
     save('/etc/nfs.conf.d/dirigentenstab.conf', '[nfsd]\nhost=10.253.80.1\nvers3=n\nvers4=y\n')
+    run('systemctl', 'unmask', 'nfs-server', 'rpcbind', 'rpcbind.socket')
     run('exportfs', '-ra')
     run('systemctl', 'restart', 'nfs-kernel-server')
+
+
+def import_system_cas(path):
+    marker = STATE / 'agent-system-cas.done'
+    if marker.exists():
+        return
+    run('keytool', '-importkeystore', '-noprompt', '-srckeystore', '/etc/ssl/certs/java/cacerts',
+        '-srcstorepass', 'changeit', '-destkeystore', str(path / 'cloud.jks'),
+        '-deststorepass:file', str(STATE / 'agent-keystore-password'))
+    marker.touch(mode=0o600)
 
 
 def agent_certificate(cloud):
     path = Path('/etc/cloudstack/agent')
     if (path / 'cloud.jks').exists():
+        import_system_cas(path)
         return
     certificate = cloud.job('issueCertificate', domain='homeserver,dirigentenstab.internal',
                              ipaddress=ADDRESS, duration=365)
@@ -159,9 +182,28 @@ def agent_certificate(cloud):
         '-keystore', str(path / 'cloud.jks'), '-storepass:file', str(STATE / 'agent-keystore-password'))
     (path / 'cloud.p12').unlink()
     (path / 'cloud.jks').chmod(0o600)
+    import_system_cas(path)
+
+
+def guest_template(cloud, zone_id):
+    templates = cloud.call('listTemplates', templatefilter='all', zoneid=zone_id).get('template', [])
+    existing = next((entry for entry in templates if entry['name'] == GUEST_TEMPLATE_NAME), None)
+    if existing:
+        return existing['id']
+    systems = cloud.call('listOsTypes', keyword='Ubuntu').get('ostype', [])
+    ubuntu = next((entry for entry in systems if entry['description'] == 'Ubuntu 24.04 LTS'), None)
+    if not ubuntu:
+        raise RuntimeError('Pinned CloudStack release has no Ubuntu 24.04 guest OS mapping.')
+    template = cloud.call('registerTemplate', name=GUEST_TEMPLATE_NAME, displaytext='Ubuntu 24.04 LTS managed Linux',
+                          url=GUEST_TEMPLATE_URL, checksum='{SHA-256}' + GUEST_TEMPLATE_SHA256,
+                          zoneid=zone_id, ostypeid=ubuntu['id'], format='QCOW2', hypervisor='KVM',
+                          arch='x86_64', bits=64, ispublic='true', isextractable='false',
+                          passwordenabled='false', directdownload='true')
+    return template['template'][0]['id']
 
 
 def zone(cloud):
+    cloud.call('updateConfiguration', name='system.vm.use.local.storage', value='true')
     management = cloud.call('listConfigurations', name='management.network.cidr').get('configuration', [])
     if management and management[0].get('value') != '10.253.80.0/24':
         cloud.call('updateConfiguration', name='management.network.cidr', value='10.253.80.0/24')
@@ -226,11 +268,24 @@ def zone(cloud):
             raise RuntimeError('Required basic-zone security group network offering is missing.')
         cloud.call('createNetwork', zoneid=zone['id'], physicalnetworkid=physical['id'],
                    name='Dirigentenstab-guests', displaytext='Private managed guest network',
-                   networkofferingid=offerings[0]['id'], gateway=ADDRESS,
-                   netmask='255.255.255.0', startip='10.253.80.100', endip='10.253.80.220',
-                   vlan='untagged', acltype='Domain')
+                   networkofferingid=offerings[0]['id'], acltype='Domain', subdomainaccess='true')
+    guest = next(entry for entry in cloud.call('listNetworks', zoneid=zone['id'], listall='true').get('network', [])
+                 if entry.get('name') == 'Dirigentenstab-guests')
+    ranges = cloud.call('listVlanIpRanges', zoneid=zone['id'], networkid=guest['id']).get('vlaniprange', [])
+    if not ranges:
+        cloud.call('createVlanIpRange', zoneid=zone['id'], podid=pod['id'], networkid=guest['id'],
+                   forvirtualnetwork='false', gateway=ADDRESS, netmask='255.255.255.0',
+                   startip='10.253.80.100', endip='10.253.80.220', vlan='untagged')
     cloud.call('updateZone', id=zone['id'], allocationstate='Enabled')
-    save(STATE / 'zone.json', json.dumps({'zone_id': zone['id'], 'pod_id': pod['id'], 'cluster_id': cluster['id']}), 0o600)
+    template_id = guest_template(cloud, zone['id'])
+    offerings = cloud.call('listServiceOfferings', name='Dirigentenstab-small').get('serviceoffering', [])
+    offering = offerings[0] if offerings else cloud.call('createServiceOffering',
+        name='Dirigentenstab-small', displaytext='1 CPU, 1 GiB, local primary storage',
+        cpunumber=1, cpuspeed=1000, memory=1024, storagetype='local')['serviceoffering']
+    save(STATE / 'zone.json', json.dumps({'zone_id': zone['id'], 'pod_id': pod['id'], 'cluster_id': cluster['id'],
+                                        'template_id': template_id, 'template_url': GUEST_TEMPLATE_URL,
+                                        'template_sha256': GUEST_TEMPLATE_SHA256,
+                                        'network_id': guest['id'], 'service_offering_id': offering['id']}), 0o600)
     print('Real KVM host registered; private zone, guest security groups and restricted secondary storage configured.')
 
 

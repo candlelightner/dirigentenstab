@@ -8,7 +8,7 @@ CloudStack authenticates human logins. Only root and domain administrators can o
 
 `agents` stores metadata and CloudStack UUID references. There is no mutable local domain tree or parent column. Domain relationships and visible human administrators come from current CloudStack API calls. CloudStack enforces domain ancestry; the backend independently checks which agents a human may operate and which subordinate agents a caller may delegate to.
 
-Every agent gets a distinct DomainAdmin account in its own domain. It has two expiring API key pairs. The runtime key allows a reviewed set of guest infrastructure APIs; the provisioning key allows only the account/domain/key APIs needed by trusted backend provisioning. Neither key can exceed its CloudStack account's role or domain boundary. API catalogue descriptions and signatures come from `listApis`, with CloudMonkey's maintained metadata cache.
+Every agent gets a distinct DomainAdmin account in its own domain. It has two expiring API key pairs. The runtime key allows a reviewed set of guest infrastructure APIs. The provisioning key covers the runtime permission envelope plus the account/domain/key APIs needed by trusted backend provisioning: CloudStack 4.23 requires an issuing key to cover every permission it delegates. Only trusted provisioning code receives that key; generic tools always use runtime credentials. A child's runtime permissions are intersected with its parent's current runtime catalogue. Neither key can exceed its CloudStack account's role or domain boundary. API catalogue descriptions and signatures come from `listApis`, with CloudMonkey's maintained metadata cache.
 
 ## Execution
 
@@ -19,6 +19,8 @@ CloudMonkey runs directly through `asyncio.create_subprocess_exec`, never a host
 ## Durable operations
 
 Subgroup provisioning persists intent before making CloudStack changes. Stable operation IDs appear in generated domain/account/key names. Each successful stage persists its IDs; retries find existing resources under the same parent. Credentials are validated before the new agent becomes visible. Lost key-registration responses are handled by finding and revoking that operation's keys before replacement.
+
+Before creating a domain, the backend retrieves its actual parent path and level. The generated child name and full stored path must fit CloudStack's 255-character utf8mb3 columns. `MAX_HIERARCHY_DEPTH` defaults to 10, with native ROOT at level 0. The path-length limit may be reached before the configured depth when names are long. Neither bound depends on model-supplied ancestry.
 
 Credential rotation stores its old keys, replacement keys and operation ID durably. New keys are validated before the active credential record changes; old keys are revoked afterward. Retry resumes the same operation.
 

@@ -34,6 +34,18 @@ After installation, run:
 
 ```sh
 sudo ./setup.sh --verify
+sudo .venv/bin/python scripts/live_acceptance.py --run
+sudo .venv/bin/python scripts/gpu_acceptance.py --run
 ```
 
 Native service verification, the CI browser fixture and actual infrastructure acceptance are distinct checks. Real acceptance requires a live CloudStack KVM host and VMs: create/start a VM using an agent identity, run Python through its pinned SSH identity, inspect a deliberately failing command, upload/download a file, and reject access from an unrelated domain. Record the actual outputs and resource identities privately; publish only a sanitized result. Never report the browser fixture or unit mocks as real KVM acceptance.
+
+The acceptance script creates two durably tracked private VMs under the Research and Development agents and retains them for inspection. It verifies non-root guest execution without default sudo or host sockets, file round trips, unrelated-domain denial and rejection of host-only API/configuration. It never submits a second deployment after an ambiguous result; use `scripts/admin.py status` and `recover-deployments` first. The private resume/report file is `/var/lib/dirigentenstab/setup/live-acceptance.json`.
+
+`.github/workflows/live.yaml` supports an explicit manual run on a trusted, dedicated self-hosted test runner labeled `dirigentenstab-acceptance`. Configure the `private-cloud-acceptance` environment and its `DIRIGENTENSTAB_INSTALL` variable to point at an already deployed test installation. The workflow runs only from main after the confirmation input is selected. It does not deploy code, run pull-request code, configure a runner automatically, or open the private API to GitHub-hosted runners. Ordinary CI integration tests use real local SSH/SFTP endpoints and synthetic infrastructure fixtures; this manual job uses actual CloudStack/KVM.
+
+### Live portal smoke test, 2026-10-25
+
+Chromium also tested the actual portal at its private local HTTPS endpoint on the Ubuntu 24.04 host, with native CloudStack 4.23.0.0 and the separately configured local Qwen inference provider. The live check passed CloudStack-backed login, Secure/HttpOnly/SameSite cookies, the real domain tree, direct agent selection, model configuration display and authenticated WebSocket handshakes.
+
+A new read-only conversation called `search_api` against the live catalogue and displayed streamed text plus tool activity. Reloading the portal restored that conversation, including its tool history. A database check confirmed the persisted messages were encrypted. The browser content and WebSocket frames were checked against the installation, agent and provider credentials without recording those credentials. Logout revoked the browser session. The browser reported no page errors. This portal check did not mutate infrastructure and is separate from the real VM/SSH acceptance described above.

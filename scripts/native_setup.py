@@ -5,6 +5,8 @@ import hashlib
 import ipaddress
 import json
 import os
+import pwd
+import platform
 from pathlib import Path
 import re
 import secrets
@@ -84,10 +86,23 @@ def properties(path, values):
     save(path, old)
 
 
+def check_routes(routes):
+    for route in routes:
+        if route.get('dst') == 'default' or route.get('dev') == BRIDGE:
+            continue
+        subnet = ipaddress.ip_network(route['dst'], strict=False)
+        if subnet.overlaps(NETWORK):
+            raise RuntimeError(f'Private network {NETWORK} conflicts with route {route["dst"]}. Use a separately prepared CloudStack network/host.')
+        if route.get('dev') != 'cloud0' and subnet.overlaps(ipaddress.ip_network('169.254.0.0/16')):
+            raise RuntimeError('Existing link-local route conflicts with the CloudStack control network; prepare a separate KVM host.')
+
+
 def preflight(existing=False):
     osinfo = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
     if osinfo.get('ID', '').strip('"') != 'ubuntu' or osinfo.get('VERSION_ID', '').strip('"') != '24.04':
         raise RuntimeError('Native installation supports Ubuntu 24.04 LTS. Use --existing for another CloudStack host.')
+    if platform.machine() not in {'x86_64', 'amd64'}:
+        raise RuntimeError('This native installer pins the x86-64 CloudMonkey/system templates. Use --existing with a separately prepared host.')
     if not existing and (not Path('/dev/kvm').exists() or not re.search(r'\b(vmx|svm)\b', Path('/proc/cpuinfo').read_text())):
         raise RuntimeError('Hardware KVM is unavailable; enable CPU virtualization in firmware.')
     memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
@@ -96,16 +111,18 @@ def preflight(existing=False):
     if not existing and (available < 8192 or disk < 50):
         raise RuntimeError(f'Insufficient resources: {available} MiB available RAM, {disk} GiB free disk. Need 8 GiB and 50 GiB.')
     routes = json.loads(run('ip', '-json', 'route'))
-    for route in routes:
-        if route.get('dst') == 'default' or route.get('dev') == BRIDGE:
-            continue
-        subnet = ipaddress.ip_network(route['dst'], strict=False)
-        if subnet.overlaps(NETWORK):
-            raise RuntimeError(f'Private network {NETWORK} conflicts with route {route["dst"]}. Administrator must choose a separate host/network.')
+    check_routes(routes)
     if not existing and shutil.which('virsh'):
         domains = run('virsh', '-c', 'qemu:///system', 'list', '--all', '--name', check=False).strip()
         if domains and not (STATE / 'packages.done').exists():
             raise RuntimeError('Existing libvirt VMs detected; use an empty KVM host or --existing. No VM is adopted or deleted.')
+    mysql_data = Path('/var/lib/mysql')
+    if not existing and mysql_data.is_dir() and any(mysql_data.iterdir()) and not (STATE / 'packages.started').exists() and not (STATE / 'packages.done').exists():
+        raise RuntimeError('Existing MySQL data detected. Use --existing or a separately prepared CloudStack host; no database is adopted or upgraded.')
+    if not existing and not (STATE / 'packages.started').exists() and not (STATE / 'packages.done').exists():
+        for service in ['nfs-server', 'rpcbind']:
+            if run('systemctl', 'is-active', service, check=False).strip() == 'active':
+                raise RuntimeError(f'Existing {service} service detected; use --existing or a separate CloudStack host to preserve it.')
     print(f'Ubuntu 24.04; KVM={Path("/dev/kvm").exists()}; available RAM={available} MiB; free disk={disk} GiB')
     print('Existing virtualization:', run('pgrep', '-a', 'qemu-system', check=False).split(' -')[0] or 'none')
     print('Existing ports:', run('ss', '-lnt').strip())
@@ -120,6 +137,7 @@ def step(name, action):
         print(f'{name}: already completed', flush=True)
         return
     print(f'{name}: starting', flush=True)
+    (STATE / f'{name}.started').touch(mode=0o600)
     action()
     marker.touch(mode=0o600)
     print(f'{name}: complete', flush=True)
@@ -143,11 +161,12 @@ def repositories():
 
 
 def packages():
-    for service in ['cloudstack-management', 'cloudstack-agent']:
-        override = Path(f'/etc/systemd/system/{service}.service')
+    for service in ['cloudstack-management', 'cloudstack-agent', 'mysql', 'nfs-server', 'rpcbind', 'rpcbind.socket']:
+        unit = service if service.endswith('.socket') else service + '.service'
+        override = Path('/etc/systemd/system') / unit
         if override.exists() and not (override.is_symlink() and os.readlink(override) == '/dev/null'):
             raise RuntimeError(f'Existing override for {service}; inspect manually before native installation.')
-        run('systemctl', 'mask', service)
+        run('systemctl', 'mask', unit)
     run('apt-get', 'install', '-y', '--no-install-recommends',
         f'cloudstack-management={VERSION}', f'cloudstack-agent={VERSION}',
         f'cloudstack-common={VERSION}', 'mysql-community-server', 'nfs-kernel-server',
@@ -181,7 +200,7 @@ def network():
          'table inet dirigentenstab_private {\n'
          ' chain private_services { type filter hook input priority -10; policy accept;\n'
          f'  ip saddr 172.30.253.2 ip daddr {ADDRESS} tcp dport 8080 accept\n'
-         f'  iifname != "lo" iifname != "{BRIDGE}" tcp dport {{ 111, 8080, 8250, 9090, 16509, 16514, 2049 }} drop\n'
+         f'  iifname != "lo" iifname != "{BRIDGE}" tcp dport {{ 111, 2049, 3306, 8080, 8250, 9090, 16509, 16514, 33060 }} drop\n'
          f'  iifname != "lo" iifname != "{BRIDGE}" udp dport {{ 111, 2049 }} drop\n'
          ' }\n}\n')
     save('/etc/systemd/system/dirigentenstab-network.service',
@@ -190,6 +209,9 @@ def network():
          'ExecStart=/usr/sbin/nft -f /etc/dirigentenstab-network.nft\n'
          'ExecStop=/usr/sbin/nft delete table ip dirigentenstab\n'
          'ExecStop=/usr/sbin/nft delete table inet dirigentenstab_private\n\n[Install]\nWantedBy=multi-user.target\n')
+    for unit in ['cloudstack-management.service', 'cloudstack-agent.service', 'nfs-server.service', 'rpcbind.socket']:
+        save(f'/etc/systemd/system/{unit}.d/dirigentenstab-network.conf',
+             '[Unit]\nRequires=dirigentenstab-network.service\nAfter=dirigentenstab-network.service\n')
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', '--now', 'dirigentenstab-network')
 
@@ -200,6 +222,8 @@ def database():
          'server-id=1\ninnodb_rollback_on_timeout=1\ninnodb_lock_wait_timeout=600\n'
          'max_connections=350\nlog_bin=mysql-bin\nbinlog_format=ROW\n'
          'sql_mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION\n')
+    run('systemctl', 'unmask', 'mysql')
+    run('systemctl', 'enable', '--now', 'mysql')
     run('systemctl', 'restart', 'mysql')
     schema = run('mysql', '-NBe', "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='cloud'")
     if schema.strip():
@@ -221,6 +245,8 @@ def services():
     properties('/etc/cloudstack/management/db.properties', {'cluster.node.IP': ADDRESS})
     for path in ['/var/lib/libvirt/images/dirigentenstab', '/var/lib/dirigentenstab/secondary']:
         Path(path).mkdir(parents=True, exist_ok=True)
+    os.chown('/var/lib/libvirt/images/dirigentenstab', 0, pwd.getpwnam('libvirt-qemu').pw_gid)
+    Path('/var/lib/libvirt/images/dirigentenstab').chmod(0o750)
     # Keep libvirt on its authenticated Unix socket: no unauthenticated TCP listener.
     properties('/etc/cloudstack/agent/agent.properties', {
         'host': ADDRESS, 'private.network.device': BRIDGE, 'public.network.device': BRIDGE,
@@ -242,9 +268,20 @@ def services():
             time.sleep(3)
     else:
         raise RuntimeError('Management server did not become ready; inspect journalctl -u cloudstack-management.')
+    install_cmk()
+
+
+def install_cmk():
+    binary = Path('/usr/local/bin/cmk')
+    if binary.exists() and hashlib.sha256(binary.read_bytes()).hexdigest() == CMK_SHA256:
+        return
+    original = STATE / 'originals/usr/local/bin/cmk'
+    if binary.exists() and not original.exists():
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(binary, original)
     download('https://github.com/apache/cloudstack-cloudmonkey/releases/download/6.6.0/cmk.linux.x86-64',
-             '/usr/local/bin/cmk', sha256=CMK_SHA256)
-    Path('/usr/local/bin/cmk').chmod(0o755)
+             binary, sha256=CMK_SHA256)
+    binary.chmod(0o755)
 
 
 def verify():
@@ -259,23 +296,70 @@ def verify():
             raise RuntimeError('CloudStack API/zone verification failed.')
 
 
+def prepare_application():
+    install_cmk()
+    if subprocess.run([sys.executable, '-c', 'import ensurepip'], capture_output=True, check=False).returncode:
+        run('apt-get', 'update')
+        run('apt-get', 'install', '-y', 'python3.12-venv')
+    if not shutil.which('docker'):
+        if shutil.which('containerd'):
+            raise RuntimeError('Existing containerd detected. Install a compatible Docker Engine/Compose without replacing that service, then retry.')
+        run('apt-get', 'update')
+        run('apt-get', 'install', '-y', 'docker.io', 'docker-compose-v2', 'python3.12-venv')
+        run('systemctl', 'enable', '--now', 'docker')
+    run('docker', 'compose', 'version')
+    environment = ROOT / '.venv'
+    if not (environment / 'bin/python').exists():
+        run(sys.executable, '-m', 'venv', str(environment))
+    run(str(environment / 'bin/pip'), 'install', '-r', str(ROOT / 'requirements.lock'))
+    run(str(environment / 'bin/pip'), 'install', '--no-deps', '-e', str(ROOT))
+    # The application owns .env, master-key creation and its CloudStack identity bootstrap.
+    result = subprocess.run([str(environment / 'bin/python'), str(ROOT / 'scripts/configure_app.py'), '--resume'], check=False)
+    if result.returncode:
+        raise RuntimeError('Application configuration incomplete. Correct .env/prerequisites and rerun --existing; CloudStack is preserved.')
+
+
+def verify_existing():
+    python = ROOT / '.venv/bin/python'
+    if not python.exists():
+        raise RuntimeError('Run --install --existing to prepare the application first.')
+    code = '''import asyncio,json
+from pathlib import Path
+from dotenv import dotenv_values
+from dirigentenstab.cloud import Cloud
+from dirigentenstab.settings import Settings
+v=dotenv_values('.env')
+p=Path(v['CLOUDSTACK_BOOTSTRAP_CREDENTIALS_FILE'])
+if p.stat().st_mode & 0o077: raise SystemExit('Bootstrap credentials must remain private (chmod 600).')
+k=json.loads(p.read_text())
+c=Cloud(Settings(v['CLOUDSTACK_URL'],v['PUBLIC_ORIGIN']),{n:k[n] for n in ('apikey','secretkey')})
+asyncio.run(c.raw('listCapabilities'))
+print('Existing CloudStack API verified through CloudMonkey; native services were not changed.')
+'''
+    if subprocess.run([str(python), '-c', code], cwd=ROOT, check=False).returncode:
+        raise RuntimeError('Existing CloudStack API verification failed; check the private endpoint and bootstrap credential validity.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    modes = parser.add_mutually_exclusive_group(required=True)
-    for name in ['preflight', 'install', 'verify', 'existing']:
+    modes = parser.add_mutually_exclusive_group()
+    for name in ['preflight', 'install', 'verify']:
         modes.add_argument('--' + name, action='store_true')
+    parser.add_argument('--existing', action='store_true', help='Connect to an existing private CloudStack installation')
     args = parser.parse_args()
+    if not any([args.preflight, args.install, args.verify, args.existing]):
+        parser.error('Choose --preflight, --install, --verify or --existing')
     if os.geteuid() != 0:
         parser.error('Run with sudo. Preflight reads protected virtualization and network state.')
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True)
     if args.preflight:
-        preflight()
+        preflight(existing=args.existing)
     elif args.verify:
-        verify()
+        verify_existing() if args.existing else verify()
     elif args.existing:
         print('Existing mode: CloudStack services and networking are not modified.')
-        print('Configure CLOUDSTACK_URL and PUBLIC_ORIGIN in .env, then run the application bootstrap command in README.md.')
+        prepare_application()
     else:
         preflight()
         for name, action in [('repositories', repositories), ('packages', packages), ('network', network),
@@ -285,6 +369,7 @@ def main():
         if result.returncode:
             raise RuntimeError('Zone setup incomplete; safe to retry after resolving the reported prerequisite.')
         verify()
+        prepare_application()
 
 
 if __name__ == '__main__':

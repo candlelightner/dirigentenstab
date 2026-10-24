@@ -85,6 +85,10 @@ async def test_retry_cleanup_uses_actual_cloudstack_userkeys_response(store, mon
     deleted = []
 
     class Cloud:
+        async def catalogue(self):
+            from dirigentenstab.cloud import PROVISION_APIS, RUNTIME_APIS
+            return {api: {} for api in PROVISION_APIS | RUNTIME_APIS}
+
         async def raw(self, command, params):
             if command == 'listUserKeys':
                 return {'userapikey': [{'id': 'orphan', 'name': 'ds-operation-runtime'},

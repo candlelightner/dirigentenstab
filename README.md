@@ -45,6 +45,6 @@ python3 -m venv .venv
 .venv/bin/pytest -q -m 'not browser and not live'
 ```
 
-CI runs unit and integration checks and builds the image. Chromium browser tests run in their own job. A version tag publishes `ghcr.io/candlelightner/dirigentenstab:<version>`. Pushing or publishing an image never deploys it to your host.
+CI runs unit and integration checks and builds the image. Chromium browser tests run in their own job. Merging a version change in `pyproject.toml` publishes `ghcr.io/candlelightner/dirigentenstab:<version>` and creates its release tag; an explicit version tag is also supported. Pushing or publishing an image never deploys it to your host.
 
 CloudStack 4.23 is a regular release supported until the next regular or LTS release. It is pinned for restricted API-key support; schedule upgrades using the upstream release notes rather than enabling unattended CloudStack upgrades. Third-party components retain their own licenses; see [third-party notices](docs/THIRD_PARTY.md).
