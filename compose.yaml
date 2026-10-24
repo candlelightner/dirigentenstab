@@ -1,0 +1,64 @@
+name: dirigentenstab
+services:
+  app:
+    image: ${IMAGE:-ghcr.io/candlelightner/dirigentenstab:0.1.0}
+    build: .
+    restart: unless-stopped
+    init: true
+    user: '10001:10001'
+    ports:
+      - '${BIND_ADDRESS:-127.0.0.1}:${BIND_PORT:-3000}:8088'
+    environment:
+      CLOUDSTACK_URL: ${CLOUDSTACK_URL:?Configure CLOUDSTACK_URL}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Configure HTTPS PUBLIC_ORIGIN}
+      DATABASE: /data/dirigentenstab.db
+      MASTER_KEY_FILE: /run/secrets/master_key
+      APP_TLS_CERT: /run/secrets/tls_cert
+      APP_TLS_KEY: /run/secrets/tls_key
+      SSH_NETWORKS: ${SSH_NETWORKS:-10.253.80.0/24}
+      PYTHONDONTWRITEBYTECODE: '1'
+    volumes:
+      - app_data:/data
+    secrets:
+      - master_key
+      - tls_cert
+      - tls_key
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /home/dirigent:uid=10001,gid=10001,mode=0700,size=32m
+    shm_size: 32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2
+    networks:
+      management:
+        ipv4_address: 172.30.253.2
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8088/healthz',context=ssl._create_unverified_context(),timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+volumes:
+  app_data:
+    name: dirigentenstab_data
+networks:
+  management:
+    ipam:
+      config:
+        - subnet: 172.30.253.0/24
+secrets:
+  master_key:
+    file: ${MASTER_KEY_PATH:-./secrets/master_key}
+  tls_cert:
+    file: ${TLS_CERT_PATH:-./secrets/tls.crt}
+  tls_key:
+    file: ${TLS_KEY_PATH:-./secrets/tls.key}

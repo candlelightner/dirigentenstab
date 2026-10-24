@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dirigentenstab"
+version = "0.1.0"
+description = "Small CloudStack-backed hierarchical AI agent manager"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "nicegui>=3,<4",
+  "pydantic-ai-slim[openai]>=1,<2",
+  "cryptography>=46,<49",
+  "asyncssh>=2.21,<3",
+  "httpx>=0.28,<1",
+  "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.14,<1"]
+browser = ["playwright==1.64.1"]
+
+[project.scripts]
+dirigentenstab = "dirigentenstab.web:main"
+
+[tool.setuptools.packages.find]
+include = ["dirigentenstab*"]
+
+[tool.setuptools.package-data]
+dirigentenstab = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["browser: real Chromium tests (install playwright and chromium)",
+           "live: real private CloudStack/KVM acceptance tests (explicit opt-in)"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "ASYNC"]

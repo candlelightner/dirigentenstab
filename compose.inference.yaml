@@ -1,0 +1,8 @@
+services:
+  app:
+    networks:
+      inference: {}
+networks:
+  inference:
+    external: true
+    name: dirigentenstab-inference

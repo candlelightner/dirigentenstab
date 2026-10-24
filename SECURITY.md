@@ -1,0 +1,1 @@
+Please report vulnerabilities privately through GitHub's security reporting facility if enabled, or contact the repository owner without including credentials, private conversations, database files or host logs. See [security boundaries](docs/SECURITY.md).
