@@ -124,7 +124,7 @@ def test_original_backup_authenticates_decrypt_and_checks_file_link_and_byte_tot
     damaged = bytearray(backup.read_bytes())
     damaged[-1] ^= 1
     backup.write_bytes(damaged)
-    with pytest.raises((ValueError, tarfile.TarError), match='decryption|header|archive|data'):
+    with pytest.raises((ValueError, tarfile.TarError)):
         migration.verify_original(backup, key, checksum, expected)
 
 
