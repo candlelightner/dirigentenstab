@@ -713,10 +713,6 @@ class Service:
             else:
                 if native_key_id:
                     pair = self._native_pair(available, agent, key_id=native_key_id)
-                    permissions = await call('listUserKeyRules', {'keypairid': pair['id']})
-                    rules = permissions.get('keypermission', [])
-                    if rules or int(permissions.get('count', len(rules))) != 0:
-                        raise PermissionError('Selected key has explicit native rules; use rotate or migrate-key for account-role-only authentication')
                 else:
                     pair = await self._credentials(call, agent, rotation['operation_id'])
                 self.store.execute("UPDATE credential_rotations SET replacement=?,phase='validating',updated=? WHERE agent_id=?",
