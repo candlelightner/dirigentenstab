@@ -445,3 +445,94 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
         await user.should_see('Thinking support could not be verified')
         await user.should_not_see('Private model API failure payload')
         assert selector.options == {'default': 'Model default'} and selector.value == 'default'
+
+
+@pytest.mark.parametrize('restored,final_status', [(False, 'interrupted'), (False, 'reconciliation'), (True, 'interrupted'), (True, 'running')])
+async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores_controls(restored, final_status):
+    identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account'}
+
+    class Auth:
+        async def identity(self, token):
+            return identity
+
+    class Service:
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            assert current == identity and agent_id == 'agent'
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        status = 'running'
+        task = None
+        stopped = []
+
+        async def conversations(self, current, agent_id):
+            return [{'id': 'conversation', 'title': 'Owned running task'}]
+
+        async def restore(self, current, conversation_id):
+            assert current == identity and conversation_id == 'conversation'
+            return {'id': conversation_id, 'agent_id': 'agent', 'messages': [
+                {'kind': 'response', 'parts': [{'part_kind': 'text', 'content': 'Partial reply retained'}]}],
+                'runs': [{'id': 'operation', 'status': self.status, 'events': [],
+                          'budget': {'reason': 'stopped', 'resumable': self.status == 'interrupted'}}]}
+
+        async def chat(self, current, agent_id, conversation_id, prompt, on_event):
+            self.task = asyncio.current_task()
+            await on_event({'type': 'run_started', 'operation_id': 'operation', 'conversation_id': 'conversation'})
+            await on_event({'type': 'text', 'text': 'Partial reply retained'})
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.status = final_status
+                raise
+
+        async def stop(self, current, operation_id):
+            assert current == identity and operation_id == 'operation'
+            self.stopped.append(operation_id)
+            if self.task:
+                self.task.cancel()
+                try:
+                    await self.task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                self.status = final_status
+            return {'operation_id': operation_id, 'status': self.status}
+
+    runtime = Runtime()
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), runtime)
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Configure')
+        await user.should_not_see('Stop agent')
+        if restored:
+            user.find('Conversation').trigger('update:modelValue', {'value': 0})
+        else:
+            user.find('Message').type('Run a task')
+            user.find('Send').click()
+        await user.should_see('Stop agent')
+        await user.should_see('Partial reply retained')
+        user.find('Stop agent').click()
+        if final_status == 'running':
+            await user.should_see('Stop requested')
+            await user.should_see('Stop agent')
+            assert not next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
+            return
+        await user.should_see('Requires reconciliation' if final_status == 'reconciliation' else 'Stopped')
+        await user.should_not_see('Stop agent')
+        await user.should_not_see('thinking_indicator')
+        await user.should_see('Partial reply retained')
+        assert runtime.stopped == ['operation']
+        assert next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
+        user.find('Message').type('Next task')
+        assert next(iter(user.find(kind=ui.button, content='Send').elements)).enabled
+        if final_status == 'interrupted':
+            await user.should_see('Continue saved task')

@@ -157,7 +157,11 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'thinking indicator' in prompt:
+    if 'stop fixture' in prompt:
+        yield 'Partial reply retained'
+        await asyncio.sleep(60)
+        yield 'This response should be stopped'
+    elif 'thinking indicator' in prompt:
         await asyncio.sleep(0.5)
         yield 'Pending response complete.'
     elif 'bounded lifecycle' in prompt:

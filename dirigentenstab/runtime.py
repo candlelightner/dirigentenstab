@@ -155,6 +155,7 @@ class Runtime:
         self.guest = Guest(service)
         self.slots = asyncio.Semaphore(4)
         self.running = set()
+        self.active = {}
         for run in self.service.store.all("SELECT id,checkpoint FROM chat_runs WHERE status='running'"):
             saved = self.service.store.open(run['checkpoint']) if run['checkpoint'] else None
             uncertain = bool(saved and any(item['status'] in {'running', 'uncertain'}
@@ -227,6 +228,22 @@ class Runtime:
             'requests_per_window': REQUESTS_PER_WINDOW, 'tools_per_window': TOOLS_PER_WINDOW,
             'automatic_windows': AUTOMATIC_WINDOWS,
         }
+
+    async def stop(self, identity, operation_id):
+        run = self.service.store.one('SELECT r.id,r.agent_id,r.status FROM chat_runs r '
+                                     'JOIN conversations c ON c.id=r.conversation_id '
+                                     'WHERE r.id=? AND c.human_id=?', (operation_id, identity['userid']))
+        if not run:
+            raise PermissionError('Execution is not accessible')
+        await self.service.authorize(identity, run['agent_id'], include_disabled=True)
+        task = self.active.get(operation_id)
+        if task and not task.done():
+            if not task.cancelling():
+                task.cancel()
+            # A second stop must not interrupt the first cancellation's durable cleanup.
+            await asyncio.wait({task}, timeout=5)
+        status = self.service.store.one('SELECT status FROM chat_runs WHERE id=?', (operation_id,))['status']
+        return {'operation_id': operation_id, 'status': status}
 
     async def resume(self, identity, operation_id, on_event=None):
         run = self.service.store.one('SELECT * FROM chat_runs WHERE id=?', (operation_id,))
@@ -626,6 +643,7 @@ class Runtime:
                 (operation_id, conversation_id, 'running', agent_id, time.time(), time.time(),
                  self.service.store.seal([])))
         self.running.add(conversation_id)
+        self.active[operation_id] = asyncio.current_task()
 
         def checkpoint():
             nonlocal last_checkpoint, accounted_requests, accounted_tools
@@ -761,8 +779,16 @@ class Runtime:
                     (agent_id, agent_id, agent_id))
             pending = pending or any(item['status'] in {'running', 'uncertain'} for item in state['mutations'].values())
             status = 'reconciliation' if pending else 'interrupted' if isinstance(exc, asyncio.CancelledError) else 'failed'
-            error = diagnose(exc, operation_id=operation_id, agent_id=agent_id, tool=active_tool,
-                             reconciliation=bool(pending))
+            if isinstance(exc, asyncio.CancelledError):
+                state.update(reason='stopped', resumable=not bool(pending))
+                for mutation in state['mutations'].values():
+                    if mutation['status'] == 'running':
+                        mutation['status'] = 'uncertain'
+                error = OperationError('provisioning' if pending else 'stopped', 'Agent execution stopped.',
+                                       operation_id, reconciliation=bool(pending))
+            else:
+                error = diagnose(exc, operation_id=operation_id, agent_id=agent_id, tool=active_tool,
+                                 reconciliation=bool(pending))
             if isinstance(exc, TimeoutError) and not pending:
                 status = 'interrupted'
                 state.update(reason='timeout', resumable=True)
@@ -780,3 +806,4 @@ class Runtime:
                                            (status, time.time(), operation_id))
             finally:
                 self.running.discard(conversation_id)
+                self.active.pop(operation_id, None)

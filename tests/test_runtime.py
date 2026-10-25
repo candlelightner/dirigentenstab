@@ -96,7 +96,7 @@ def service(tmp_path):
         async def agent(self, agent_id):
             return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
 
-        async def authorize(self, identity, agent_id):
+        async def authorize(self, identity, agent_id, **kwargs):
             if identity['userid'] != 'human' or agent_id == 'other':
                 raise PermissionError('not authorized')
             return await self.agent(agent_id)
@@ -1044,3 +1044,167 @@ async def test_current_openai_responses_replay_encrypted_reasoning_and_assistant
     assert reasoning['encrypted_content'] == 'opaque-reasoning'
     assistant = next(item for item in requests[1]['input'] if item.get('role') == 'assistant')
     assert assistant['phase'] == 'final_answer'
+
+
+async def test_stop_after_reload_preserves_partial_stream_and_can_resume(service, monkeypatch):
+    import asyncio
+
+    streamed, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def model(messages, info):
+        try:
+            yield 'Saved partial answer'
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+
+    async def emit(event):
+        assert event['operation_id'] in manager.active
+        if event['type'] == 'text':
+            streamed.set()
+
+    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Inspect', emit))
+    await asyncio.wait_for(streamed.wait(), 2)
+    conversation = service.store.one('SELECT id FROM conversations')
+    restored = await manager.restore({'userid': 'human'}, conversation['id'])
+    operation_id = restored['runs'][0]['id']
+    results = await asyncio.gather(manager.stop({'userid': 'human'}, operation_id),
+                                   manager.stop({'userid': 'human'}, operation_id))
+    assert all(result == {'operation_id': operation_id, 'status': 'interrupted'} for result in results)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set() and manager.active == {} and manager.running == set()
+    restored = await manager.restore({'userid': 'human'}, conversation['id'])
+    assert 'Saved partial answer' in str(restored['messages'])
+    assert restored['runs'][0]['budget']['reason'] == 'stopped'
+    assert restored['runs'][0]['budget']['resumable'] is True
+
+    async def complete(messages, info):
+        yield 'Finished safely'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=complete))
+    result = await manager.resume({'userid': 'human'}, operation_id)
+    assert result['status'] == 'completed' and result['output'] == 'Finished safely'
+    assert await manager.stop({'userid': 'human'}, operation_id) == {'operation_id': operation_id, 'status': 'completed'}
+
+
+async def test_stop_cancels_execution_queued_before_model_dispatch(service, monkeypatch):
+    import asyncio
+
+    started = asyncio.Event()
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+
+    def forbidden(*args):
+        pytest.fail('A queued, stopped execution must not reach the model')
+
+    monkeypatch.setattr(runtime, 'build_model', forbidden)
+
+    async def emit(event):
+        if event['type'] == 'run_started':
+            assert event['operation_id'] in manager.active
+            started.set()
+
+    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Inspect', emit))
+    await asyncio.wait_for(started.wait(), 2)
+    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
+    assert (await manager.stop({'userid': 'human'}, operation_id))['status'] == 'interrupted'
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs')['checkpoint'])
+    assert state['reason'] == 'stopped' and state['resumable'] and not state['mutations']
+    assert not manager.active and not manager.running
+
+
+async def test_stop_rejects_other_humans_and_current_domain_scope_even_for_known_run(service, monkeypatch):
+    async def model(messages, info):
+        yield 'Complete'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    completed = await manager.chat({'userid': 'human'}, 'parent', None, 'Inspect')
+    with pytest.raises(PermissionError):
+        await manager.stop({'userid': 'other-human', 'type': 1}, completed['operation_id'])
+    with pytest.raises(PermissionError):
+        await manager.stop({'userid': 'human'}, 'unknown')
+
+    async def denied(*args, **kwargs):
+        raise PermissionError('Outside current domain scope')
+
+    monkeypatch.setattr(service, 'authorize', denied)
+    with pytest.raises(PermissionError, match='Outside current domain scope'):
+        await manager.stop({'userid': 'human', 'type': 1}, completed['operation_id'])
+    assert service.store.one('SELECT status FROM chat_runs')['status'] == 'completed'
+
+
+async def test_stop_during_mutation_preserves_uncertain_result_and_blocks_resume(service, monkeypatch):
+    import asyncio
+
+    dispatched, cancelled = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def mutation(agent_id, command, params):
+        calls.append((agent_id, command, params))
+        dispatched.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def model(messages, info):
+        yield {0: DeltaToolCall(name='execute_api', json_args='{"command":"destroyVirtualMachine","params":{"id":"vm"}}',
+                                tool_call_id='mutating-call')}
+
+    service.execute = mutation
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Destroy selected VM'))
+    await asyncio.wait_for(dispatched.wait(), 2)
+    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
+    assert (await manager.stop({'userid': 'human'}, operation_id))['status'] == 'reconciliation'
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run = service.store.one('SELECT * FROM chat_runs')
+    state = service.store.open(run['checkpoint'])
+    assert cancelled.is_set() and len(calls) == 1
+    assert state['reason'] == 'stopped' and state['resumable'] is False
+    assert list(state['mutations'].values())[0]['status'] == 'uncertain'
+    with pytest.raises(ValueError, match='cannot be continued safely'):
+        await manager.resume({'userid': 'human'}, operation_id)
+    assert len(calls) == 1 and not manager.active
+
+
+async def test_stop_propagates_through_delegation_and_saves_child_history(service, monkeypatch):
+    import asyncio
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def parent(messages, info):
+        yield {0: DeltaToolCall(name='delegate', json_args='{"agent_id":"child","task":"Inspect delegated task"}',
+                                tool_call_id='delegated-call')}
+
+    async def child(messages, info):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(runtime, 'build_model', lambda provider, model, store:
+                        FunctionModel(child) if model == 'child' else FunctionModel(stream_function=parent))
+    manager = runtime.Runtime(service)
+    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Delegate inspection'))
+    await asyncio.wait_for(entered.wait(), 2)
+    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
+    assert (await manager.stop({'userid': 'human'}, operation_id))['status'] == 'interrupted'
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    child_conversation = service.store.one("SELECT messages FROM conversations WHERE agent_id='child'")
+    assert cancelled.is_set() and child_conversation
+    assert 'Inspect delegated task' in str(service.store.open(child_conversation['messages']))
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs')['checkpoint'])
+    assert state['reason'] == 'stopped' and state['resumable'] is True
+    assert not manager.active and not manager.running
