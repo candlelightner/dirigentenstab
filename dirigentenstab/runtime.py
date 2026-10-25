@@ -567,13 +567,13 @@ class Runtime:
                     count = len(content) if isinstance(content, list) else next(
                         (len(v) for v in content.values() if isinstance(v, list)), None) if isinstance(content, dict) else None
                     summary = (f'{count} results' if count is not None else
-                               'Operation failed' if isinstance(content, dict) and 'error' in content else 'Finished')
+                               'Operation failed' if isinstance(content, dict) and bool(content.get('error')) else 'Finished')
                     await emit({'type': 'tool_result', 'name': event.part.tool_name,
                                 'call_id': event.part.tool_call_id, 'target': targets.get(event.part.tool_call_id, ''),
                                 'summary': summary,
                                 'duration': round(time.monotonic() - started.get(event.part.tool_call_id,
                                                                                time.monotonic()), 2),
-                                'failed': event.part.part_kind == 'retry-prompt' or isinstance(content, dict) and 'error' in content,
+                                'failed': event.part.part_kind == 'retry-prompt' or isinstance(content, dict) and bool(content.get('error')),
                                 'content': str(content)[:16384] if not isinstance(content, dict)
                                 else content if len(json.dumps(content, default=str)) <= 16384
                                 else {'summary': str(content)[:16384], 'truncated': True}})

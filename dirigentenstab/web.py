@@ -426,6 +426,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             history_select.disable()
             agent_choice.disable()
             continue_button.set_visibility(False)
+            continue_button.disable()
             if not resume:
                 message('human', text)
                 prompt.set_value('')
@@ -480,6 +481,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 new_button.enable()
                 history_select.enable()
                 agent_choice.enable()
+                continue_button.enable()
 
         async def configure_agent():
             current = await actor()

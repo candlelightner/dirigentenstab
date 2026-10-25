@@ -461,6 +461,9 @@ async def test_ssh_readiness_can_retry_and_new_verification_calls_are_fresh(serv
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     result = await manager.chat({'userid': 'human'}, 'parent', None, 'Run Python')
     assert result['status'] == 'completed' and len(attempts) == 3
+    saved = await manager.restore({'userid': 'human'}, result['conversation_id'])
+    calls = [e for e in saved['runs'][-1]['events'] if e['type'] == 'tool_result']
+    assert [e['failed'] for e in calls] == [True, False, False]
 
 
 @pytest.mark.parametrize('phase', ['rejected', 'complete'])

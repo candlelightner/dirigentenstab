@@ -81,7 +81,7 @@ async def perform(options):
             conversation = app.store.one('SELECT title FROM conversations WHERE id=?', (state['conversation_id'],))
             if options.resume:
                 await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
-                await page.get_by_role('option', name=conversation['title'], exact=True).click()
+                await page.get_by_role('option', name=conversation['title'], exact=True).first.click()
             continuations = 0
             deadline = time.monotonic() + 2000
             while time.monotonic() < deadline:
@@ -124,7 +124,7 @@ async def perform(options):
             await page.reload()
             await page.wait_for_function('window.socket?.connected && window.did_handshake')
             await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
-            await page.get_by_role('option', name=conversation['title'], exact=True).click()
+            await page.get_by_role('option', name=conversation['title'], exact=True).first.click()
             await page.get_by_text('Completed · Reference: ' + run['id'], exact=True).wait_for()
             await page.set_viewport_size({'width': 390, 'height': 844})
             await page.wait_for_timeout(400)

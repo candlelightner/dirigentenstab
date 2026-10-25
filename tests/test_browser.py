@@ -223,10 +223,11 @@ async def test_browser_budget_pause_reload_and_continue(browser_app):
         await page.get_by_label('Conversation', exact=True).fill('bounded lifecycle')
         await page.get_by_role('option', name='bounded lifecycle', exact=True).click()
         await continuation.wait_for()
-        for _ in range(2):
+        for tools in (4, 5):
             await continuation.click()
-            await continuation.wait_for(state='hidden')
-            await page.get_by_role('status').filter(has_text='Completed').or_(continuation).first.wait_for()
+            await page.get_by_text(f'Tools: {tools}', exact=False).wait_for()
+            await page.get_by_text('Paused · Completed activity saved' if tools == 4 else 'Completed',
+                                   exact=tools == 5).wait_for()
         await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
         assert not await continuation.is_visible()
         await page.get_by_text('Tools: 5', exact=False).wait_for()
