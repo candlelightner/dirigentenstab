@@ -1,0 +1,13 @@
+.git
+.env
+.venv
+.work
+secrets
+data
+__pycache__
+.pytest_cache
+.ruff_cache
+*.db*
+tests
+docs/*
+!docs/THIRD_PARTY.md

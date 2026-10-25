@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+    branches: [main, 'implementation/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.lock && pip install --no-deps -e .
+      - run: ruff check .
+      - run: pytest -q
+      - run: bash -n setup.sh
+      - run: docker compose --env-file .env.example config --quiet
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,1 @@
+ALTER TABLE conversations ADD COLUMN imported INTEGER NOT NULL DEFAULT 0;

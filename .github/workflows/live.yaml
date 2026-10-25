@@ -1,0 +1,26 @@
+name: Real CloudStack KVM acceptance (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Run tracked VM, nested GPU quota and offering restriction tests on the private test cloud
+        type: boolean
+        required: true
+        default: false
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    if: inputs.confirm && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, dirigentenstab-acceptance]
+    timeout-minutes: 30
+    environment: private-cloud-acceptance
+    steps:
+      - name: Test the explicitly deployed installation
+        env:
+          DIRIGENTENSTAB_INSTALL: ${{ vars.DIRIGENTENSTAB_INSTALL }}
+        run: |
+          test -n "$DIRIGENTENSTAB_INSTALL"
+          cd "$DIRIGENTENSTAB_INSTALL"
+          sudo -n .venv/bin/python scripts/live_acceptance.py --run
+          sudo -n .venv/bin/python scripts/gpu_acceptance.py --run

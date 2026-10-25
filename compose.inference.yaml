@@ -1,0 +1,10 @@
+services:
+  app:
+    networks:
+      management:
+        gw_priority: 100
+      inference: {}
+networks:
+  inference:
+    external: true
+    name: dirigentenstab-inference
