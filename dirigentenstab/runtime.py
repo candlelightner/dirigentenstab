@@ -36,6 +36,7 @@ from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_ope
 from .mcp import MCP
 from .mcp_tools import RemoteTools
 from . import thinking
+from .compaction import CompactionModel
 
 
 REQUESTS_PER_WINDOW = 20
@@ -200,6 +201,32 @@ class Runtime:
         metadata = next((model for model in models if model['id'] == model_id), None)
         return thinking.capabilities(provider, model_id, metadata)
 
+    async def context_limits(self, identity, provider_id, model_id, context_window=None):
+        allowed = await self.service.providers(identity)
+        if not any(provider['id'] == provider_id for provider in allowed):
+            raise PermissionError('Provider is unavailable')
+        if context_window is not None and (type(context_window) is not int or not 2 <= context_window <= 2147483647):
+            raise ValueError('Context window must be a whole token count from 2 to 2147483647')
+        window, source = context_window, 'Manual context-window override.'
+        if window is None:
+            source = 'The model API did not advertise a context window; enter a manual token limit.'
+            try:
+                provider, models = await self._catalogue(identity, provider_id)
+                selected = model_id or provider['default_model']
+                metadata = next((model for model in models if model['id'] == selected), {})
+                candidates = [(field, metadata.get(field)) for field in ('context_window', 'context_length', 'max_model_len')]
+                if isinstance(metadata.get('meta'), dict):
+                    candidates.append(('meta.n_ctx', metadata['meta'].get('n_ctx')))
+                for field, value in candidates:
+                    if type(value) is int and 2 <= value <= 2147483647:
+                        window, source = value, f'Provider model API ({field}).'
+                        break
+            except (httpx.HTTPError, ValueError):
+                source = 'Model API unavailable; enter a manual context-window token limit.'
+        reserve = min(8192, max(1, window // 4)) if window else 8192
+        return {'context_window': window, 'response_reserve': reserve,
+                'usable_tokens': window - reserve if window else None, 'source': source}
+
     async def conversations(self, identity, agent_id):
         await self.service.authorize(identity, agent_id)
         return self.service.store.all(
@@ -227,6 +254,8 @@ class Runtime:
         return {key: checkpoint.get(key) for key in ('requests', 'tool_calls', 'windows', 'cache_hits', 'reason', 'resumable')} | {
             'requests_per_window': REQUESTS_PER_WINDOW, 'tools_per_window': TOOLS_PER_WINDOW,
             'automatic_windows': AUTOMATIC_WINDOWS,
+            'context': checkpoint.get('context'),
+            'compactions': checkpoint.get('compactions', 0),
         }
 
     async def stop(self, identity, operation_id):
@@ -404,7 +433,7 @@ class Runtime:
                          (service.store.seal(state), operation_id))
         service.store.audit(identity['userid'], 'reconcile-execution', operation_id)
 
-    async def _agent(self, identity, agent_id, budget, depth, emit):
+    async def _agent(self, identity, agent_id, budget, depth, emit, *, conversation_id=None):
         record = await self.service.authorize(identity, agent_id)
         provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (record['provider_id'],))
         if not provider:
@@ -418,6 +447,37 @@ class Runtime:
             if level not in capabilities['options']:
                 raise ValueError('Selected thinking level is unavailable for this model; refresh its thinking settings')
         model_settings = {'max_tokens': 8192, 'timeout': 60, **thinking.model_settings(provider, model_id, level)}
+        model = build_model(provider, model_id, self.service.store)
+        if record.get('auto_compact_percent') is not None or record.get('context_window') is not None:
+            limits = await self.context_limits(identity, record['provider_id'], model_id, record.get('context_window'))
+            model_settings['max_tokens'] = limits['response_reserve']
+            summary_model = None
+            if record.get('auto_compact_percent') is not None:
+                summary_provider = (self.service.store.one('SELECT * FROM providers WHERE id=?',
+                                                           (record['compaction_provider_id'],))
+                                    if record.get('compaction_provider_id') else provider)
+                if not summary_provider:
+                    raise ValueError('Compaction provider is unavailable')
+                summary_id = ((record.get('compaction_model') or summary_provider['default_model'])
+                              if record.get('compaction_provider_id') else model_id)
+                summary_model = (model if summary_provider['id'] == provider['id'] and summary_id == model_id else
+                                 build_model(summary_provider, summary_id, self.service.store))
+
+            async def context_event(event):
+                state = budget.get('state')
+                if state is not None:
+                    if event.get('context'):
+                        state['context'] = event['context'] | {'agent_id': agent_id}
+                    if event['type'] == 'compaction' and event.get('phase') == 'completed':
+                        state['compactions'] = state.get('compactions', 0) + 1
+                await emit(event)
+
+            model = CompactionModel(model, store=self.service.store, conversation_id=conversation_id,
+                                    summary_model=summary_model, context_window=limits['context_window'],
+                                    threshold_percent=record.get('auto_compact_percent'),
+                                    response_reserve=limits['response_reserve'], on_event=context_event,
+                                    pending=lambda: any(item['status'] in {'running', 'uncertain'}
+                                                        for item in budget.get('state', {}).get('mutations', {}).values()))
         def check_window(messages):
             if 'window_deadline' in budget and time.monotonic() >= budget['window_deadline']:
                 raise ExecutionCheckpoint('time')
@@ -483,7 +543,7 @@ class Runtime:
                         'deployment_id': getattr(exc, 'operation_id', None)}
 
         agent = Agent(
-            build_model(provider, model_id, self.service.store),
+            model,
             instructions=(instructions + '\nReuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
                           'List-valued CloudMonkey parameters must be comma-separated strings, never JSON arrays. '
                           'Prefer exact available_api_names instead of repeated searches for known commands. '
@@ -551,7 +611,6 @@ class Runtime:
                 return {'error': 'Delegation is not authorized'}
             await self.service.authorize(identity, target)
             budget['remaining'] -= 1
-            child = await self._agent(identity, target, budget, depth + 1, emit)
             task = self.service.redact(task)
             state = budget.get('state')
             key = hashlib.sha256(json.dumps([target, task]).encode()).hexdigest()
@@ -573,6 +632,7 @@ class Runtime:
                 if state:
                     state['delegations'][key] = {'conversation_id': conversation_id}
                     budget['save']()
+            child = await self._agent(identity, target, budget, depth + 1, emit, conversation_id=conversation_id)
             captured_child = []
             try:
                 with capture_run_messages() as captured_child:
@@ -595,7 +655,7 @@ class Runtime:
     async def chat(self, identity, agent_id, conversation_id, prompt, on_event=None, *, _resume=None):
         if not _resume and (not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32768):
             raise ValueError('Message must contain 1–32768 characters')
-        await self.service.authorize(identity, agent_id)
+        record = await self.service.authorize(identity, agent_id)
         history_json = []
         if conversation_id:
             conversation = await self.restore(identity, conversation_id)
@@ -614,7 +674,7 @@ class Runtime:
             )
         if conversation_id in self.running:
             raise ValueError('This conversation already has an execution in progress')
-        if len(json.dumps(history_json)) > 2 * 1024 * 1024:
+        if len(json.dumps(history_json)) > 2 * 1024 * 1024 and record.get('auto_compact_percent') is None:
             raise ValueError('Conversation reached its context limit; start a new conversation')
         prompt = self.service.redact(prompt)
         history = load_history(history_json, close_pending=not bool(_resume))
@@ -719,7 +779,7 @@ class Runtime:
         try:
             await emit({'type': 'run_started', 'conversation_id': conversation_id})
             async with self.slots, asyncio.timeout(INVOCATION_SECONDS):
-                agent = await self._agent(identity, agent_id, budget, 0, emit)
+                agent = await self._agent(identity, agent_id, budget, 0, emit, conversation_id=conversation_id)
                 for window in range(AUTOMATIC_WINDOWS):
                     state['windows'] += 1
                     with capture_run_messages() as captured:

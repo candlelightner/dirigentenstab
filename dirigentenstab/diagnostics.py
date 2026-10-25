@@ -67,6 +67,9 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         category, description = 'authentication', 'The model provider rejected authentication. Check its credentials.'
     elif isinstance(exc, (ModelAPIError, ModelHTTPError, UnexpectedModelBehavior, UsageLimitExceeded, httpx.HTTPError)):
         category, description = 'model-provider', 'The model provider could not complete this reply. Check its configuration.'
+    elif isinstance(exc, RuntimeError) and str(exc) == (
+            'Context compaction failed; the original conversation and previous summary are preserved'):
+        category, description = 'compaction', str(exc) + '.'
     elif isinstance(exc, ValueError):
         category, description = 'configuration', 'The request or configuration is invalid. Review the selected settings.'
         safe_messages = {
@@ -82,6 +85,17 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
             'Provider returned an invalid model catalogue; enter a model ID manually',
             'Use a short subgroup name with letters, numbers, spaces, underscores or dashes',
             'Subgroup configuration too large', 'Message must contain 1–32768 characters',
+            'Compaction provider missing', 'Compaction provider is unavailable', 'Choose a compaction model',
+            'Invalid compaction provider', 'Invalid compaction model',
+            'Automatic compaction must be a whole percentage from 1 to 99, or disabled',
+            'Context window must be a whole token count from 2 to 2147483647',
+            'Set a known context window before enabling automatic compaction',
+            'Context compaction requires a known context window, output reserve and threshold of 1–99 percent',
+            'Context compaction cannot proceed while an operation needs reconciliation',
+            'Context cannot be compacted safely; the current request and recent tool exchange must remain intact',
+            'Context cannot shrink while preserving the current user request and system prompts',
+            'Context compaction returned an empty summary; the original conversation is preserved',
+            'Context compaction did not produce a smaller context that fits; the original conversation is preserved',
         }
         if str(exc) in safe_messages:
             description = str(exc) + '.'

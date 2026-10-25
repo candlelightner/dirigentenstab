@@ -15,6 +15,8 @@ from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, check_vm_policy
 from .gpu import helper_call
 
+_UNSET = object()
+
 
 def first(response, key):
     value = response.get(key)
@@ -464,8 +466,9 @@ class Service:
         return provider_id
 
     async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None,
-                           *, thinking=None):
-        await self.authorize(identity, agent_id)
+                           *, thinking=None, compaction_provider_id=_UNSET, compaction_model=_UNSET,
+                           auto_compact_percent=_UNSET, context_window=_UNSET):
+        agent = await self.authorize(identity, agent_id)
         if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
             raise ValueError('Provider missing')
         if len(model) > 300 or len(instructions) > 32000:
@@ -473,12 +476,40 @@ class Service:
         if thinking is not None and (not isinstance(thinking, str)
                                      or not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', thinking)):
             raise ValueError('Invalid thinking level')
+        compaction = {key: agent.get(key) if value is _UNSET else value for key, value in {
+            'compaction_provider_id': compaction_provider_id, 'compaction_model': compaction_model,
+            'auto_compact_percent': auto_compact_percent, 'context_window': context_window}.items()}
+        selected_provider = compaction['compaction_provider_id']
+        if selected_provider is not None and (not isinstance(selected_provider, str) or len(selected_provider) > 256):
+            raise ValueError('Invalid compaction provider')
+        compaction['compaction_provider_id'] = selected_provider or None
+        if compaction['compaction_model'] is None:
+            compaction['compaction_model'] = ''
+        if not isinstance(compaction['compaction_model'], str) or len(compaction['compaction_model']) > 256:
+            raise ValueError('Invalid compaction model')
+        if compaction['compaction_provider_id']:
+            selected = self.store.one('SELECT default_model FROM providers WHERE id=?',
+                                      (compaction['compaction_provider_id'],))
+            if not selected:
+                raise ValueError('Compaction provider missing')
+            if compaction['auto_compact_percent'] is not None and not (compaction['compaction_model'].strip() or selected['default_model']):
+                raise ValueError('Choose a compaction model')
+        else:
+            compaction['compaction_model'] = ''
+        percentage = compaction['auto_compact_percent']
+        if percentage is not None and (type(percentage) is not int or not 1 <= percentage <= 99):
+            raise ValueError('Automatic compaction must be a whole percentage from 1 to 99, or disabled')
+        window = compaction['context_window']
+        if window is not None and (type(window) is not int or not 2 <= window <= 2147483647):
+            raise ValueError('Context window must be a whole token count from 2 to 2147483647')
         if can_provision is not None:
             if identity['type'] != 1:
                 raise PermissionError('Only a platform administrator can change provisioning permission')
             self.store.execute('UPDATE agents SET can_provision=? WHERE id=?', (bool(can_provision), agent_id))
-        self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking) WHERE id=?',
-                           (provider_id or None, model, instructions, thinking, agent_id))
+        self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking),'
+                           'compaction_provider_id=?,compaction_model=?,auto_compact_percent=?,context_window=? WHERE id=?',
+                           (provider_id or None, model, instructions, thinking, compaction['compaction_provider_id'],
+                            compaction['compaction_model'], percentage, window, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, call, user_id, name):

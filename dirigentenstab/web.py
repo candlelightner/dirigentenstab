@@ -250,6 +250,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 gpu_recover_button = ui.button('Check GPU recovery', icon='restore').props('outline')
                 gpu_recover_button.set_visibility(False)
                 budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
+                context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
+                compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
                 with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
                         'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
@@ -321,6 +323,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             continue_button.set_visibility(False)
             gpu_recover_button.set_visibility(False)
             budget_label.set_text('')
+            context_label.set_text('')
+            compaction_status.set_text('')
             transcript.clear()
             tool_cards.clear()
             progress.set_text('Ready')
@@ -414,6 +418,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             prompt.enable()
             continue_button.set_visibility(False)
             budget_label.set_text('')
+            context_label.set_text('')
+            compaction_status.set_text('')
             state['conversation'] = restored['id']
             state['imported'] = bool(restored.get('imported'))
             progress.set_text('Imported history is read-only. Sending starts a new conversation without '
@@ -450,11 +456,30 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 continue_button.set_visibility(False)
                 gpu_recover_button.set_visibility(False)
                 budget_label.set_text('')
+                context_label.set_text('')
+                compaction_status.set_text('')
                 progress.set_text('')
                 history_select.set_value(None)
                 transcript.clear()
 
+        def show_context(context):
+            estimate = context.get('estimated_tokens', 0)
+            usable = context.get('usable_tokens')
+            if usable:
+                percent = context.get('percent')
+                usage = f'Context: ~{estimate:,} / {usable:,} usable tokens'
+                if percent is not None:
+                    usage += f' ({percent:.1f}%)'
+                usage += f" · Window {context['context_window']:,} − response reserve {context['response_reserve']:,}"
+            else:
+                usage = f'Context: ~{estimate:,} tokens · model context limit unavailable'
+            if context.get('threshold_percent') is not None:
+                usage += f" · Auto-compact at {context['threshold_percent']}%"
+            context_label.set_text(usage + (' · ' + context['source'] if context.get('source') else ''))
+
         def show_budget(budget):
+            if budget.get('context'):
+                show_context(budget['context'])
             budget_label.set_text(f"Requests: {budget.get('requests', 0)} · Tools: {budget.get('tool_calls', 0)} · "
                                   f"Windows: {budget.get('windows', 0)} · Reused: {budget.get('cache_hits', 0)} · "
                                   f"Window limits: {budget.get('requests_per_window', 20)} requests / "
@@ -475,6 +500,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         def stopped_run(run):
             state['active_operation'] = None
             state['busy'] = False
+            compaction_status.set_text('')
             stop_button.set_visibility(False)
             reconciliation = run['status'] == 'reconciliation'
             progress.set_text(('Requires reconciliation · inspect unfinished remote actions' if reconciliation else
@@ -547,12 +573,19 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.chat_message(name='Agent').classes('w-full max-w-full'):
                     answer = ui.markdown('', extras=['tables', 'fenced-code-blocks'], sanitize=True).classes('markdown w-full')
             progress.set_text('Agent is working…')
+            compaction_status.set_text('')
             chunks = []
 
             async def event_received(event):
                 if event.get('budget'):
                     show_budget(event['budget'])
-                if event.get('type') == 'run_started':
+                if event.get('type') == 'context_usage':
+                    show_context(event['context'])
+                elif event.get('type') == 'compaction':
+                    compaction_status.set_text(event['status'])
+                    if event.get('context'):
+                        show_context(event['context'])
+                elif event.get('type') == 'run_started':
                     state['conversation'] = event['conversation_id']
                     state['active_operation'] = event['operation_id']
                     stop_button.set_visibility(True)
@@ -581,6 +614,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 await histories()
                 await refresh()
             except asyncio.CancelledError:
+                compaction_status.set_text('')
                 progress.set_text('Stopped · activity saved; unfinished remote actions may need reconciliation.')
                 if state['conversation']:
                     restored = await runtime.restore(current, state['conversation'])
@@ -830,6 +864,82 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 thinking.on_value_change(thinking_changed)
                 model.on_value_change(lambda: protect(load_thinking))
+                context_generation = 0
+                context_info = {'usable_tokens': None}
+                with ui.expansion('Context compaction', value=agent.get('auto_compact_percent') is not None).classes('w-full'):
+                    automatic = ui.checkbox('Automatically compact context', value=agent.get('auto_compact_percent') is not None)
+                    auto_percent = ui.number('Compact at % of usable context', value=agent.get('auto_compact_percent') or 75,
+                                             min=1, max=99, precision=0).classes('w-full')
+                    auto_percent.bind_enabled_from(automatic, 'value')
+                    compaction_provider = ui.select({'': 'Same as conversation', **options},
+                        value=agent.get('compaction_provider_id') or '', label='Compaction provider').classes('w-full')
+                    saved_compaction_model = agent.get('compaction_model', '')
+                    compaction_model = ui.select([saved_compaction_model] if saved_compaction_model else [],
+                        value=saved_compaction_model or None, label='Compaction model', with_input=True,
+                        new_value_mode='add-unique').classes('w-full')
+                    compaction_model.bind_visibility_from(compaction_provider, 'value', backward=bool)
+                    compaction_model.bind_enabled_from(compaction_provider, 'value', backward=bool)
+                    compaction_model_status = ui.label('').classes('text-sm').props('role=status')
+                    window_override = ui.number('Context window override (tokens, optional)', value=agent.get('context_window'),
+                                                min=2, precision=0).props('clearable').classes('w-full')
+                    ui.label('The conversation model API supplies its context limit unless overridden. '
+                             'Usage is estimated; the usable window excludes the response reserve.').classes('text-sm')
+                    context_source = ui.label('').classes('text-sm').props('role=status')
+
+                async def load_context():
+                    nonlocal context_generation, context_info
+                    context_generation += 1
+                    generation = context_generation
+                    context_info = {'usable_tokens': None}
+                    selected_provider, selected_model = provider.value, (model.value or '').strip()
+                    override = int(window_override.value) if window_override.value is not None else None
+                    context_source.set_text('Checking conversation context limit…')
+                    try:
+                        current = await actor()
+                        limits = (await runtime.context_limits(current, selected_provider, selected_model, override)
+                                  if selected_provider else {'usable_tokens': None,
+                                                            'source': 'Select a conversation provider and model.'})
+                        if (generation != context_generation or provider.value != selected_provider
+                                or (model.value or '').strip() != selected_model):
+                            return
+                        context_info = limits
+                        if limits.get('usable_tokens'):
+                            context_source.set_text(f"Usable context: {limits['context_window']:,} − "
+                                f"{limits['response_reserve']:,} response tokens = {limits['usable_tokens']:,} tokens. "
+                                + limits['source'])
+                        else:
+                            context_source.set_text(limits['source'] + ' Enter a context window override before enabling automatic compaction.')
+                    except Exception as exc:
+                        if generation == context_generation:
+                            context_info = {'usable_tokens': None}
+                            error = diagnose(exc, agent_id=agent['id'], tool='context_limits')
+                            context_source.set_text(str(error) + ' Context limit unavailable; enter a manual override for automatic compaction.')
+
+                async def load_compaction_models():
+                    selected_provider = compaction_provider.value
+                    if not selected_provider:
+                        compaction_model_status.set_text('Uses the conversation provider and model.')
+                        return
+                    compaction_model.props('loading')
+                    try:
+                        choices = await runtime.models(await actor(), selected_provider)
+                        if compaction_provider.value == selected_provider:
+                            selected_model = compaction_model.value
+                            compaction_model.set_options(list(dict.fromkeys(([selected_model] if selected_model else []) + choices)),
+                                                         value=selected_model)
+                            compaction_model_status.set_text('Choose a model or enter a custom model ID.')
+                    except Exception as exc:
+                        if compaction_provider.value == selected_provider:
+                            error = diagnose(exc, agent_id=agent['id'], tool='discover_compaction_models')
+                            compaction_model_status.set_text(str(error) + ' Enter a compaction model ID manually.')
+                    finally:
+                        if compaction_provider.value == selected_provider:
+                            compaction_model.props(remove='loading')
+
+                model.on_value_change(lambda: protect(load_context))
+                window_override.on_value_change(lambda: protect(load_context))
+                compaction_provider.on_value_change(lambda: protect(load_compaction_models))
+                ui.timer(0.01, lambda: protect(load_compaction_models), once=True)
 
                 async def load_models():
                     selected_provider = provider.value
@@ -857,6 +967,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 async def provider_changed():
                     await load_models()
                     await load_thinking()
+                    await load_context()
 
                 provider.on_value_change(lambda: protect(provider_changed))
                 ui.timer(0.01, lambda: protect(provider_changed), once=True)
@@ -869,6 +980,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 async def save():
                     options = {'can_provision': can_provision.value} if can_provision is not None else {}
+                    if automatic.value and (type(auto_percent.value) not in {int, float}
+                                            or not 1 <= auto_percent.value <= 99 or int(auto_percent.value) != auto_percent.value):
+                        raise ValueError('Automatic compaction must be a whole percentage from 1 to 99, or disabled')
+                    if window_override.value is not None and (type(window_override.value) not in {int, float}
+                            or not 2 <= window_override.value <= 2147483647 or int(window_override.value) != window_override.value):
+                        raise ValueError('Context window must be a whole token count from 2 to 2147483647')
+                    if automatic.value and not context_info.get('usable_tokens'):
+                        raise ValueError('Set a known context window before enabling automatic compaction')
+                    options.update(compaction_provider_id=compaction_provider.value or None,
+                                   compaction_model=(compaction_model.value or '').strip() if compaction_provider.value else '',
+                                   auto_compact_percent=int(auto_percent.value) if automatic.value else None,
+                                   context_window=int(window_override.value) if window_override.value is not None else None)
                     await service.update_agent(await actor(), agent['id'], provider.value,
                                                (model.value or '').strip(), instructions.value or '', thinking=thinking.value, **options)
                     dialog.close()

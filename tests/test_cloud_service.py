@@ -583,6 +583,9 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB')
     store.execute('UPDATE agents SET provisioning=?', (archived,))
     store.execute('DROP TABLE legacy_agent_credentials')
+    store.execute('DROP TABLE conversation_compactions')
+    for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
+        store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
