@@ -687,16 +687,57 @@ async def test_recovered_private_template_continues_the_same_owned_task(service,
     assert dispatched == ['createTemplate']
 
 
+@pytest.mark.parametrize('command,params', [
+    ('deployVirtualMachine', {'templateid': 'base', 'serviceofferingid': 'gpu'}),
+    ('stopVirtualMachine', {'id': 'gpu-vm'}),
+])
+async def test_managed_gpu_dispatch_uses_private_server_context_without_exposing_session(service, monkeypatch,
+                                                                                       command, params):
+    from dirigentenstab.gpu import GPU_CONTEXT
+
+    seen = []
+    session = 'private-human-session-hash'
+    args = {'command': command, 'params': params, 'managed': True}
+
+    async def execute(*values, **options):
+        assert values == ('parent', args['command'], args['params']) and options == {'managed': True}
+        seen.append(GPU_CONTEXT.get())
+        return {'virtualmachine': {'id': 'gpu-vm'}}
+
+    service.execute = execute
+
+    async def model(messages, info):
+        assert session not in str(messages) + str(info.instructions) + str(info.function_tools)
+        assert 'managed=True for controller-prepared GPU deployment and lifecycle operations' in info.instructions
+        if messages[-1].parts[0].part_kind == 'tool-return':
+            yield 'GPU VM ready'
+        else:
+            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(args), tool_call_id='gpu-call')}
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human', '_session': session}, 'parent', None,
+                                               'Deploy a managed GPU VM')
+    assert result['status'] == 'completed'
+    assert seen == [{'run_id': result['operation_id'], 'call_id': 'gpu-call', 'session': session}]
+    assert GPU_CONTEXT.get() is None
+    run = service.store.one('SELECT * FROM chat_runs')
+    conversation = service.store.one('SELECT messages FROM conversations')
+    assert session not in str(service.store.open(run['events'])) + str(service.store.open(run['checkpoint']))
+    assert session not in str(service.store.open(conversation['messages']))
+
+
 @pytest.mark.parametrize('managed', [False, True])
 async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_replay(service, monkeypatch, managed):
     from dirigentenstab.diagnostics import OperationError
-    from dirigentenstab.gpu import operation_id
+    from dirigentenstab.gpu import GPU_CONTEXT, operation_id
     args = {'command': 'deployVirtualMachine', 'params': {'templateid': 'base', 'serviceofferingid': 'gpu'}}
     if managed:
         args['managed'] = True
     calls = []
     async def execute(*values, **options):
         assert options == ({'managed': True} if managed else {})
+        assert GPU_CONTEXT.get() == {'run_id': service.store.one('SELECT id FROM chat_runs')['id'],
+                                      'call_id': 'gpu-call', 'session': 'private-session-hash'}
         calls.append(values)
         raise OperationError('gpu', 'Saved host operation requires reconciliation', 'reference', reconciliation=True)
     service.execute = execute
@@ -705,7 +746,8 @@ async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_r
     monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
     manager = runtime.Runtime(service)
     with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Create a GPU VM')
+        await manager.chat({'userid': 'human', '_session': 'private-session-hash'}, 'parent', None, 'Create a GPU VM')
+    assert GPU_CONTEXT.get() is None
     run = service.store.one('SELECT * FROM chat_runs')
     async def confirmed(settings, action, **payload):
         assert action == 'result' and payload['session'] == 'private-session-hash'

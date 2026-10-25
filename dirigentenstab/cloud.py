@@ -14,10 +14,11 @@ from uuid import UUID
 
 
 class CloudError(RuntimeError):
-    def __init__(self, message, *, rejected=False, operation_id=None):
+    def __init__(self, message, *, rejected=False, operation_id=None, public_detail=None):
         super().__init__(message)
         self.rejected = rejected
         self.operation_id = operation_id
+        self.public_detail = public_detail
 
 
 AUTH_PARAMS = frozenset({'apikey', 'secretkey', 'signature', 'signatureversion', 'sessionkey',
@@ -94,6 +95,15 @@ class Cloud:
         self._metadata_time = 0
         self._limit = asyncio.Semaphore(4)
 
+    def _error_detail(self, detail, params):
+        hidden = [*self.credentials.values(), *(str(value) for key, value in params.items()
+                  if SENSITIVE_FIELD.search(key) or len(str(value)) > 64)]
+        detail = str(detail)
+        for value in sorted(set(hidden), key=len, reverse=True):
+            if value:
+                detail = detail.replace(value, '[redacted]')
+        return ' '.join(str(redact(detail)).split())[:400]
+
     async def _process(self, directory, args, max_bytes):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('CMK_', 'OPENAI_', 'CLOUDSTACK_'))}
@@ -120,13 +130,9 @@ class Cloud:
             if proc.returncode:
                 message = 'CloudStack rejected the operation or could not be reached'
                 rejected = False
+                detail = None
                 text = stdout.decode(errors='replace') + '\n' + stderr.decode(errors='replace')
-                hidden = list(self.credentials.values())
-                for arg in args:
-                    if '=' in arg:
-                        key, value = arg.split('=', 1)
-                        if SENSITIVE_FIELD.search(key) or len(value) > 64:
-                            hidden.append(value)
+                params = dict(arg.split('=', 1) for arg in args if '=' in arg)
                 try:
                     error = json.JSONDecoder().raw_decode(text[text.index('{'):])[0]
                     if 'errorresponse' in error:
@@ -135,17 +141,17 @@ class Cloud:
                         error = next(value for value in error.values()
                                      if isinstance(value, dict) and 'errorcode' in value)
                     code = int(error['errorcode'])
-                    detail = str(error.get('errortext', ''))
-                    detail = str(redact(detail, hidden))[:400]
+                    detail = self._error_detail(error.get('errortext', ''), params)
                     message = f'CloudStack error {code}: {detail}'
                     rejected = code in {400, 401, 403, 431, 435, 436, 531, 535}
                 except (ValueError, KeyError, TypeError, UnicodeError, StopIteration):
                     match = re.search(r'\(HTTP (\d{3}), error code \d+\)\s*(.*)', text, re.S)
                     if match:
                         status = int(match[1])
-                        message = f'CloudStack HTTP {status}: ' + str(redact(match[2], hidden))[:400]
+                        detail = self._error_detail(match[2], params)
+                        message = f'CloudStack HTTP {status}: {detail}'
                         rejected = status in {400, 401, 403, 431, 435, 436, 531, 535}
-                raise CloudError(message, rejected=rejected)
+                raise CloudError(message, rejected=rejected, public_detail=detail)
             return stdout
         finally:
             for reader in readers:
@@ -206,14 +212,20 @@ class Cloud:
             result = json.loads(data) if data.strip() else {}
         except (ValueError, UnicodeError):
             raise CloudError('CloudMonkey returned an invalid response') from None
-        if 'errorresponse' in result or 'errorcode' in result:
-            raise CloudError('CloudStack denied or failed the operation')
-        if len(result) == 1:
+        if isinstance(result, dict) and 'errorresponse' in result:
+            result = result['errorresponse']
+        if isinstance(result, dict) and len(result) == 1:
             key = next(iter(result))
             if key.lower().endswith('response'):
                 result = result[key]
         if not isinstance(result, dict):
             raise CloudError('Unexpected CloudStack response')
+        if 'errorcode' in result:
+            code = str(result['errorcode'])
+            detail = self._error_detail(result.get('errortext', ''), params or {})
+            raise CloudError(f'CloudStack error {code}: {detail}',
+                             rejected=code in {'400', '401', '403', '431', '435', '436', '531', '535'},
+                             public_detail=detail)
         return result
 
     async def catalogue(self, *, refresh=False):
@@ -259,11 +271,9 @@ class Cloud:
                     failure = job.get('jobresult')
                     if not isinstance(failure, dict):
                         failure = {}
-                    hidden = [*self.credentials.values(), *(str(value) for key, value in params.items()
-                               if SENSITIVE_FIELD.search(key) or len(str(value)) > 64)]
-                    detail = str(redact(str(failure.get('errortext', 'Native operation rejected')), hidden))[:400]
+                    detail = self._error_detail(failure.get('errortext', 'Native operation rejected'), params)
                     raise CloudError(f"CloudStack asynchronous operation failed ({failure.get('errorcode', 'unknown')}): "
-                                     f'{detail}; job ID {job_id}')
+                                     f'{detail}; job ID {job_id}', public_detail=f'{detail}; job ID {job_id}'[:500])
                 await asyncio.sleep(2)
             raise CloudError(f'CloudStack job remains pending; job ID {job_id}. Check status before retrying')
         return result

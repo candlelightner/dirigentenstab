@@ -155,6 +155,7 @@ async def controller(tmp_path):
     native = Native(host)
     class Service:
         human_type = 1
+        gpu_local = False
         async def agent(self, aid):
             value = store.one('SELECT * FROM agents WHERE id=?', (aid,))
             if not value:
@@ -162,16 +163,26 @@ async def controller(tmp_path):
             return value
         async def cloud_client(self, agent):
             return Scoped(native, agent['domain_id'])
+        async def authorize(self, identity, aid):
+            agent = await self.agent(aid)
+            allowed = {identity['domainid']}
+            if identity['domainid'] == MAIN:
+                allowed.add(CHILD)
+            if identity['type'] != 1 and agent['domain_id'] not in allowed:
+                raise PermissionError('Agent outside your CloudStack domain')
+            return agent
         async def human_call(self, identity, command, params):
             if command == 'listUsers':
-                return {'user': [{'id': 'human', 'state': 'enabled'}]}
-            return {'account': [{'name': 'admin', 'domainid': ROOT, 'accounttype': self.human_type, 'state': 'enabled'}]}
+                return {'user': [{'id': identity['userid'], 'state': 'enabled'}]}
+            return {'account': [{'name': identity['account'], 'domainid': identity['domainid'],
+                                 'accounttype': self.human_type, 'state': 'enabled'}]}
         def redact(self, value):
             return value
         async def recover_deployments(self, operation_id=None):
             return
         async def execute(self, aid, command, params, *, managed=False):
             assert managed == (command == 'deployVirtualMachine')
+            assert self.gpu_local, 'Controller native dispatch must not re-enter the GPU helper'
             await asyncio.sleep(.01)
             if command == 'deployVirtualMachine':
                 agent = await self.agent(aid)
@@ -264,6 +275,68 @@ async def test_serialized_three_8q_to_one_24q_and_idempotence(controller):
     assert result['virtualmachine']['serviceofferingid'] == 'o24'
     assert len(controller.host.items) == 1 and next(iter(controller.host.items.values()))['profile'] == P24
     assert sum(c[0] == 'remove' for c in controller.host.calls) == 3
+
+
+async def test_domain_admin_can_reconfigure_unused_owned_24q_for_managed_8q(controller):
+    first = await controller.dispatch(request('full-first', serviceofferingid='o24'), 10001)
+    vm_id = first['virtualmachine']['id']
+    await controller.dispatch(request('stop-full', 'stopVirtualMachine', id=vm_id), 10001)
+    await controller.dispatch(request('release-full', 'changeServiceForVirtualMachine',
+                                      id=vm_id, serviceofferingid='cpu'), 10001)
+    controller.service.human_type = 2
+    controller.service.store.execute('UPDATE sessions SET identity=? WHERE token_hash=?', (
+        controller.service.store.seal({'userid': 'human', 'account': 'admin', 'domainid': MAIN, 'type': 2}),
+        'human-session'))
+    new = request('registered-image', templateid='new-private-cloud-image')
+    proof = await controller.dispatch({**new, 'action': 'authorize'}, 10001)
+    assert proof['profile'] == P8
+    assert len(controller.host.items) == 1 and next(iter(controller.host.items.values()))['profile'] == P24
+    results = [await controller.dispatch(new, 10001)]
+    results.extend([await controller.dispatch(request('eight-next-'+str(i)), 10001) for i in range(2)])
+    assert len({r['virtualmachine']['id'] for r in results}) == 3
+    assert len(controller.host.items) == 3 and all(d['profile'] == P8 for d in controller.host.items.values())
+    assert sum(call[0] == 'remove' for call in controller.host.calls) == 1
+    assert not controller.service.gpu_local and controller.service.gpu_deployment_id is None
+    receipt = await controller.dispatch({'action': 'result', 'session': 'human-session',
+        'operation_id': operation_id(new['context']), 'run_id': new['context']['run_id']}, 10001)
+    assert receipt['phase'] == 'completed' and receipt['result'] == results[0]
+
+
+@pytest.mark.parametrize('action', ['execute', 'authorize'])
+async def test_gpu_dispatch_rejects_another_humans_durable_run(controller, action):
+    original = request('human-owned')
+    await controller.dispatch(original, 10001)
+    controller.service.store.execute('INSERT INTO sessions VALUES(?,?,?,?)', (
+        'another-session', 'csrf', controller.service.store.seal(
+            {'userid': 'another-human', 'account': 'admin', 'domainid': ROOT, 'type': 1}), 99999999999))
+    before = list(controller.host.calls)
+    with pytest.raises(PermissionError, match='human conversation owner'):
+        await controller.dispatch({**original, 'session': 'another-session', 'action': action}, 10001)
+    assert controller.host.calls == before and len(controller.cloud.vms) == 1
+
+
+async def test_domain_admin_gpu_dispatch_stays_within_human_scope(controller):
+    controller.service.human_type = 2
+    controller.service.store.execute('UPDATE sessions SET identity=? WHERE token_hash=?', (
+        controller.service.store.seal({'userid': 'human', 'account': 'admin', 'domainid': OTHER, 'type': 2}),
+        'human-session'))
+    with pytest.raises(PermissionError, match='outside your CloudStack domain'):
+        await controller.dispatch(request('outside-human-domain'), 10001)
+    with pytest.raises(PermissionError, match='human platform'):
+        await controller.dispatch({'action': 'set_policy', 'session': 'human-session', 'domain_id': OTHER,
+                                   'policy': policy(3)}, 10001)
+    assert not controller.host.calls
+
+
+async def test_failed_native_dispatch_restores_controller_local_guard(controller, monkeypatch):
+    async def fail(*args, **kwargs):
+        assert controller.service.gpu_local
+        raise RuntimeError('Native dispatch interrupted')
+    monkeypatch.setattr(controller.service, 'execute', fail)
+    with pytest.raises(RuntimeError, match='interrupted'):
+        await controller.dispatch(request('native-failure'), 10001)
+    assert not controller.service.gpu_local and controller.service.gpu_deployment_id is None
+    assert controller.journal.rows('SELECT phase FROM operations')[0]['phase'] == 'reconciliation'
 
 
 @pytest.mark.parametrize('blocked', ['foreign', 'unknown', 'allocated', 'reserved', 'attached'])

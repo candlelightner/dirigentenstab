@@ -12,8 +12,8 @@ import httpx
 from .cloud import Cloud, CloudError, redact, validate
 from .settings import endpoint, dashboard_endpoint
 from .hierarchy import validate_child
-from .limits import APP_ROOT_AGENT, check_vm_policy
-from .gpu import helper_call
+from .limits import APP_ROOT_AGENT, check_vm_policy, gpu_count
+from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 
 _UNSET = object()
 
@@ -197,9 +197,37 @@ class Service:
         agent = await self.agent(agent_id)
         cloud = await self.cloud_client(agent)
         try:
-            if managed and command not in {'createTemplate', 'deployVirtualMachine'}:
-                raise ValueError('Managed enrollment supports VM deployment and private template creation')
-            if managed and command == 'createTemplate':
+            gpu_request = None
+            if managed and command not in GPU_COMMANDS | {'createTemplate'}:
+                raise ValueError('Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations')
+            if managed and command in GPU_COMMANDS and not self.gpu_local:
+                validate(None, params)
+                vm = None
+                if command != 'deployVirtualMachine':
+                    vm = next((v for v in (await cloud.raw('listVirtualMachines', {'id': params.get('id')})).get(
+                        'virtualmachine', []) if v['id'] == params.get('id')), None)
+                    if not vm:
+                        raise PermissionError('VM is unavailable to this agent')
+                offering_ids = {value for value in (params.get('serviceofferingid'), (vm or {}).get('serviceofferingid')) if value}
+                gpu = False
+                for offering_id in offering_ids:
+                    offering = next((o for o in (await cloud.raw('listServiceOfferings', {'id': offering_id})).get(
+                        'serviceoffering', []) if o['id'] == offering_id), None)
+                    if not offering:
+                        raise PermissionError('Compute offering is unavailable to this agent')
+                    gpu |= gpu_count(offering) > 0
+                if gpu:
+                    context = GPU_CONTEXT.get() or {}
+                    if not all(isinstance(context.get(field), str) and context[field] for field in ('session', 'run_id', 'call_id')):
+                        raise PermissionError('Managed GPU operations require an authenticated durable agent execution')
+                    gpu_request = {'agent_id': agent_id, 'command': command, 'params': params,
+                                   'session': context['session'],
+                                   'context': {field: context[field] for field in ('run_id', 'call_id')}}
+                elif command != 'deployVirtualMachine':
+                    raise ValueError('Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations')
+            if gpu_request:
+                result = await helper_call(self.settings, 'execute', **gpu_request)
+            elif managed and command == 'createTemplate':
                 result = await self._create_private_template(agent, cloud, params)
             elif managed and command == 'deployVirtualMachine':
                 async with self._deploy_lock:
@@ -241,7 +269,7 @@ class Service:
         guest = Guest(self)
         template = self.store.one('SELECT * FROM managed_templates WHERE id=?', (params['templateid'],))
         cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk,
-                                                          guest_admin=bool(template['guest_admin']))
+                                                          guest_admin=bool(template and template['guest_admin']))
         name = 'ds-vm-' + op_id[:20]
         groups = [group_id, *str(params.get('securitygroupids', '')).split(',')]
         request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode(),
@@ -275,7 +303,11 @@ class Service:
                     # Failed deployment jobs can retain a Stopped VM and its already-injected SSH identity.
                     self.store.execute("UPDATE vm_deployments SET phase='failed',updated=? WHERE id=?",
                                        (time.time(), op_id))
-                    raise CloudError(f'Managed deployment {op_id} failed; recover before retrying', operation_id=op_id)
+                    failure = status.get('jobresult')
+                    detail = cloud._error_detail(failure.get('errortext', 'Native operation failed')
+                                                 if isinstance(failure, dict) else 'Native operation failed', request)
+                    raise CloudError(f'Managed deployment {op_id} failed; recover before retrying',
+                                     operation_id=op_id, public_detail=detail)
                 if status.get('jobstatus') == 1:
                     result = status['jobresult']
                     break
@@ -303,8 +335,8 @@ class Service:
         vm = next((v for v in (await cloud.raw('listVirtualMachines', {'id': volume['virtualmachineid']})).get(
             'virtualmachine', []) if v['id'] == volume['virtualmachineid']), None)
         source = self.store.one('SELECT * FROM managed_templates WHERE id=?', ((vm or {}).get('templateid'),))
-        if not vm or vm.get('state') != 'Stopped' or not source:
-            raise PermissionError('Stop an approved managed VM and prepare its cloud-init identity before creating a template')
+        if not vm or vm.get('state') != 'Stopped':
+            raise PermissionError('Stop the managed VM and prepare its cloud-init identity before creating a template')
         op_id = hashlib.sha256(json.dumps([agent['id'], params], sort_keys=True).encode()).hexdigest()[:32]
         name = 'ds-template-' + op_id[:20]
         request = {**params, 'name': name, 'displaytext': params.get('displaytext', params['name']),
@@ -316,7 +348,7 @@ class Service:
             raise CloudError('Private template operation needs recovery; do not repeat creation', operation_id=op_id)
         self.store.execute('INSERT INTO template_creations VALUES(?,?,?,?,?,NULL,?,?,?)',
                            (op_id, agent['id'], volume['id'], name, self.store.seal({'request': request}),
-                            'dispatched', source['guest_admin'], time.time()))
+                            'dispatched', bool(source and source['guest_admin']), time.time()))
         deadline = time.monotonic() + 600
         try:
             result = await cloud.raw('createTemplate', request)
@@ -328,7 +360,11 @@ class Service:
                     if job.get('jobstatus') == 1:
                         break
                     if job.get('jobstatus') == 2:
-                        raise CloudError('Private template job failed; inspect the saved operation', operation_id=op_id)
+                        failure = job.get('jobresult')
+                        detail = cloud._error_detail(failure.get('errortext', 'Native operation failed')
+                                                     if isinstance(failure, dict) else 'Native operation failed', request)
+                        raise CloudError('Private template job failed; inspect the saved operation',
+                                         operation_id=op_id, public_detail=detail)
                     await asyncio.sleep(2)
                 else:
                     raise CloudError('Private template job pending; recover before continuing', operation_id=op_id)
@@ -342,7 +378,8 @@ class Service:
         except CloudError as exc:
             if exc.rejected:
                 self.store.execute("UPDATE template_creations SET phase='rejected' WHERE id=?", (op_id,))
-            raise CloudError(str(exc), rejected=exc.rejected, operation_id=op_id) from None
+            raise CloudError(str(exc), rejected=exc.rejected, operation_id=op_id,
+                             public_detail=exc.public_detail) from None
 
     async def _bind_private_template(self, op):
         agent = await self.agent(op['agent_id'])

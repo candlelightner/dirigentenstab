@@ -1,4 +1,4 @@
-"""Human-operated GPU host preparation; VM dispatch keeps the agent identity."""
+"""Policy-scoped GPU host preparation; VM dispatch keeps the agent identity."""
 import asyncio
 from contextlib import contextmanager
 import hashlib
@@ -414,6 +414,7 @@ class Controller:
         rows = self.journal.rows('SELECT * FROM operations WHERE id=?', (request['operation_id'],))
         if not run or run['human_id'] != actor['userid'] or not rows:
             raise PermissionError('GPU operation does not belong to this human conversation owner')
+        await self.service.authorize(actor, run['agent_id'])
         op = rows[0]
         original = json.loads(op['request'])
         if original['context']['run_id'] != request['run_id'] or original['agent_id'] != run['agent_id']:
@@ -426,7 +427,7 @@ class Controller:
         return {'phase': op['phase'], 'result': json.loads(op['result']) if op['result'] else {'rejected': True},
                 'command': original['command'], 'params': original['params']}
 
-    async def execute(self, request, preflight=False):
+    async def execute(self, request, preflight=False, *, actor=None):
         command, params = request['command'], request['params']
         if command not in GPU_COMMANDS:
             raise PermissionError('GPU controller operation is not allowed')
@@ -434,9 +435,12 @@ class Controller:
         if (not isinstance(context, dict) or set(context) != {'run_id', 'call_id'}
                 or not isinstance(context['call_id'], str) or len(context['call_id']) > 256):
             raise PermissionError('GPU operation context is invalid')
-        run = self.service.store.one('SELECT agent_id,status FROM chat_runs WHERE id=?', (context['run_id'],))
+        run = self.service.store.one('SELECT r.agent_id,r.status,c.human_id FROM chat_runs r '
+                                     'JOIN conversations c ON c.id=r.conversation_id WHERE r.id=?', (context['run_id'],))
         if not run or run['agent_id'] != request['agent_id'] or run['status'] not in {'running', 'reconciliation'}:
             raise PermissionError('GPU request does not belong to this durable server-side agent execution')
+        if actor is not None and run['human_id'] != actor['userid']:
+            raise PermissionError('GPU execution does not belong to this human conversation owner')
         agent = await self.service.agent(request['agent_id'])
         cloud = await self.service.cloud_client(agent)
         metadata = (await cloud.catalogue()).get(command)
@@ -458,9 +462,8 @@ class Controller:
             if not any(a['id'] == allocation_owner['account_id'] and a.get('domainid') == allocation_owner['domain_id']
                        and a.get('name') == vm.get('account') for a in accounts):
                 raise PermissionError('CloudStack could not verify the exact GPU VM owner account')
-        elif (params.get('domainid') not in {None, agent['domain_id']} or params.get('account') or
-              not self.service.store.one('SELECT id FROM managed_templates WHERE id=?', (params.get('templateid'),))):
-            raise PermissionError('GPU deployment requires an approved managed template in the agent’s own account')
+        elif params.get('domainid') not in {None, agent['domain_id']} or params.get('account') or params.get('projectid'):
+            raise PermissionError('GPU deployment must use the agent’s own account and domain')
         native_id = params.get('serviceofferingid') or (vm or {}).get('serviceofferingid')
         values = (await cloud.raw('listServiceOfferings', {'id': native_id})).get('serviceoffering', [])
         offering = next((o for o in values if o['id'] == native_id), None)
@@ -512,6 +515,8 @@ class Controller:
                 raise RuntimeError('Another GPU operation requires reconciliation before further GPU changes')
             self.journal.write('INSERT INTO operations(id,fingerprint,request,phase,result,updated) VALUES(?,?,?,?,NULL,?)',
                                (identifier, fingerprint, json.dumps(request), 'preparing', time.time()))
+        previous_local = getattr(self.service, 'gpu_local', False)
+        previous_deployment = getattr(self.service, 'gpu_deployment_id', None)
         try:
             from .limits import VM_POLICY_COMMANDS, check_vm_policy
             if command in VM_POLICY_COMMANDS:
@@ -528,6 +533,7 @@ class Controller:
                                      'domainid': allocation_owner['domain_id'], 'value': str(policy['release_on_stop']).lower()})
             self.journal.phase(identifier, 'dispatching')
             self.service.gpu_deployment_id = identifier if command == 'deployVirtualMachine' else None
+            self.service.gpu_local = True
             result = await self.service.execute(agent['id'], command, params, managed=command == 'deployVirtualMachine')
             await self.cloud.raw('discoverGpuDevices', {'id': self.host_id})
             self.journal.phase(identifier, 'completed', result)
@@ -541,7 +547,8 @@ class Controller:
                 self.journal.phase(identifier, 'failed')
             raise
         finally:
-            self.service.gpu_deployment_id = None
+            self.service.gpu_deployment_id = previous_deployment
+            self.service.gpu_local = previous_local
 
     async def dispatch(self, request, peer_uid):
         if peer_uid not in {0, 10001}:
@@ -578,5 +585,6 @@ class Controller:
                         raise PermissionError('Only a saved pre-dispatch GPU plan may be resumed')
                     return await self.execute(json.loads(rows[0]['request']))
                 return await self.reconcile(rows[0])
-            await self.human(request['session'])
-            return await self.execute(request, preflight=action == 'authorize')
+            actor = await self.human(request['session'], platform=False)
+            await self.service.authorize(actor, request['agent_id'])
+            return await self.execute(request, preflight=action == 'authorize', actor=actor)

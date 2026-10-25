@@ -32,3 +32,12 @@ def test_safe_compaction_failures_remain_clear_to_users(exc, description):
 def test_compaction_like_provider_error_cannot_expose_payload(caplog):
     error = diagnose(RuntimeError('Context compaction failed; provider secret private-payload'), operation_id='operation')
     assert 'private-payload' not in str(error) + caplog.text
+
+
+def test_native_public_detail_is_bounded_and_kept_out_of_logs(caplog):
+    detail = 'Native deployment rejected: ' + 'x' * 1000
+    error = diagnose(CloudError('private-payload', rejected=True, public_detail=detail),
+                     operation_id='operation', tool='execute_api')
+    assert detail[:500] in str(error) and detail[:501] not in str(error)
+    assert 'private-payload' not in str(error) + caplog.text
+    assert 'Native deployment rejected' not in caplog.text
