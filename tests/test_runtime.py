@@ -523,3 +523,44 @@ async def test_time_window_yields_before_dispatch_instead_of_cancelling_mutation
     assert result['status'] == 'completed' and len(service.executions) == 1
     saved = await manager.restore({'userid': 'human'}, result['conversation_id'])
     assert saved['runs'][-1]['budget']['windows'] == 2
+
+
+async def test_three_turn_conversation_preserves_65_tool_chain_across_restart(service, monkeypatch):
+    """CI exercises real Pydantic AI windows with a longer chain than production's tool cap."""
+    async def model(messages, info):
+        prompts = [str(p.content) for m in messages for p in m.parts if p.part_kind == 'user-prompt']
+        if prompts[-1] == 'Remember inventory':
+            yield 'Inventory reference retained'
+        elif prompts[-1] == 'Verify the previous task':
+            assert 'Inventory reference retained' in str(messages)
+            assert 'Lifecycle verified after 65 calls' in str(messages)
+            assert sum(p.part_kind == 'tool-return' for m in messages for p in m.parts) == 65
+            yield 'Both previous turns and their tool results are retained'
+        else:
+            completed = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+            if completed == 65:
+                yield 'Lifecycle verified after 65 calls'
+            else:
+                # A later model request repeats its creation intent; only one dispatch is allowed.
+                params = {'name': 'one-disposable'} if completed in (0, 32) else {'page': completed}
+                command = 'deployVirtualMachine' if completed in (0, 32) else 'listVirtualMachines'
+                yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
+                    {'command': command, 'params': params}), tool_call_id=f'chain-{completed}')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    first = await manager.chat({'userid': 'human'}, 'parent', None, 'Remember inventory')
+    second = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Run the lifecycle')
+    assert second['status'] == 'paused'
+    assert second['conversation_id'] == first['conversation_id']
+    manager = runtime.Runtime(service)
+    completed = await manager.resume({'userid': 'human'}, second['operation_id'])
+    assert completed['status'] == 'completed' and completed['operation_id'] == second['operation_id']
+    third = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Verify the previous task')
+    assert third['status'] == 'completed'
+    saved = await manager.restore({'userid': 'human'}, first['conversation_id'])
+    assert len(saved['runs']) == 3
+    long_run = next(r for r in saved['runs'] if r['id'] == second['operation_id'])
+    assert long_run['budget']['tool_calls'] == 65 and long_run['budget']['windows'] >= 4
+    assert len(long_run['events']) == 130
+    assert sum(command == 'deployVirtualMachine' for _, command, _ in service.executions) == 1
+    assert sum(p['part_kind'] == 'user-prompt' for m in saved['messages'] for p in m['parts']) == 3

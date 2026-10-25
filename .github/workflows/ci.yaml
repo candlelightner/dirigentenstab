@@ -16,7 +16,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements.lock && pip install --no-deps -e .
       - run: ruff check .
-      - run: pytest -q
+      - name: Unit and integration, including multi-turn conversations and 65-tool continuation
+        run: pytest -q
       - run: bash -n setup.sh
       - run: docker compose --env-file .env.example config --quiet
   container:

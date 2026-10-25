@@ -233,4 +233,15 @@ async def test_browser_budget_pause_reload_and_continue(browser_app):
         box = await page.get_by_label('Message', exact=True).bounding_box()
         assert box['y'] + box['height'] <= 844
         await page.screenshot(path=str(state / 'budget-completed.png'), full_page=True)
+        await page.get_by_label('Message', exact=True).fill('Inspect resources in a second turn')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.get_by_label('Conversation', exact=True).fill('bounded lifecycle')
+        await page.get_by_role('option', name='bounded lifecycle', exact=True).click()
+        await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        assert await page.get_by_text('Inspect resources in a second turn', exact=True).count() == 1
         await browser.close()
