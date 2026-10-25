@@ -557,3 +557,45 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         assert not await indicator.is_visible()
         await page.screenshot(path=str(state / 'thinking-selector-mobile.png'), full_page=True)
         await browser.close()
+
+
+async def test_browser_stop_agent_current_and_restored_running_conversation(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        selector = page.get_by_label('Chat directly with an agent', exact=True)
+        await selector.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        for restored in (False, True):
+            title = 'stop fixture restored' if restored else 'stop fixture current'
+            await page.get_by_label('Message', exact=True).fill(title)
+            await page.get_by_role('button', name='Send', exact=True).click()
+            await page.get_by_text('Partial reply retained', exact=True).wait_for()
+            await page.get_by_role('button', name='Stop agent', exact=True).wait_for()
+            if restored:
+                await page.reload()
+                await page.wait_for_function('window.socket?.connected && window.did_handshake')
+                await selector.fill('Research')
+                await page.get_by_role('option', name='Research Admin', exact=True).click()
+                await page.get_by_label('Conversation', exact=True).fill(title)
+                await page.get_by_role('option', name=title, exact=True).click()
+                await page.get_by_role('button', name='Stop agent', exact=True).wait_for()
+            await page.get_by_role('button', name='Stop agent', exact=True).click()
+            await page.get_by_text('Stopped · Reference:', exact=False).wait_for()
+            await page.get_by_role('button', name='Stop agent', exact=True).wait_for(state='hidden')
+            await page.locator('.thinking-indicator').wait_for(state='hidden')
+            await page.get_by_text('Partial reply retained', exact=True).wait_for()
+            assert await page.get_by_label('Message', exact=True).is_enabled()
+            run = store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id WHERE c.title=?', (title,))
+            assert run['status'] == 'interrupted'
+            assert store.open(run['checkpoint'])['reason'] == 'stopped'
+            await page.get_by_role('button', name='Continue saved task', exact=True).wait_for()
+            await page.get_by_role('button', name='New conversation', exact=True).click()
+            await page.get_by_text('Partial reply retained', exact=True).wait_for(state='hidden')
+        await page.screenshot(path=str(state / 'stopped-agent-mobile.png'), full_page=True)
+        await browser.close()

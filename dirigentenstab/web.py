@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import os
@@ -141,7 +142,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     error = diagnose(exc, agent_id=state['agent'])
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'resume_operation': None}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'resume_operation': None, 'active_operation': None}
         agents = {row['id']: row for row in data.get('agents', [])}
         dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
         dashboard_links = []
@@ -260,8 +261,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
                         'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
                     send_button = ui.button('Send', icon='send').props('aria-label="Send"')
+                    stop_button = ui.button('Stop agent', icon='stop', color='negative',
+                                            on_click=lambda: protect(stop_agent)).props('outline')
+                    stop_button.set_visibility(False)
                     send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
-                                                  bool(value and value.strip()) and not state['busy'])
+                                                  bool(value and value.strip()) and not state['busy'] and not state['active_operation'])
 
         tool_cards = {}
 
@@ -311,7 +315,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             current = await actor()
             agent = await service.authorize(current, agent_id)
-            state.update(agent=agent_id, conversation=None, imported=False, resume_operation=None)
+            state.update(agent=agent_id, conversation=None, imported=False, resume_operation=None, active_operation=None)
+            stop_button.set_visibility(False)
+            prompt.enable()
             continue_button.set_visibility(False)
             gpu_recover_button.set_visibility(False)
             budget_label.set_text('')
@@ -403,6 +409,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if restored['agent_id'] != state['agent']:
                 raise PermissionError('Conversation belongs to another agent')
             state['resume_operation'] = None
+            state['active_operation'] = None
+            stop_button.set_visibility(False)
+            prompt.enable()
             continue_button.set_visibility(False)
             budget_label.set_text('')
             state['conversation'] = restored['id']
@@ -413,6 +422,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             tool_cards.clear()
             if restored.get('runs'):
                 run = restored['runs'][-1]
+                state['active_operation'] = run['id'] if run['status'] == 'running' else None
+                stop_button.set_visibility(bool(state['active_operation']))
+                prompt.set_enabled(not state['active_operation'])
                 progress.set_text(f"{run['status'].capitalize()} · Reference: {run['id']}")
                 budget = run.get('budget')
                 state['resume_operation'] = run['id'] if budget and budget.get('resumable') else None
@@ -421,7 +433,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if budget:
                     show_budget(budget)
                     if budget.get('resumable'):
-                        progress.set_text('Paused · ' + str(budget.get('reason')) + ' budget · Reference: ' + run['id'])
+                        progress.set_text(('Stopped' if budget.get('reason') == 'stopped' else
+                                           'Paused · ' + str(budget.get('reason')) + ' budget') + ' · Reference: ' + run['id'])
             for kind, content in history_parts(restored):
                 activity(content) if kind == 'activity' else message(kind, content)
 
@@ -429,6 +442,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             await actor()
             if not state['busy']:
                 state['conversation'] = None
+                state['active_operation'] = None
+                stop_button.set_visibility(False)
+                prompt.enable()
                 state['imported'] = False
                 state['resume_operation'] = None
                 continue_button.set_visibility(False)
@@ -456,9 +472,53 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             gpu_recover_button.set_visibility(False)
             progress.set_text('GPU result verified. Continue saved task without repeating its completed action.')
 
+        def stopped_run(run):
+            state['active_operation'] = None
+            state['busy'] = False
+            stop_button.set_visibility(False)
+            reconciliation = run['status'] == 'reconciliation'
+            progress.set_text(('Requires reconciliation · inspect unfinished remote actions' if reconciliation else
+                               'Stopped' if run['status'] == 'interrupted' else run['status'].capitalize())
+                              + ' · Reference: ' + run['id'])
+            budget = run.get('budget') or {}
+            state['resume_operation'] = run['id'] if budget.get('resumable') else None
+            continue_button.set_visibility(bool(state['resume_operation']))
+            gpu_recover_button.set_visibility(reconciliation)
+            prompt.enable()
+            send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
+            new_button.enable()
+            history_select.enable()
+            agent_choice.enable()
+            continue_button.enable()
+
+        async def stop_agent():
+            operation_id = state['active_operation']
+            if not operation_id:
+                return
+            stop_button.disable()
+            try:
+                current = await actor()
+                result = await runtime.stop(current, operation_id)
+                if state['active_operation'] != operation_id:
+                    return
+                if result['status'] == 'running':
+                    progress.set_text('Stop requested · waiting for active work to finish · Reference: ' + operation_id)
+                    return
+                restored = await runtime.restore(current, state['conversation'])
+                if state['active_operation'] == operation_id:
+                    run = next((run for run in restored.get('runs', []) if run['id'] == operation_id),
+                               {'id': operation_id, 'status': result['status']})
+                    stopped_run(run)
+                    transcript.clear()
+                    tool_cards.clear()
+                    for kind, content in history_parts(restored):
+                        activity(content) if kind == 'activity' else message(kind, content)
+            finally:
+                stop_button.enable()
+
         async def send(resume=False):
             text = prompt.value.strip() if prompt.value else ''
-            if state['busy'] or not state['agent'] or (not resume and not text):
+            if state['busy'] or state['active_operation'] or not state['agent'] or (not resume and not text):
                 return
             # Claim the submission before the first await; rapid clicks cannot start two mutations.
             state['busy'] = True
@@ -494,6 +554,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     show_budget(event['budget'])
                 if event.get('type') == 'run_started':
                     state['conversation'] = event['conversation_id']
+                    state['active_operation'] = event['operation_id']
+                    stop_button.set_visibility(True)
                     progress.set_text('Running · Reference: ' + event['operation_id'])
                 elif event.get('type') == 'text':
                     chunks.append(event.get('text', ''))
@@ -506,6 +568,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             try:
                 result = (await runtime.resume(current, state['resume_operation'], event_received) if resume else
                           await runtime.chat(current, agent_id, state['conversation'], text, event_received))
+                state['active_operation'] = None
+                stop_button.set_visibility(False)
                 state['conversation'] = result['conversation_id']
                 state['imported'] = False
                 answer.set_content(result['output'])
@@ -516,7 +580,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                   'Requires reconciliation' if result.get('status') == 'reconciliation' else 'Completed')
                 await histories()
                 await refresh()
+            except asyncio.CancelledError:
+                progress.set_text('Stopped · activity saved; unfinished remote actions may need reconciliation.')
+                if state['conversation']:
+                    restored = await runtime.restore(current, state['conversation'])
+                    if restored.get('runs'):
+                        stopped_run(restored['runs'][-1])
             except Exception as exc:
+                state['active_operation'] = None
+                stop_button.set_visibility(False)
                 error = diagnose(exc, agent_id=agent_id)
                 progress.set_text(('Requires reconciliation · ' if error.reconciliation else 'Failed · ') + str(error))
                 await histories()
@@ -530,6 +602,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 raise error from None
             finally:
                 state['busy'] = False
+                state['active_operation'] = None
+                stop_button.set_visibility(False)
                 send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
                 prompt.enable()
                 new_button.enable()
