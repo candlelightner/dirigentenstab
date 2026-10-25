@@ -22,7 +22,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 13
+    assert reopened.one('PRAGMA user_version')['user_version'] == 14
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -31,6 +31,9 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('DROP TABLE mcp_assignments')
     store.execute('DROP TABLE mcp_servers')
     store.execute('DROP TABLE legacy_agent_credentials')
+    store.execute('DROP TABLE conversation_compactions')
+    for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
+        store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('ALTER TABLE agents RENAME COLUMN credentials TO runtime')
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB NOT NULL')
@@ -69,6 +72,9 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     store.execute('ALTER TABLE agents RENAME COLUMN credentials TO runtime')
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB')
     store.execute('UPDATE agents SET provisioning=?', (old_provisioning,))
+    store.execute('DROP TABLE conversation_compactions')
+    for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
+        store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('PRAGMA user_version=11')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
@@ -90,6 +96,9 @@ def test_thinking_migration_preserves_credentials_and_conversations_with_model_d
                   ('agent', 'Agent', 'domain', 'account', 'user', credentials))
     store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                   ('conversation', 'agent', 'human', 'Existing conversation', 1, messages))
+    store.execute('DROP TABLE conversation_compactions')
+    for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
+        store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('PRAGMA user_version=12')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))

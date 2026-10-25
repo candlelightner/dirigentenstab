@@ -79,7 +79,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         async def rotate_credentials(self, identity, agent_id):
             self.rotations.append((identity['userid'], agent_id))
 
-        async def update_agent(self, identity, agent_id, provider_id, model, instructions, *, thinking='default'):
+        async def update_agent(self, identity, agent_id, provider_id, model, instructions, *, thinking='default', **compaction):
             self.updates.append((identity['userid'], agent_id, instructions))
             agent['instructions'] = instructions
             agent['thinking'] = thinking
@@ -97,6 +97,10 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
             await self.release.wait()
             if self.fail:
                 raise RuntimeError('Synthetic pending reply failed')
+            await on_event({'type': 'context_usage', 'context': {'estimated_tokens': 1234, 'context_window': 10000,
+                'response_reserve': 2000, 'usable_tokens': 8000, 'percent': 15.425, 'threshold_percent': 75,
+                'source': 'Approximate test usage'}})
+            await on_event({'type': 'compaction', 'status': 'Context compacted.', 'summary': 'PRIVATE SUMMARY CONTENT'})
             await on_event({'type': 'text', 'text': 'Hello'})
             await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
             return {'conversation_id': 'conversation', 'output': 'Hello'}
@@ -134,6 +138,9 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         runtime.release.set()
         await asyncio.sleep(0.1)
         await user.should_see('Hello')
+        await user.should_see('Context: ~1,234 / 8,000 usable tokens (15.4%)')
+        await user.should_see('Context compacted.')
+        await user.should_not_see('PRIVATE SUMMARY CONTENT')
         await user.should_not_see('thinking_indicator')
         assert runtime.sent == [('human', 'agent', 'Hello research')]
         user.find('Configure').click()
@@ -381,7 +388,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
             return [{'id': 'reported', 'name': 'Reported'}, {'id': 'local', 'name': 'Local'},
                     {'id': 'unavailable', 'name': 'Unavailable'}]
 
-        async def update_agent(self, current, agent_id, provider_id, model, instructions, *, thinking):
+        async def update_agent(self, current, agent_id, provider_id, model, instructions, *, thinking, **compaction):
             assert current == identity and agent_id == 'agent'
             agent.update(provider_id=provider_id, model=model, instructions=instructions, thinking=thinking)
 
@@ -395,6 +402,9 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
 
         async def models(self, current, provider_id):
             return ['model-a', 'model-b']
+
+        async def context_limits(self, current, provider_id, model_id, context_window=None):
+            return {'context_window': None, 'response_reserve': 8192, 'usable_tokens': None, 'source': 'No context metadata.'}
 
         async def thinking_capabilities(self, current, provider_id, model_id):
             assert current == identity
@@ -486,6 +496,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
             self.task = asyncio.current_task()
             await on_event({'type': 'run_started', 'operation_id': 'operation', 'conversation_id': 'conversation'})
             await on_event({'type': 'text', 'text': 'Partial reply retained'})
+            await on_event({'type': 'compaction', 'status': 'Compacting context…'})
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -520,6 +531,8 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
             user.find('Send').click()
         await user.should_see('Stop agent')
         await user.should_see('Partial reply retained')
+        if not restored:
+            await user.should_see('Compacting context…')
         user.find('Stop agent').click()
         if final_status == 'running':
             await user.should_see('Stop requested')
@@ -529,6 +542,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         await user.should_see('Requires reconciliation' if final_status == 'reconciliation' else 'Stopped')
         await user.should_not_see('Stop agent')
         await user.should_not_see('thinking_indicator')
+        await user.should_not_see('Compacting context…')
         await user.should_see('Partial reply retained')
         assert runtime.stopped == ['operation']
         assert next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
@@ -536,3 +550,92 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         assert next(iter(user.find(kind=ui.button, content='Send').elements)).enabled
         if final_status == 'interrupted':
             await user.should_see('Continue saved task')
+
+
+async def test_compaction_configuration_persists_and_context_meter_restores():
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account',
+             'provider_id': 'main', 'model': 'model-a', 'auto_compact_percent': None}
+    identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+
+    class Auth:
+        async def identity(self, token):
+            return identity
+
+    class Service:
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return [{'id': 'main', 'name': 'Main'}, {'id': 'summary', 'name': 'Summary'}]
+
+        async def update_agent(self, current, agent_id, provider_id, model, instructions, **settings):
+            agent.update(provider_id=provider_id, model=model, instructions=instructions, **settings)
+
+    class Runtime:
+        async def conversations(self, current, agent_id):
+            return [{'id': 'saved', 'title': 'Saved context'}]
+
+        async def models(self, current, provider_id):
+            return ['summary-small'] if provider_id == 'summary' else ['model-a', 'model-b']
+
+        async def thinking_capabilities(self, current, provider_id, model):
+            return {'options': {'default': 'Model default'}, 'source': 'No thinking controls advertised.'}
+
+        async def context_limits(self, current, provider_id, model_id, context_window=None):
+            assert current == identity
+            window = context_window or (40000 if model_id == 'model-a' else None)
+            reserve = min(8192, max(1, window // 4)) if window else 8192
+            return {'context_window': window, 'response_reserve': reserve,
+                    'usable_tokens': window - reserve if window else None,
+                    'source': 'Manual context window override.' if context_window else
+                              'Provider API context_window.' if window else 'API context limit unknown.'}
+
+        async def restore(self, current, conversation_id):
+            return {'id': 'saved', 'agent_id': 'agent', 'messages': [], 'runs': [
+                {'id': 'run', 'status': 'completed', 'events': [], 'budget': {'context': {
+                    'estimated_tokens': 321, 'context_window': 2000, 'response_reserve': 500,
+                    'usable_tokens': 1500, 'percent': 21.4, 'threshold_percent': 75, 'source': 'Saved approximate usage'}}}]}
+
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Configure')
+        user.find('Configure').click()
+        await user.should_see('Provider API context_window.')
+        assert not next(iter(user.find(kind=ui.checkbox, content='Automatically compact context').elements)).value
+        assert not next(iter(user.find(kind=ui.number, content='Compact at %').elements)).enabled
+        user.find('Compaction provider').trigger('update:modelValue', {'value': 2})
+        await user.should_see('Choose a model or enter a custom model ID.')
+        user.find('Compaction model').trigger('update:modelValue', {'value': 0})
+        user.find('Automatically compact context').click()
+        user.find('Context window override').type('20000')
+        await user.should_see('Manual context window override.')
+        await user.should_see('20,000 − 5,000 response tokens = 15,000 tokens')
+        user.find('Save').click()
+        await asyncio.sleep(0.05)
+        assert {key: agent[key] for key in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window')} == {
+            'compaction_provider_id': 'summary', 'compaction_model': 'summary-small', 'auto_compact_percent': 75, 'context_window': 20000}
+        user.find('Configure').click()
+        await user.should_see('Manual context window override.')
+        assert next(iter(user.find(kind=ui.number, content='Compact at %').elements)).value == 75
+        assert next(iter(user.find(kind=ui.select, content='Compaction model').elements)).value == 'summary-small'
+        user.find('Model ID').trigger('update:modelValue', {'value': 1})
+        user.find('Context window override').clear()
+        await user.should_see('API context limit unknown.')
+        await user.should_see('Enter a context window override before enabling automatic compaction.')
+        user.find('Automatically compact context').click()
+        user.find('Compact at %').clear()
+        user.find('Compaction provider').trigger('update:modelValue', {'value': 0})
+        await user.should_not_see('Compaction model')
+        user.find('Save').click()
+        await asyncio.sleep(0.05)
+        assert agent['auto_compact_percent'] is None and agent['context_window'] is None
+        assert agent['compaction_provider_id'] is None and agent['compaction_model'] == ''
+        user.find('Conversation').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Context: ~321 / 1,500 usable tokens (21.4%)')
+        await user.should_see('Saved approximate usage')

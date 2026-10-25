@@ -32,17 +32,22 @@ def browser_app(tmp_path):
                           'PYTHONPATH': str(project)}, stdout=log, stderr=subprocess.STDOUT,
     )
     url = f'https://localhost:{port}'
+    started = time.monotonic()
+    last_error = None
     try:
-        for _ in range(120):
+        # Imports, migrations and TLS setup can exceed 12 seconds on shared CI storage.
+        while time.monotonic() - started < 30:
             if process.poll() is not None:
                 pytest.fail('Browser fixture failed to start:\n' + (tmp_path / 'browser-server.log').read_text())
             try:
                 with urllib.request.urlopen(url + '/healthz', context=ssl._create_unverified_context(), timeout=1):
                     break
-            except (OSError, urllib.error.URLError):
+            except (OSError, urllib.error.URLError) as exc:
+                last_error = repr(exc)
                 time.sleep(0.1)
         else:
-            pytest.fail('Browser fixture did not become ready')
+            pytest.fail(f'Browser fixture did not become ready after {time.monotonic() - started:.1f}s; '
+                        f'last health probe: {last_error}\n' + (tmp_path / 'browser-server.log').read_text())
         yield url, tmp_path
     finally:
         process.terminate()
@@ -503,6 +508,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         agent = page.get_by_label('Chat directly with an agent', exact=True)
         await agent.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_role('button', name='Configure', exact=True).click()
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         thinking = page.get_by_label('Thinking level', exact=True)
@@ -516,6 +522,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await agent.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_role('button', name='Configure', exact=True).click()
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         await thinking.click()
@@ -551,6 +558,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         assert not await indicator.is_visible()
         await agent.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill('thinking indicator')
         await page.get_by_role('option', name='thinking indicator', exact=True).click()
         await page.get_by_text('Pending response complete.', exact=True).wait_for()
@@ -570,6 +578,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
         selector = page.get_by_label('Chat directly with an agent', exact=True)
         await selector.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
         store = Store(str(state / 'browser.db'), str(state / 'master'))
         for restored in (False, True):
             title = 'stop fixture restored' if restored else 'stop fixture current'
@@ -582,6 +591,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
                 await page.wait_for_function('window.socket?.connected && window.did_handshake')
                 await selector.fill('Research')
                 await page.get_by_role('option', name='Research Admin', exact=True).click()
+                await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
                 await page.get_by_label('Conversation', exact=True).fill(title)
                 await page.get_by_role('option', name=title, exact=True).click()
                 await page.get_by_role('button', name='Stop agent', exact=True).wait_for()
@@ -598,4 +608,78 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
             await page.get_by_role('button', name='New conversation', exact=True).click()
             await page.get_by_text('Partial reply retained', exact=True).wait_for(state='hidden')
         await page.screenshot(path=str(state / 'stopped-agent-mobile.png'), full_page=True)
+        await browser.close()
+
+
+async def test_browser_compaction_configuration_and_context_meter_persist(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    title = 'thinking indicator compaction meter'
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        selector = page.get_by_label('Chat directly with an agent', exact=True)
+        await selector.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_text('Context compaction', exact=True).click()
+        await page.get_by_text('Provider model API (context_window).', exact=False).wait_for()
+        automatic = page.get_by_role('checkbox', name='Automatically compact context', exact=True)
+        assert await automatic.get_attribute('aria-checked') == 'false'
+        assert await page.get_by_label('Compact at % of usable context', exact=True).is_disabled()
+        provider = page.get_by_label('Compaction provider', exact=True)
+        await provider.click()
+        await page.get_by_role('option', name='Local fixture', exact=True).click()
+        model = page.get_by_label('Compaction model', exact=True)
+        await model.fill('second-model')
+        await model.press('Enter')
+        await automatic.click()
+        await playwright.expect(automatic).to_have_attribute('aria-checked', 'true')
+        override = page.get_by_label('Context window override (tokens, optional)', exact=True)
+        await override.fill('65536')
+        await override.press('Tab')
+        await page.get_by_text('Manual context-window override.', exact=False).wait_for()
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        settings = store.one("SELECT compaction_provider_id,compaction_model,auto_compact_percent,context_window FROM agents WHERE id='research'")
+        assert settings == {'compaction_provider_id': 'fixture', 'compaction_model': 'second-model',
+                            'auto_compact_percent': 75, 'context_window': 65536}
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await selector.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_text('Manual context-window override.', exact=False).wait_for()
+        assert await model.input_value() == 'second-model'
+        assert await override.input_value() == '65536'
+        assert await automatic.get_attribute('aria-checked') == 'true'
+        await provider.click()
+        await page.get_by_role('option', name='Same as conversation', exact=True).click()
+        await model.wait_for(state='hidden')
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await page.get_by_label('Message', exact=True).fill(title)
+        await page.get_by_role('button', name='Send', exact=True).click()
+        meter = page.locator('.conversation').get_by_text('Context: ~', exact=False)
+        await meter.wait_for()
+        assert '57,344 usable tokens' in await meter.inner_text()
+        assert 'Auto-compact at 75%' in await meter.inner_text()
+        await page.get_by_text('Pending response complete.', exact=True).wait_for()
+        run = store.one('SELECT checkpoint FROM chat_runs ORDER BY created DESC LIMIT 1')
+        assert store.open(run['checkpoint'])['context']['usable_tokens'] == 57344
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await selector.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await page.get_by_label('Conversation', exact=True).fill(title)
+        await page.get_by_role('option', name=title, exact=True).click()
+        await meter.wait_for()
+        assert '57,344 usable tokens' in await meter.inner_text()
+        await page.screenshot(path=str(state / 'compaction-context-mobile.png'), full_page=True)
         await browser.close()

@@ -57,8 +57,8 @@ def fake_api(state):
         def do_GET(self):
             if self.path == '/v1/models':
                 value, status = {'data': [
-                    {'id': 'fixture-model', 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
-                    {'id': 'second-model', 'effort': {'supported_levels': ['low', 'high']}}]}, 200
+                    {'id': 'fixture-model', 'context_window': 65536, 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
+                    {'id': 'second-model', 'max_model_len': 32768, 'effort': {'supported_levels': ['low', 'high']}}]}, 200
             elif self.path == '/empty/models':
                 value, status = {'data': []}, 200
             elif self.path == '/unauthorized/models':
@@ -214,27 +214,28 @@ def main():
     master = args.state_dir / 'master'
     master.write_bytes(Fernet.generate_key())
     store = Store(str(args.state_dir / 'browser.db'), str(master))
-    store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
-                  ('fixture', 'Local fixture', 'chat', 'http://127.0.0.1/v1', store.seal(PRIVATE_VALUES[4]), 'fixture-model'))
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
-                  'VALUES(?,?,?,?,?,?,?,?)',
-                  (AGENT_ID, 'Research Admin', AGENT_DOMAIN, 'research-account', 'research-user',
-                   store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
-                   'fixture', 'fixture-model'))
-    api_port = fake_api(args.state_dir)
-    store.execute('UPDATE providers SET base_url=? WHERE id=?', (f'http://127.0.0.1:{api_port}/v1', 'fixture'))
-    for identifier, endpoint in [('unsupported', 'unsupported'), ('empty', 'empty'), ('unauthorized', 'unauthorized')]:
-        store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
-                      (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
-                       store.seal(''), ''))
-    for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'), *[
-            (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
-        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
-                      'VALUES(?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
+    with store.connect() as conn:
+        conn.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
+                      ('fixture', 'Local fixture', 'chat', 'http://127.0.0.1/v1', store.seal(PRIVATE_VALUES[4]), 'fixture-model'))
+        conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
+                      'VALUES(?,?,?,?,?,?,?,?)',
+                      (AGENT_ID, 'Research Admin', AGENT_DOMAIN, 'research-account', 'research-user',
                        store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
                        'fixture', 'fixture-model'))
-    store.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
-                  (APP_ROOT_AGENT, 'Agents', 'fixture-model', '', 'complete', 0))
+        api_port = fake_api(args.state_dir)
+        conn.execute('UPDATE providers SET base_url=? WHERE id=?', (f'http://127.0.0.1:{api_port}/v1', 'fixture'))
+        for identifier, endpoint in [('unsupported', 'unsupported'), ('empty', 'empty'), ('unauthorized', 'unauthorized')]:
+            conn.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+                          (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
+                           store.seal(''), ''))
+        for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'), *[
+                (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
+            conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
+                          'VALUES(?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
+                           store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
+                           'fixture', 'fixture-model'))
+        conn.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
+                      (APP_ROOT_AGENT, 'Agents', 'fixture-model', '', 'complete', 0))
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
