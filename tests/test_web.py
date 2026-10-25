@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
 from dirigentenstab.web import build_ui, hierarchy_nodes, history_parts
@@ -190,6 +191,12 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
     class Integration:
         saved = []
         assigned = []
+        discoveries = []
+        fail = False
+        fail_save = False
+        block_once = False
+        started = asyncio.Event()
+        release = asyncio.Event()
 
         def __init__(self, service):
             pass
@@ -198,16 +205,35 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
             assert current == identity and agent_id == 'agent'
             return {'can_manage_servers': manage, 'servers': [
                 {'id': 'search', 'name': 'Search service', 'url': 'https://search.example/mcp',
-                 'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['web_search']}]}
+                 'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['web_search']},
+                {'id': 'other', 'name': 'Other service', 'url': 'https://other.example/mcp',
+                 'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['other_tool']}]}
 
         async def save_server(self, current, name, url, token=None, server_id=None, enabled=True):
             assert current == identity and manage
+            if self.fail_save:
+                raise ValueError('Invalid MCP endpoint')
             self.saved.append((name, url, token, server_id, enabled))
             return 'search'
 
         async def assign(self, current, agent_id, server_id, tools):
             assert current == identity
             self.assigned.append((agent_id, server_id, tools))
+
+        async def discover(self, current, agent_id, server_id):
+            assert current == identity and agent_id == 'agent'
+            self.discoveries.append(server_id)
+            if self.fail:
+                raise RuntimeError('private discovery payload and API credential')
+            if server_id == 'search' and self.block_once:
+                Integration.block_once = False
+                self.started.set()
+                await self.release.wait()
+                return [{'name': 'stale_tool', 'description': 'This stale result must be ignored'}]
+            if server_id == 'other':
+                return [{'name': 'other_tool', 'description': 'A tool from the other server'}]
+            return [{'name': 'web_search', 'description': 'Search the public web'}] + (
+                [{'name': 'web_extract', 'description': 'Read a public web page'}] if manage else [])
 
     monkeypatch.setattr(mcp, 'MCP', Integration)
     auth = Auth()
@@ -220,7 +246,9 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         user.find('Configure').click()
         await user.should_see('System prompt')
         user.find('MCP tools').click()
-        await user.should_see('Assigned tool names')
+        await user.should_see('Search the public web')
+        assert Integration.discoveries == ['search']
+        assert not next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
         if manage:
             await user.should_see('API key / bearer token (blank keeps existing)')
             before_save = auth.calls
@@ -236,12 +264,62 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
             await user.should_not_see('API key / bearer token (blank keeps existing)')
             await user.should_not_see('Save server settings')
             await user.should_see('Ancestor allows: web_search')
-        user.find('Assigned tool names').clear().type('web_search')
+        await user.should_see('Search the public web')
+        user.find(kind=ui.checkbox, content='web_search').click()
         before_save = auth.calls
         user.find('Save assigned tools').click()
         await user.should_see('Assigned tools saved for this agent.')
         assert Integration.assigned == [('agent', 'search', ['web_search'])]
         assert auth.calls > before_save
+        Integration.fail = True
+        user.find(kind=ui.button, content='Refresh tools').click()
+        await user.should_see('Your selections are preserved.')
+        await user.should_not_see('private discovery payload')
+        assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
+        assert not next(iter(user.find(kind=ui.button, content='Save assigned tools').elements)).enabled
+        user.find('Save assigned tools').click()
+        assert Integration.assigned == [('agent', 'search', ['web_search'])]
+        Integration.fail = False
+        user.find(kind=ui.button, content='Refresh tools').click()
+        await user.should_see('tools available.')
+        assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
+        if manage:
+            assert not next(iter(user.find(kind=ui.checkbox, content='web_extract').elements)).value
+            Integration.block_once = True
+            user.find(kind=ui.button, content='Refresh tools').click()
+            await asyncio.wait_for(Integration.started.wait(), timeout=1)
+            Integration.fail_save = True
+            user.find('Save server settings').click()
+            await user.should_see('Server settings were not confirmed.')
+            assert next(iter(user.find(kind=ui.button, content='Refresh tools').elements)).enabled
+            assert not next(iter(user.find(kind=ui.button, content='Save assigned tools').elements)).enabled
+            assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
+            Integration.fail_save = False
+            user.find(kind=ui.button, content='Refresh tools').click()
+            await user.should_see('2 tools available.')
+            Integration.release.set()
+            await asyncio.sleep(0.05)
+            await user.should_not_see('stale_tool')
+            Integration.started.clear()
+            Integration.release.clear()
+            Integration.block_once = True
+            user.find(kind=ui.button, content='Refresh tools').click()
+            await asyncio.wait_for(Integration.started.wait(), timeout=1)
+            user.find('MCP server').trigger('update:modelValue', {'value': 2})
+            await user.should_see('A tool from the other server')
+            user.find(kind=ui.checkbox, content='other_tool').click()
+            Integration.release.set()
+            await asyncio.sleep(0.05)
+            await user.should_not_see('stale_tool')
+            assert next(iter(user.find(kind=ui.checkbox, content='other_tool').elements)).value
+            user.find('MCP server').trigger('update:modelValue', {'value': 1})
+            await user.should_see('Search the public web')
+            assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
+            user.find('MCP server').trigger('update:modelValue', {'value': 2})
+            await user.should_see('A tool from the other server')
+            assert next(iter(user.find(kind=ui.checkbox, content='other_tool').elements)).value
+            user.find('MCP server').trigger('update:modelValue', {'value': 1})
+            await user.should_see('Search the public web')
         redirects = []
         monkeypatch.setattr(user.navigate, 'to', redirects.append)
         auth.enabled = False
