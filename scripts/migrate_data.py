@@ -215,6 +215,14 @@ async def provision(manifest, service):
 async def deploy(manifest, service, agent):
     if agent.get('vm_id'):
         return agent['vm_id']
+    if agent.get('deployment_id'):
+        previous = service.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (agent['deployment_id'],))
+        if previous and previous['phase'] == 'rejected':
+            if previous.get('vm_id'):
+                raise ValueError('A rejected deployment unexpectedly has a VM; investigate before retrying')
+            agent.setdefault('rejected_deployment_ids', []).append(agent.pop('deployment_id'))
+            agent.pop('deployment_phase', None)
+            save(manifest)
     target = await service.agent(agent['target_agent_id'])
     cloud = await service.cloud_client(target)
     zone = json.loads((STATE / 'zone.json').read_text())
@@ -222,7 +230,8 @@ async def deploy(manifest, service, agent):
     if not agent.get('deployment_id'):
         agent['deployment_phase'] = 'dispatching'
         save(manifest)
-        previous = service.store.all('SELECT id FROM vm_deployments WHERE agent_id=?', (target['id'],))
+        previous = service.store.all('SELECT id FROM vm_deployments WHERE agent_id=? AND phase<>?',
+                                     (target['id'], 'rejected'))
         if previous:
             raise ValueError('Target agent already has a managed deployment; reconcile it before retrying migration')
         size = max(2, math.ceil(agent['workspace_bytes'] / 2**30 * 2.2) + 2)
@@ -247,6 +256,7 @@ async def deploy(manifest, service, agent):
         operation = service.store.one('SELECT vm_id,phase FROM vm_deployments WHERE id=?', (agent['deployment_id'],))
         if operation and operation.get('vm_id'):
             agent['vm_id'] = operation['vm_id']
+            agent['deployment_phase'] = operation['phase']
         else:
             raise ValueError('Migration deployment needs explicit recovery; no duplicate VM created')
     if not agent.get('vm_id'):

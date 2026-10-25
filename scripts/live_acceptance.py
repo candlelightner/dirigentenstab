@@ -52,11 +52,11 @@ async def acceptance(app, zone):
     for name, agent in agents.items():
         key = name.lower() + '_vm'
         if key not in state:
-            pending = app.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched')",
-                                    (agent['id'],))
-            if pending:
+            previous = app.store.one("SELECT id,vm_id,phase FROM vm_deployments WHERE agent_id=? AND phase<>'rejected' "
+                                     'ORDER BY updated DESC LIMIT 1', (agent['id'],))
+            if previous:
                 await app.recover_deployments()
-                recovered = app.store.one("SELECT vm_id FROM vm_deployments WHERE id=? AND phase='complete'", (pending['id'],))
+                recovered = app.store.one("SELECT vm_id FROM vm_deployments WHERE id=? AND phase='complete'", (previous['id'],))
                 if not recovered:
                     raise RuntimeError('A previous VM deployment is ambiguous. Use scripts/admin.py status and recovery.')
                 state[key] = recovered['vm_id']

@@ -509,7 +509,8 @@ async def test_revoke_tracks_rotation_orphans_deletes_signing_key_last_and_recov
     assert store.one('SELECT enabled FROM agents')['enabled'] == 0
 
 
-async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_and_recovers_once(store):
+@pytest.mark.parametrize('failure', ['transport', 'async-job', 'http-rejection'])
+async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_identity(store, failure):
     add_parent(store)
     template = '00000000-0000-0000-0000-000000000001'
     params = {'templateid': template, 'zoneid': '00000000-0000-0000-0000-000000000002',
@@ -532,12 +533,22 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
                 return {'serviceoffering': [{'id': request['id'], 'gpucount': 0}]}
             if command == 'deployVirtualMachine':
                 self.deployments += 1
-                pending = store.one('SELECT * FROM vm_deployments')
+                pending = store.one('SELECT * FROM vm_deployments WHERE name=?', (request['name'],))
                 assert pending['phase'] == 'dispatched' and pending['name'] == request['name']
                 assert store.one('SELECT host_key FROM vm_access WHERE vm_id=?',
                                  ('pending-' + pending['id'],))['host_key']
-                self.vm = {'id': 'actual-vm-id', 'name': request['name']}
-                raise CloudError('Connection dropped after deployment was accepted')
+                if failure == 'http-rejection':
+                    raise CloudError('Definitive API validation rejection', rejected=True)
+                self.vm = {'id': 'actual-vm-id', 'name': request['name'], 'state': 'Stopped',
+                           'account': 'parent-service', 'domainid': 'parent-domain'}
+                if failure == 'transport':
+                    raise CloudError('Connection dropped after deployment was accepted')
+                return {'jobid': 'failed-job'}
+            if command == 'queryAsyncJobResult':
+                return {'jobstatus': 2, 'jobresult': {'errorcode': 533, 'errortext': 'No destination found'}}
+            if command == 'listAccounts':
+                assert request['id'] == 'parent-account'
+                return {'account': [{'id': 'parent-account', 'name': 'parent-service', 'domainid': 'parent-domain'}]}
             assert command == 'listVirtualMachines'
             return {'virtualmachine': [self.vm] if self.vm else []}
 
@@ -554,6 +565,17 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
     service._ssh_security_group = ssh_group
     with pytest.raises(CloudError):
         await service.execute('parent', 'deployVirtualMachine', params)
+    operation = store.one('SELECT * FROM vm_deployments')
+    if failure == 'http-rejection':
+        assert operation['phase'] == 'rejected'
+        with pytest.raises(CloudError, match='validation rejection'):
+            await service.execute('parent', 'deployVirtualMachine', params)
+        assert cloud.deployments == 2
+        await service.recover_deployments()
+        assert all(op['phase'] == 'rejected' for op in store.all('SELECT phase FROM vm_deployments'))
+        return
+    assert operation['phase'] == ('failed' if failure == 'async-job' else 'dispatched')
+    prepared = store.one('SELECT private_key,host_key,owner_agent FROM vm_access')
     with pytest.raises(CloudError, match='recovery'):
         await service.execute('parent', 'deployVirtualMachine', params)
     assert cloud.deployments == 1
@@ -562,7 +584,135 @@ async def test_managed_deploy_persists_before_dispatch_blocks_ambiguous_retry_an
     assert cloud.deployments == 1
     assert store.one('SELECT * FROM vm_deployments')['phase'] == 'complete'
     assert store.one('SELECT vm_id FROM vm_access')['vm_id'] == 'actual-vm-id'
+    assert store.one('SELECT private_key,host_key,owner_agent FROM vm_access') == prepared
     assert b'BEGIN OPENSSH PRIVATE KEY' not in store.path.read_bytes()
+
+
+@pytest.fixture
+def failed_deployment(store):
+    add_parent(store)
+    operation_id, name = 'failed-operation', 'ds-vm-owned-stable-name'
+    store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',
+                  (operation_id, 'parent', name, store.seal({'name': name}), 'failed', 1))
+    store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key) VALUES(?,?,?,?,?)',
+                  ('pending-' + operation_id, 'parent', 'dirigent', store.seal('synthetic-private-key'), 'synthetic-host-key'))
+
+    class RecoveryCloud:
+        def __init__(self):
+            self.vms = []
+            self.calls = []
+
+        async def raw(self, command, params):
+            self.calls.append((command, params.copy()))
+            if command == 'listAccounts':
+                assert params == {'id': 'parent-account', 'listall': True}
+                return {'account': [{'id': 'parent-account', 'name': 'parent-service', 'domainid': 'parent-domain'}]}
+            assert command == 'listVirtualMachines', 'Recovery must never create infrastructure or credentials'
+            assert params['name'] == name
+            return {'virtualmachine': self.vms}
+
+    service, cloud = Service(store, SimpleNamespace()), RecoveryCloud()
+
+    async def client(agent, purpose='runtime'):
+        assert agent['id'] == 'parent' and purpose == 'runtime'
+        return cloud
+
+    service.cloud_client = client
+    return service, cloud, operation_id, name
+
+
+@pytest.mark.parametrize('phase', ['prepared', 'dispatched', 'failed'])
+async def test_missing_or_ambiguous_vm_never_clears_failed_deployment_or_dispatches_again(failed_deployment, phase):
+    service, cloud, operation_id, name = failed_deployment
+    service.store.execute('UPDATE vm_deployments SET phase=?', (phase,))
+    agent = await service.agent('parent')
+    for vms in ([], [{'id': 'one', 'name': name, 'account': 'parent-service', 'domainid': 'parent-domain', 'state': 'Running'},
+                    {'id': 'two', 'name': name, 'account': 'parent-service', 'domainid': 'parent-domain', 'state': 'Running'}]):
+        cloud.vms = vms
+        await service.recover_deployments()
+        assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': phase, 'vm_id': None}
+        with pytest.raises(CloudError, match='needs recovery'):
+            await service._deploy_managed(agent, cloud, {})
+    assert all(command in {'listAccounts', 'listVirtualMachines'} for command, _ in cloud.calls)
+
+
+@pytest.mark.parametrize('state', ['Error', 'Destroyed', 'Expunging', 'Starting', 'Stopping', 'Migrating', 'Unknown', None])
+async def test_failed_vm_in_unusable_or_transient_state_is_never_adopted_or_redeployed(failed_deployment, state):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [{'id': 'unusable-vm', 'name': name, 'account': 'parent-service',
+                  'domainid': 'parent-domain', 'state': state}]
+    prepared = service.store.one('SELECT * FROM vm_access')
+    await service.recover_deployments()
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'failed', 'vm_id': None}
+    assert service.store.one('SELECT * FROM vm_access') == prepared
+    assert service.store.one('SELECT operation,target FROM audit') == {
+        'operation': 'deployment-recovery-needs-review', 'target': operation_id}
+    with pytest.raises(CloudError, match='needs recovery'):
+        await service._deploy_managed(await service.agent('parent'), cloud, {})
+    assert all(command in {'listAccounts', 'listVirtualMachines'} for command, _ in cloud.calls)
+
+
+@pytest.mark.parametrize('foreign', [
+    {'account': 'child-service', 'domainid': 'child-domain'},
+    {'account': 'parent-service', 'domainid': 'other-domain'},
+    {'account': 'other-service', 'domainid': 'parent-domain'},
+])
+async def test_recovery_never_adopts_a_parent_visible_child_or_other_account_vm(failed_deployment, foreign):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [{'id': 'foreign-vm', 'name': name, 'state': 'Stopped', **foreign}]
+    await service.recover_deployments()
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'failed', 'vm_id': None}
+    assert service.store.one('SELECT vm_id FROM vm_access')['vm_id'] == 'pending-' + operation_id
+    cloud.vms.append({'id': 'owned-vm', 'name': name, 'account': 'parent-service', 'domainid': 'parent-domain',
+                      'state': 'Running'})
+    await service.recover_deployments()
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'complete', 'vm_id': 'owned-vm'}
+    service._bind_vm(operation_id, 'owned-vm')
+    with pytest.raises(CloudError, match='another VM'):
+        service._bind_vm(operation_id, 'different-vm')
+
+
+@pytest.mark.parametrize('problem', ['missing', 'other-owner', 'already-managed'])
+async def test_recovery_requires_the_original_ssh_record_and_matching_owner(failed_deployment, problem):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [{'id': 'owned-vm', 'name': name, 'account': 'parent-service', 'domainid': 'parent-domain',
+                  'state': 'Stopped'}]
+    if problem == 'missing':
+        service.store.execute('DELETE FROM vm_access')
+    elif problem == 'other-owner':
+        service.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) '
+                              "SELECT 'other','Other','other-domain','other-account','other-user',runtime,provisioning "
+                              "FROM agents WHERE id='parent'")
+        service.store.execute("UPDATE vm_access SET owner_agent='other'")
+    else:
+        service.store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key) '
+                              "SELECT 'owned-vm',owner_agent,username,private_key,host_key FROM vm_access")
+    before = service.store.all('SELECT * FROM vm_access ORDER BY vm_id')
+    with pytest.raises(CloudError, match='SSH identity'):
+        await service.recover_deployments()
+    assert service.store.all('SELECT * FROM vm_access ORDER BY vm_id') == before
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'failed', 'vm_id': None}
+
+
+async def test_confirmed_rejection_cli_is_the_only_resolution_for_a_legacy_failed_op_without_a_vm(failed_deployment):
+    from scripts.admin import perform
+
+    service, cloud, operation_id, _ = failed_deployment
+    original = cloud.raw
+
+    async def raw(command, params):
+        if command == 'listAsyncJobs':
+            return {'asyncjobs': []}
+        return await original(command, params)
+
+    cloud.raw = raw
+    options = SimpleNamespace(command='resolve-rejection', identifier=operation_id, confirmed_rejection=False)
+    with pytest.raises(SystemExit, match='confirmed-rejection'):
+        await perform(options, service)
+    assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == 'failed'
+    options.confirmed_rejection = True
+    await perform(options, service)
+    assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == 'rejected'
 
 
 @pytest.mark.parametrize('source', ['0.0.0.0/0', '::/0', '10.0.0.0/8', '127.0.0.1/32', '8.8.8.8/32'])

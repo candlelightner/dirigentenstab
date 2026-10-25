@@ -264,6 +264,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             state['busy'] = True
             send_button.disable()
             prompt.disable()
+            new_button.disable()
+            history_select.disable()
+            agent_choice.disable()
             message('human', text)
             prompt.set_value('')
             with transcript:
@@ -290,6 +293,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 state['busy'] = False
                 send_button.enable()
                 prompt.enable()
+                new_button.enable()
+                history_select.enable()
+                agent_choice.enable()
                 progress.set_text('')
 
         async def configure_agent():

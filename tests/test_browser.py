@@ -86,6 +86,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         content = await page.content()
         assert all(secret not in content for secret in PRIVATE_VALUES)
         await page.get_by_role('button', name='New conversation', exact=True).click()
+        await page.get_by_text(output, exact=True).wait_for(state='detached')
         await page.get_by_label('Conversation', exact=True).fill('Inspect the research VM')
         await page.get_by_role('option', name='Inspect the research VM', exact=True).click()
         await page.get_by_text(output, exact=True).wait_for()

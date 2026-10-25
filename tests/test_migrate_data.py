@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -157,3 +158,68 @@ def test_restore_preserves_source_marker_filename_and_rejects_symlink_destinatio
     rejected = subprocess.run([sys.executable, '-c', rejected_program, checksum], capture_output=True, timeout=10)
     assert rejected.returncode != 0
     assert (tmp_path / 'legacy' / name).read_bytes() == content
+
+
+class DeploymentStore:
+    def __init__(self, phase):
+        self.db = sqlite3.connect(':memory:')
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('CREATE TABLE vm_deployments(id,agent_id,phase,vm_id,updated)')
+        self.db.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?)', ('old', 'target', phase, None, 1))
+
+    def all(self, sql, args):
+        return [dict(row) for row in self.db.execute(sql, args)]
+
+    def one(self, sql, args):
+        return next(iter(self.all(sql, args)), None)
+
+
+class DeploymentService:
+    def __init__(self, phase):
+        self.store, self.dispatched = DeploymentStore(phase), 0
+
+    async def agent(self, agent_id):
+        return {'id': agent_id}
+
+    async def cloud_client(self, agent):
+        return object()
+
+    async def _deploy_managed(self, agent, cloud, params, *, workspace_disk):
+        assert workspace_disk
+        self.dispatched += 1
+        self.store.db.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?)',
+                              ('new', agent['id'], 'complete', 'new-vm', 2))
+        return {'virtualmachine': {'id': 'new-vm'}}
+
+    async def recover_deployments(self):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['rejected', 'failed', 'dispatched', 'adopted'])
+async def test_migration_retries_only_terminal_rejection(tmp_path, monkeypatch, phase):
+    monkeypatch.setattr(migration, 'STATE', tmp_path)
+    monkeypatch.setattr(migration, 'MANIFEST', tmp_path / 'manifest.json')
+    (tmp_path / 'zone.json').write_text(json.dumps({'zone_id': 'zone', 'template_id': 'template',
+                                                 'service_offering_id': 'offering'}))
+    (tmp_path / 'migration-storage.json').write_text(json.dumps({'disk_offering_id': 'disk'}))
+    agent = {'target_agent_id': 'target', 'deployment_id': 'old', 'deployment_phase': phase,
+             'workspace_bytes': 1, 'source_id': 'fixture'}
+    service = DeploymentService('failed' if phase == 'adopted' else phase)
+    if phase == 'rejected':
+        assert await migration.deploy({'agents': [agent]}, service, agent) == 'new-vm'
+        assert service.dispatched == 1
+        assert agent['rejected_deployment_ids'] == ['old']
+        assert agent['deployment_id'] == 'new'
+    elif phase == 'adopted':
+        async def recover():
+            service.store.db.execute("UPDATE vm_deployments SET phase='complete',vm_id='existing-vm'")
+        service.recover_deployments = recover
+        assert await migration.deploy({'agents': [agent]}, service, agent) == 'existing-vm'
+        assert service.dispatched == 0
+        assert agent['deployment_phase'] == 'complete'
+    else:
+        with pytest.raises(ValueError, match='explicit recovery'):
+            await migration.deploy({'agents': [agent]}, service, agent)
+        assert service.dispatched == 0
+        assert agent['deployment_id'] == 'old'
