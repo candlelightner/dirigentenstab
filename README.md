@@ -45,7 +45,7 @@ For **Tavily**, select the main agent, then **Configure → MCP tools → New se
 
 External tool results are untrusted data. Generic MCP calls use the existing durable execution tracking; an uncertain outcome requires administrator review before another mutation. Only assign tools and send queries to services you intend to trust with that data. See [security](docs/SECURITY.md) for the boundaries.
 
-CloudStack `execute_api` calls use native behavior by default, preserving caller-supplied names, user-data and publication settings. For application-managed SSH enrollment, explicitly set `managed=true` when deploying from an approved template. The same option on `createTemplate` selects the durable private-template workflow; it does not restrict ordinary native template creation.
+CloudStack `execute_api` calls use native behavior by default, preserving caller-supplied names, user-data and publication settings. For application-managed SSH enrollment, explicitly set `managed=true` when deploying from a cloud-init-compatible template. The backend adds guest sudo only for explicitly approved templates; enrollment does not remove privileges or secrets already baked into an image. The selected offering's root disk must fit the template; fixed disk offerings may ignore `rootdisksize`. The same option on `createTemplate` selects the durable private-template workflow; it does not restrict ordinary native template creation.
 
 ## Security boundaries
 

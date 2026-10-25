@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import collections
 import json
 import os
@@ -601,16 +602,21 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
 
 
 @pytest.mark.parametrize('failure', ['transport', 'async-job', 'http-rejection'])
-async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_identity(store, failure):
+@pytest.mark.parametrize('guest_admin', [None, 0, 1])
+async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_identity(store, failure, guest_admin):
     add_parent(store)
     template = '00000000-0000-0000-0000-000000000001'
     params = {'templateid': template, 'zoneid': '00000000-0000-0000-0000-000000000002',
               'serviceofferingid': '00000000-0000-0000-0000-000000000003'}
-    store.execute('INSERT INTO managed_templates(id,name) VALUES(?,?)', (template, 'Managed Linux'))
+    if guest_admin is not None:
+        store.execute('INSERT INTO managed_templates VALUES(?,?,?)', (template, 'Managed Linux', guest_admin))
 
-    class DeploymentCloud:
+    class DeploymentCloud(Cloud):
         deployments = 0
         vm = None
+
+        def __init__(self):
+            super().__init__(SimpleNamespace(), {'apikey': 'parent-api', 'secretkey': 'parent-secret'})
 
         async def catalogue(self, *, refresh=False):
             return {'deployVirtualMachine': {'name': 'deployVirtualMachine', 'params': [
@@ -624,6 +630,9 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
                 return {'serviceoffering': [{'id': request['id'], 'gpucount': 0}]}
             if command == 'deployVirtualMachine':
                 self.deployments += 1
+                self.userdata = request['userdata']
+                config = json.loads(base64.b64decode(request['userdata']).decode().split('\n', 1)[1])
+                assert bool(config['users'][0].get('sudo')) == bool(guest_admin)
                 pending = store.one('SELECT * FROM vm_deployments WHERE name=?', (request['name'],))
                 assert pending['phase'] == 'dispatched' and pending['name'] == request['name']
                 assert store.one('SELECT host_key FROM vm_access WHERE vm_id=?',
@@ -636,7 +645,8 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
                     raise CloudError('Connection dropped after deployment was accepted')
                 return {'jobid': 'failed-job'}
             if command == 'queryAsyncJobResult':
-                return {'jobstatus': 2, 'jobresult': {'errorcode': 533, 'errortext': 'No destination found'}}
+                return {'jobstatus': 2, 'jobresult': {'errorcode': 533,
+                        'errortext': 'No destination found parent-secret ' + self.userdata}}
             if command == 'listAccounts':
                 assert request['id'] == 'parent-account'
                 return {'account': [{'id': 'parent-account', 'name': 'parent-service', 'domainid': 'parent-domain'}]}
@@ -654,8 +664,11 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
 
     service.cloud_client = client
     service._ssh_security_group = ssh_group
-    with pytest.raises(CloudError):
+    with pytest.raises(CloudError) as error:
         await service.execute('parent', 'deployVirtualMachine', params, managed=True)
+    if failure == 'async-job':
+        assert error.value.public_detail == 'No destination found [redacted] [redacted]'
+        assert not error.value.rejected
     operation = store.one('SELECT * FROM vm_deployments')
     if failure == 'http-rejection':
         assert operation['phase'] == 'rejected'
@@ -880,15 +893,20 @@ async def test_dashboard_is_optional_platform_admin_only_and_never_carries_crede
     assert service.dashboard_url(root) == ''
 
 
-@pytest.mark.parametrize('interrupted', [False, True])
-async def test_private_template_ownership_recovery_and_managed_clone_approval(store, interrupted):
+@pytest.mark.parametrize('interrupted', [False, True, 'async-job'])
+@pytest.mark.parametrize('guest_admin', [None, 0, 1])
+async def test_private_template_ownership_recovery_and_managed_clone_approval(store, interrupted, guest_admin):
     add_parent(store)
-    store.execute('INSERT INTO managed_templates VALUES(?,?,?)', ('base', 'Approved build base', 1))
+    if guest_admin is not None:
+        store.execute('INSERT INTO managed_templates VALUES(?,?,?)', ('base', 'Managed base', guest_admin))
     store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key) VALUES(?,?,?,?)',
                   ('vm', 'parent', 'dirigent', store.seal('synthetic-key')))
-    class TemplateCloud:
+    class TemplateCloud(Cloud):
         calls = 0
         template = None
+        state = 'Running'
+        def __init__(self):
+            super().__init__(SimpleNamespace(), {'apikey': 'parent-api', 'secretkey': 'parent-secret'})
         async def catalogue(self, *, refresh=False):
             return {'createTemplate': {'params': [{'name': n, 'type': 'string', 'required': True}
                     for n in ('name', 'volumeid', 'ostypeid')] + [
@@ -897,17 +915,21 @@ async def test_private_template_ownership_recovery_and_managed_clone_approval(st
             if command == 'listVolumes':
                 return {'volume': [{'id': 'root', 'type': 'ROOT', 'virtualmachineid': 'vm'}]}
             if command == 'listVirtualMachines':
-                return {'virtualmachine': [{'id': 'vm', 'state': 'Stopped', 'templateid': 'base'}]}
+                return {'virtualmachine': [{'id': 'vm', 'state': self.state, 'templateid': 'base'}]}
             if command == 'listTemplates':
                 return {'template': [self.template] if self.template else []}
             if command == 'listAccounts':
                 return {'account': [{'id': 'parent-account', 'domainid': 'parent-domain', 'name': 'owner'}]}
+            if command == 'queryAsyncJobResult':
+                return {'jobstatus': 2, 'jobresult': {'errortext': 'Template job failed parent-secret'}}
             assert command == 'createTemplate' and params['ispublic'] is False and params['isfeatured'] is False
             self.calls += 1
             self.template = {'id': 'private-image', 'name': params['name'], 'accountid': 'parent-account',
                              'domainid': 'parent-domain', 'account': 'owner', 'ispublic': False, 'isready': True}
+            if interrupted == 'async-job':
+                return {'jobid': 'template-job'}
             if interrupted:
-                raise CloudError('Response lost after creation')
+                raise CloudError('Response lost after creation', public_detail='Template creation response unavailable')
             return {'template': self.template}
     cloud = TemplateCloud()
     service = Service(store, SimpleNamespace(max_output=65536))
@@ -919,15 +941,23 @@ async def test_private_template_ownership_recovery_and_managed_clone_approval(st
         with pytest.raises(PermissionError):
             await service.execute('parent', 'createTemplate', params, managed=True)
     args = {'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux'}
+    with pytest.raises(PermissionError, match='Stop the managed VM'):
+        await service.execute('parent', 'createTemplate', args, managed=True)
+    assert cloud.calls == 0 and not store.one('SELECT id FROM template_creations')
+    cloud.state = 'Stopped'
     if interrupted:
-        with pytest.raises(CloudError):
+        with pytest.raises(CloudError) as error:
             await service.execute('parent', 'createTemplate', args, managed=True)
+        assert error.value.public_detail == ('Template job failed [redacted]' if interrupted == 'async-job'
+                                            else 'Template creation response unavailable')
+        assert not error.value.rejected
+        assert error.value.operation_id == store.one('SELECT id FROM template_creations')['id']
         with pytest.raises(CloudError, match='recovery'):
             await service.execute('parent', 'createTemplate', args, managed=True)
         await service.recover_templates()
     result = await service.execute('parent', 'createTemplate', args, managed=True)
     assert result['template']['id'] == 'private-image' and cloud.calls == 1
-    assert store.one('SELECT guest_admin FROM managed_templates WHERE id=?', ('private-image',))['guest_admin'] == 1
+    assert store.one('SELECT guest_admin FROM managed_templates WHERE id=?', ('private-image',))['guest_admin'] == bool(guest_admin)
     store.execute('DELETE FROM vm_access')
     with pytest.raises(PermissionError, match='managed root volume'):
         await service.execute('parent', 'createTemplate', {**args, 'name': 'unauthorized-copy'}, managed=True)

@@ -1,9 +1,57 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from dirigentenstab.cloud import Cloud, CloudError
+from dirigentenstab.diagnostics import diagnose
+
+
+@pytest.mark.parametrize('output,returncode', [('json', 1), ('text', 1), ('json', 0), ('wrapped', 0)])
+async def test_native_disk_rejection_reaches_agent_with_redacted_bounded_details(tmp_path, output, returncode):
+    reason = 'rootdisksize override (20 GB) is smaller than template size (25 GB)'
+    credentials = {'apikey': 'synthetic-native-key', 'secretkey': 'synthetic-native-secret'}
+    detail = reason + ' ' + ' '.join(credentials.values()) + ' tiny-userdata ' + 'x' * 600
+    failure = {'errorcode': 431, 'errortext': detail}
+    if output == 'text':
+        response = 'Error: (HTTP 431, error code 4350) ' + detail
+    else:
+        response = json.dumps({'deployvirtualmachineresponse': failure} if output == 'json'
+                              else {'errorresponse': failure, 'other': 'metadata'})
+    executable = tmp_path / 'fake-cloudmonkey'
+    executable.write_text('#!/usr/bin/env python3\nimport sys\n'
+                          f'print({response!r})\nsys.exit({returncode})\n')
+    executable.chmod(0o700)
+    cloud = Cloud(SimpleNamespace(cmk=str(executable), cloudstack_url='https://cloudstack.invalid/client/api'),
+                  credentials)
+    with pytest.raises(CloudError) as failure:
+        await cloud.raw('deployVirtualMachine', {'userdata': 'tiny-userdata'})
+    assert failure.value.rejected
+    assert len(failure.value.public_detail) <= 400
+    error = diagnose(failure.value, operation_id='deployment', tool='execute_api')
+    assert reason in str(error)
+    assert all(secret not in str(error) for secret in [*credentials.values(), 'tiny-userdata'])
+
+
+async def test_native_failed_job_exposes_reason_without_making_dispatch_safe_to_repeat():
+    class Failed(Cloud):
+        async def catalogue(self):
+            return {}
+
+        async def raw(self, command, params=None):
+            if command == 'deployVirtualMachine':
+                return {'jobid': 'submitted-job'}
+            return {'jobstatus': 2, 'jobresult': {'errorcode': 530,
+                    'errortext': 'No destination found synthetic-native-secret short'}}
+
+    cloud = Failed(SimpleNamespace(), {'apikey': 'synthetic-native-key', 'secretkey': 'synthetic-native-secret'})
+    with pytest.raises(CloudError) as failure:
+        await cloud.execute('deployVirtualMachine', {'userdata': 'short'})
+    assert not failure.value.rejected
+    error = diagnose(failure.value, operation_id='deployment', tool='execute_api')
+    assert 'No destination found' in str(error) and 'submitted-job' in str(error)
+    assert 'synthetic-native-secret' not in str(error) and 'short' not in str(error)
 
 
 class Native(Cloud):

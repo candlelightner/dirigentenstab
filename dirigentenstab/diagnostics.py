@@ -46,6 +46,8 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         elif exc.rejected and any(code in str(exc) for code in ('401', '403', '531')):
             category = 'authorization'
             description = 'CloudStack denied this operation for the agent’s account, domain or API key.'
+        if exc.public_detail:
+            description += ' Details: ' + exc.public_detail[:500]
     elif isinstance(exc, ModelHTTPError):
         category = 'model-provider'
         code = exc.status_code
