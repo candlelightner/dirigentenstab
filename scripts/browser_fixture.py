@@ -56,7 +56,9 @@ def fake_api(state):
 
         def do_GET(self):
             if self.path == '/v1/models':
-                value, status = {'data': [{'id': 'fixture-model'}, {'id': 'second-model'}]}, 200
+                value, status = {'data': [
+                    {'id': 'fixture-model', 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
+                    {'id': 'second-model', 'effort': {'supported_levels': ['low', 'high']}}]}, 200
             elif self.path == '/empty/models':
                 value, status = {'data': []}, 200
             elif self.path == '/unauthorized/models':
@@ -155,7 +157,10 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'bounded lifecycle' in prompt:
+    if 'thinking indicator' in prompt:
+        await asyncio.sleep(0.5)
+        yield 'Pending response complete.'
+    elif 'bounded lifecycle' in prompt:
         await asyncio.sleep(0.15)
         completed = sum(part.part_kind == 'tool-return' for message in messages for part in message.parts)
         if completed >= 5:

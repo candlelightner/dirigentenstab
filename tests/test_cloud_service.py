@@ -36,6 +36,47 @@ def add_parent(store):
     return credentials
 
 
+async def test_agent_thinking_configuration_is_persistent_and_older_callers_preserve_it(store):
+    credentials = add_parent(store)
+    service = Service(store, SimpleNamespace())
+
+    async def authorize(identity, agent_id):
+        if identity['userid'] != 'owner' or agent_id != 'parent':
+            raise PermissionError('Agent outside your CloudStack domain')
+        return await service.agent(agent_id)
+
+    service.authorize = authorize
+    identity = {'userid': 'owner', 'type': 2}
+    assert (await service.agent('parent'))['thinking'] == 'default'
+    await service.update_agent(identity, 'parent', 'provider', 'parent-model', 'Updated prompt', thinking='high')
+    await service.update_agent(identity, 'parent', 'provider', 'parent-model', 'Another prompt')
+    agent = await service.agent('parent')
+    assert agent['thinking'] == 'high' and agent['instructions'] == 'Another prompt'
+    assert store.open(agent['credentials']) == credentials
+    with pytest.raises(PermissionError):
+        await service.update_agent({'userid': 'other', 'type': 2}, 'parent', 'provider', '', '', thinking='off')
+    assert (await service.agent('parent'))['thinking'] == 'high'
+    # Providers may advertise new effort names without an application release.
+    await service.update_agent(identity, 'parent', 'provider', 'parent-model', '', thinking='provider-level')
+    assert (await service.agent('parent'))['thinking'] == 'provider-level'
+
+
+@pytest.mark.parametrize('thinking', ['', 'High', 'high\n', 'a' * 33, False, {'effort': 'high'}])
+async def test_invalid_thinking_level_cannot_partially_change_agent_configuration(store, thinking):
+    add_parent(store)
+    service = Service(store, SimpleNamespace())
+
+    async def authorize(identity, agent_id):
+        return await service.agent(agent_id)
+
+    service.authorize = authorize
+    before = await service.agent('parent')
+    with pytest.raises(ValueError, match='Invalid thinking level'):
+        await service.update_agent({'userid': 'owner', 'type': 1}, 'parent', 'provider', 'changed', 'changed',
+                                   can_provision=False, thinking=thinking)
+    assert await service.agent('parent') == before
+
+
 @pytest.fixture
 def fake_cmk(tmp_path, monkeypatch):
     executable = tmp_path / 'fake-cmk'
@@ -542,6 +583,7 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB')
     store.execute('UPDATE agents SET provisioning=?', (archived,))
     store.execute('DROP TABLE legacy_agent_credentials')
+    store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)', ('parent', 'pending', journal, journal, 'validating', 1))

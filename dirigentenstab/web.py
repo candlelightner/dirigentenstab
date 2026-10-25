@@ -172,6 +172,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
             .composer{width:100%;flex-shrink:0;align-items:end;flex-wrap:nowrap}
             .composer textarea{max-height:120px;overflow:auto!important}
+            .thinking-dot{width:5px;height:5px;border-radius:50%;background:currentColor;animation:thinking-pulse 1s infinite alternate}
+            @keyframes thinking-pulse{from{opacity:.25}to{opacity:1;transform:translateY(-2px)}}
+            @media(prefers-reduced-motion:reduce){.thinking-dot{animation:none}}
             .markdown{max-width:100%;overflow-wrap:anywhere;min-width:0}
             .markdown table,.markdown pre{display:block;max-width:100%;overflow-x:auto}
             .markdown h1,.markdown h2{font-size:1.4rem;line-height:1.3;margin:.6rem 0}
@@ -247,6 +250,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 gpu_recover_button.set_visibility(False)
                 budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
+                with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
+                        'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
+                    ui.label('Thinking…')
+                    with ui.row().classes('items-center gap-1').props('aria-hidden=true'):
+                        for dot in range(3):
+                            ui.element('span').classes('thinking-dot').style(f'animation-delay:{dot * .15}s')
                 with ui.row().classes('composer gap-2'):
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
                         'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
@@ -694,6 +703,59 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 model = ui.select([original_model] if original_model else [], label='Model ID', value=original_model or None,
                                   with_input=True, new_value_mode='add-unique').classes('w-full')
                 model_status = ui.label('').classes('text-sm').props('role=status')
+                thinking_choice = agent.get('thinking', 'default')
+                thinking_generation = 0
+                thinking_options = {'default': 'Model default'}
+                if thinking_choice != 'default':
+                    thinking_options[thinking_choice] = f'Saved level: {thinking_choice} (checking support)'
+                thinking = ui.select(thinking_options, value=thinking_choice, label='Thinking level').classes('w-full')
+                thinking.disable()
+                thinking_source = ui.label('Checking model support…').classes('text-sm').props('role=status')
+                ui.label('Applies to the next invocation; an active reply keeps its current settings.').classes('text-sm text-stone-600')
+
+                def thinking_changed(event):
+                    nonlocal thinking_choice
+                    thinking_choice = event.value or 'default'
+
+                async def load_thinking():
+                    nonlocal thinking_generation, thinking_choice
+                    thinking_generation += 1
+                    generation = thinking_generation
+                    selected_provider, selected_model = provider.value, (model.value or '').strip()
+                    thinking.disable()
+                    thinking.props('loading')
+                    save_button.disable()
+                    thinking_source.set_text('Checking model support…')
+                    try:
+                        current = await actor()
+                        capabilities = (await runtime.thinking_capabilities(current, selected_provider, selected_model)
+                                        if selected_provider else {'options': {'default': 'Model default'},
+                                                                  'source': 'Select a provider and model to discover thinking support.'})
+                        if (generation != thinking_generation or provider.value != selected_provider
+                                or (model.value or '').strip() != selected_model):
+                            return
+                        options = capabilities['options']
+                        chosen = thinking_choice if thinking_choice in options else 'default'
+                        source = capabilities['source']
+                        if chosen != thinking_choice:
+                            source += ' The previous thinking level is unavailable for this model; using Model default.'
+                        thinking_choice = chosen
+                        thinking.set_options(options, value=chosen)
+                        thinking_source.set_text(source)
+                    except Exception as exc:
+                        if generation == thinking_generation and provider.value == selected_provider and (model.value or '').strip() == selected_model:
+                            thinking_choice = 'default'
+                            thinking.set_options({'default': 'Model default'}, value='default')
+                            error = diagnose(exc, agent_id=agent['id'], tool='thinking_capabilities')
+                            thinking_source.set_text(str(error) + ' Thinking support could not be verified; only Model default is available.')
+                    finally:
+                        if generation == thinking_generation and provider.value == selected_provider and (model.value or '').strip() == selected_model:
+                            thinking.props(remove='loading')
+                            thinking.enable()
+                            save_button.enable()
+
+                thinking.on_value_change(thinking_changed)
+                model.on_value_change(lambda: protect(load_thinking))
 
                 async def load_models():
                     selected_provider = provider.value
@@ -718,8 +780,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         if provider.value == selected_provider:
                             model.props(remove='loading')
 
-                provider.on_value_change(lambda: protect(load_models))
-                ui.timer(0.01, load_models, once=True)
+                async def provider_changed():
+                    await load_models()
+                    await load_thinking()
+
+                provider.on_value_change(lambda: protect(provider_changed))
+                ui.timer(0.01, lambda: protect(provider_changed), once=True)
                 instructions = ui.textarea('System prompt', value=agent.get('instructions', '')).props('maxlength=32000').classes('w-full')
                 ui.label('Custom instructions for this agent, applied on its next model call.').classes('text-sm text-stone-600')
                 ui.button('MCP tools', icon='extension',
@@ -730,7 +796,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 async def save():
                     options = {'can_provision': can_provision.value} if can_provision is not None else {}
                     await service.update_agent(await actor(), agent['id'], provider.value,
-                                               (model.value or '').strip(), instructions.value or '', **options)
+                                               (model.value or '').strip(), instructions.value or '', thinking=thinking.value, **options)
                     dialog.close()
                     await refresh()
                     await show_agent(agent['id'])
@@ -752,14 +818,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 ui.separator()
                 ui.label('CloudStack credential access').classes('font-semibold')
-                ui.label('Rotation replaces both key pairs. Revocation disables this agent.').classes(
+                ui.label('Rotation replaces the API key pair. Revocation disables this agent.').classes(
                     'text-sm text-stone-600')
                 with ui.row().classes('w-full gap-2'):
                     ui.button('Rotate credentials', icon='key', on_click=lambda: protect(rotate)).props('outline')
                     ui.button('Revoke access', icon='block', on_click=lambda: protect(revoke), color='negative').props('flat')
                 with ui.row().classes('w-full justify-end'):
                     ui.button('Cancel', on_click=dialog.close).props('flat')
-                    ui.button('Save', on_click=lambda: protect(save))
+                    save_button = ui.button('Save', on_click=lambda: protect(save))
+                    save_button.disable()
             dialog.open()
 
         async def subgroup_dialog():

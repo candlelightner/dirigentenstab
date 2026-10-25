@@ -805,3 +805,242 @@ async def test_mcp_error_ignores_remote_readonly_hint_and_blocks_replay(service,
     with pytest.raises(ValueError):
         await manager.resume({'userid': 'human'}, run['id'])
     assert len(mcp_remote.calls) == 1
+
+
+@pytest.mark.parametrize('url,protocol,model,level,expected', [
+    ('https://api.deepseek.com', 'chat', 'deepseek-flash', 'default', {}),
+    ('https://api.deepseek.com', 'chat', 'deepseek-flash', 'off', {'thinking': {'type': 'disabled'}}),
+    ('https://api.deepseek.com', 'chat', 'deepseek-flash', 'on', {'thinking': {'type': 'enabled'}}),
+    ('https://api.deepseek.com', 'chat', 'deepseek-flash', 'low', {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'low'}),
+    ('https://api.deepseek.com', 'chat', 'deepseek-flash', 'max', {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'max'}),
+    ('https://api.deepseek.com', 'responses', 'deepseek-flash', 'off', {'reasoning': {'effort': 'none'}}),
+    ('https://api.deepseek.com', 'responses', 'deepseek-flash', 'on', {'reasoning': {'effort': 'high'}}),
+    ('https://api.deepseek.com', 'responses', 'deepseek-flash', 'max', {'reasoning': {'effort': 'max'}}),
+    ('https://api.deepseek.com', 'responses', 'deepseek-flash', 'default', {}),
+    ('http://inference/v1', 'chat', 'Qwen/Qwen3-8B', 'on', {'chat_template_kwargs': {'enable_thinking': True}}),
+    ('http://inference/v1', 'chat', 'Qwen/Qwen3-8B', 'off', {'chat_template_kwargs': {'enable_thinking': False}}),
+    ('http://inference/v1', 'chat', 'Qwen/Qwen3-8B', 'default', {}),
+    ('https://api.openai.com/v1', 'responses', 'gpt-6.1-sol', 'max', {'reasoning': {'effort': 'max'}}),
+    ('https://api.openai.com/v1', 'responses', 'gpt-6.1-sol', 'default', {}),
+    ('https://api.openai.com/v1', 'chat', 'gpt-5.2', 'off', {'reasoning_effort': 'none'}),
+    ('https://api.openai.com/v1', 'chat', 'gpt-5.2', 'high', {'reasoning_effort': 'high'}),
+    ('https://custom.example/v1', 'chat', 'custom-model', 'adaptive', {'reasoning_effort': 'adaptive'}),
+])
+async def test_thinking_controls_serialize_to_the_actual_model_request(service, monkeypatch, url, protocol, model, level, expected):
+    from dirigentenstab import thinking
+
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if protocol == 'responses':
+            assert request.url.path.endswith('/responses')
+            payload = {'id': 'resp_fixture', 'object': 'response', 'created_at': 1, 'status': 'completed',
+                       'model': model, 'output': [{'id': 'msg_fixture', 'type': 'message', 'status': 'completed',
+                           'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Done', 'annotations': []}]}],
+                       'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}
+        else:
+            assert request.url.path.endswith('/chat/completions')
+            payload = {'id': 'chat_fixture', 'object': 'chat.completion', 'created': 1, 'model': model,
+                       'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'Done'}}],
+                       'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}
+        return httpx.Response(200, json=payload)
+
+    provider = {'base_url': url, 'protocol': protocol, 'api_key': service.store.seal('provider-secret')}
+    original_provider = runtime.OpenAIProvider
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        agent = runtime.Agent(runtime.build_model(provider, model, service.store),
+                              model_settings=thinking.model_settings(provider, model, level))
+        assert (await agent.run('Hello')).output == 'Done'
+    assert len(requests) == 1
+    actual = {key: requests[0][key] for key in ('thinking', 'reasoning_effort', 'reasoning', 'chat_template_kwargs')
+              if key in requests[0]}
+    assert actual == expected
+
+
+async def test_thinking_capabilities_share_bounded_model_metadata_cache_and_recheck_provider_access(service, monkeypatch):
+    calls = []
+    original_client = httpx.AsyncClient
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(200, json={'data': [
+            {'id': 'deepseek-flash', 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
+            {'id': 'custom', 'effort': {'supported_levels': ['adaptive', 'high', 42, 'bad value']}},
+            {'id': 'unknown'}, {'invalid': 'missing ID'},
+        ]})
+
+    async def providers(identity):
+        if identity['userid'] != 'human':
+            raise PermissionError('Administrator required')
+        return service.store.all('SELECT id FROM providers')
+
+    service.providers = providers
+    service.store.execute("UPDATE providers SET base_url='https://api.deepseek.com/v1'")
+    monkeypatch.setattr(runtime.httpx, 'AsyncClient', lambda **kwargs:
+                        original_client(**kwargs, transport=httpx.MockTransport(handle)))
+    manager = runtime.Runtime(service)
+    identity = {'userid': 'human'}
+    assert await manager.models(identity, 'provider') == ['deepseek-flash', 'custom', 'unknown']
+    capability = await manager.thinking_capabilities(identity, 'provider', 'deepseek-flash')
+    assert list(capability['options']) == ['default', 'off', 'low', 'high', 'max']
+    assert 'advertised' in capability['source']
+    assert list((await manager.thinking_capabilities(identity, 'provider', 'custom'))['options']) == [
+        'default', 'off', 'adaptive', 'high']
+    assert (await manager.thinking_capabilities(identity, 'provider', 'unknown'))['options'] == {'default': 'Model default'}
+    assert len(calls) == 1
+    with pytest.raises(PermissionError):
+        await manager.thinking_capabilities({'userid': 'unrelated'}, 'provider', 'deepseek-flash')
+    assert len(calls) == 1
+    service.store.execute('UPDATE providers SET api_key=?', (service.store.seal('rotated-provider-secret'),))
+    await manager.thinking_capabilities(identity, 'provider', 'deepseek-flash')
+    assert len(calls) == 2 and calls[-1].headers['Authorization'] == 'Bearer rotated-provider-secret'
+    service.store.execute("UPDATE providers SET protocol='responses'")
+    await manager.models(identity, 'provider')
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('model,expected', [
+    ('Qwen/Qwen3-8B', ['default', 'off', 'on']),
+    ('Qwen3-0.6B-Q4_K_M.gguf', ['default', 'off', 'on']),
+    ('Qwen/Qwen3-235B-A22B-Thinking-2507', ['default']),
+    ('Qwen/Qwen3-30B-A3B-Instruct-2507', ['default']),
+    ('Qwen/Qwen3-Coder-30B-A3B', ['default']), ('unknown', ['default']),
+])
+def test_thinking_fallbacks_do_not_invent_effort_levels_for_unknown_or_fixed_mode_models(model, expected):
+    from dirigentenstab.thinking import capabilities
+
+    provider = {'base_url': 'http://inference/v1', 'protocol': 'chat'}
+    assert list(capabilities(provider, model)['options']) == expected
+
+
+@pytest.mark.parametrize('model,off', [('gpt-6-astra', False), ('gpt-6.1-sol', False),
+                                      ('gpt-6-sol', True), ('gpt-6-luna', True)])
+def test_current_openai_response_models_use_documented_effort_and_history_profiles(model, off):
+    from dirigentenstab.thinking import capabilities, model_profile
+
+    provider = {'base_url': 'https://api.openai.com/v1', 'protocol': 'responses'}
+    options = capabilities(provider, model)['options']
+    assert list(options) == ['default', *(['off'] if off else []), 'low', 'medium', 'high', 'xhigh', 'max']
+    profile = model_profile(provider, model)
+    assert profile.openai_supports_encrypted_reasoning_content and profile.openai_supports_phase
+    assert profile.openai_supports_reasoning_effort_none == off
+    reported = {'effort': {'supported_levels': ['high']}}
+    assert list(capabilities(provider, model, reported)['options']) == ['default', 'high']
+
+
+async def test_unavailable_model_api_reports_safe_default_without_exposing_credentials(service, monkeypatch):
+    original_client = httpx.AsyncClient
+
+    async def providers(identity):
+        return [{'id': 'provider'}]
+
+    service.providers = providers
+    monkeypatch.setattr(runtime.httpx, 'AsyncClient', lambda **kwargs: original_client(
+        **kwargs, transport=httpx.MockTransport(lambda request: httpx.Response(401, json={'error': 'provider-secret'}))))
+    result = await runtime.Runtime(service).thinking_capabilities({'userid': 'human'}, 'provider', 'unknown')
+    assert result['options'] == {'default': 'Model default'}
+    assert 'unavailable' in result['source'] and 'provider-secret' not in str(result)
+
+
+async def test_agent_thinking_settings_apply_per_agent_and_reject_unsupported_choices(service, monkeypatch):
+    service.store.execute("UPDATE providers SET base_url='https://api.deepseek.com/v1'")
+    service.store.execute("UPDATE agents SET thinking='high' WHERE id='parent'")
+    service.store.execute("UPDATE agents SET thinking='off' WHERE id='child'")
+    manager = runtime.Runtime(service)
+
+    async def capabilities(*args):
+        return {'options': {'default': 'Model default', 'off': 'Off', 'high': 'High'}, 'source': 'Fixture metadata'}
+
+    async def emit(event):
+        pass
+
+    monkeypatch.setattr(manager, 'thinking_capabilities', capabilities)
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(lambda *args: ModelResponse(parts=[TextPart('Done')])))
+    parent = await manager._agent({'userid': 'human'}, 'parent', {'remaining': 8}, 0, emit)
+    child = await manager._agent({'userid': 'human'}, 'child', {'remaining': 8}, 1, emit)
+    assert parent.model_settings == {'max_tokens': 8192, 'timeout': 60, 'openai_reasoning_effort': 'high',
+                                     'extra_body': {'thinking': {'type': 'enabled'}}}
+    assert child.model_settings == {'max_tokens': 8192, 'timeout': 60, 'extra_body': {'thinking': {'type': 'disabled'}}}
+    service.store.execute("UPDATE agents SET thinking='ultra' WHERE id='parent'")
+    with pytest.raises(ValueError, match='unavailable for this model'):
+        await manager._agent({'userid': 'human'}, 'parent', {'remaining': 8}, 0, emit)
+
+
+async def test_deepseek_reasoning_content_survives_tool_continuation_persistence_and_next_turn(service, monkeypatch):
+    from dirigentenstab.thinking import model_settings
+
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            message = {'role': 'assistant', 'content': None, 'reasoning_content': 'First reasoning',
+                       'tool_calls': [{'id': 'call_ping', 'type': 'function',
+                                       'function': {'name': 'ping', 'arguments': '{}'}}]}
+            finish = 'tool_calls'
+        else:
+            message = {'role': 'assistant', 'content': 'Done',
+                       'reasoning_content': 'Final reasoning ' + str(len(requests))}
+            finish = 'stop'
+        return httpx.Response(200, json={'id': 'chat_fixture', 'object': 'chat.completion', 'created': 1,
+            'model': 'deepseek-flash', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}],
+            'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}})
+
+    original_provider = runtime.OpenAIProvider
+    provider = {'base_url': 'https://api.deepseek.com/v1', 'protocol': 'chat',
+                'api_key': service.store.seal('provider-secret')}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        agent = runtime.Agent(runtime.build_model(provider, 'deepseek-flash', service.store),
+                              model_settings=model_settings(provider, 'deepseek-flash', 'high'))
+
+        @agent.tool_plain
+        def ping() -> str:
+            return 'pong'
+
+        first = await agent.run('Use the tool')
+        saved = service.store.seal(json.loads(ModelMessagesTypeAdapter.dump_json(first.all_messages())))
+        restored = runtime.load_history(service.store.open(saved))
+        assert (await agent.run('Another turn', message_history=restored)).output == 'Done'
+    continued = [message for message in requests[1]['messages'] if message['role'] == 'assistant']
+    assert continued[0]['reasoning_content'] == 'First reasoning' and continued[0]['tool_calls']
+    replayed = [message for message in requests[2]['messages'] if message['role'] == 'assistant']
+    assert [message['reasoning_content'] for message in replayed] == ['First reasoning', 'Final reasoning 2']
+    assert all(request['thinking'] == {'type': 'enabled'} and request['reasoning_effort'] == 'high' for request in requests)
+
+
+async def test_current_openai_responses_replay_encrypted_reasoning_and_assistant_phase(service, monkeypatch):
+    from dirigentenstab.thinking import model_settings
+
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json={
+            'id': 'resp_' + str(len(requests)), 'object': 'response', 'created_at': 1,
+            'status': 'completed', 'model': 'gpt-6.1-sol', 'output': [
+                {'id': 'rs_fixture', 'type': 'reasoning', 'summary': [], 'encrypted_content': 'opaque-reasoning'},
+                {'id': 'msg_fixture', 'type': 'message', 'status': 'completed', 'phase': 'final_answer',
+                 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Done', 'annotations': []}]}],
+            'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}})
+
+    original_provider = runtime.OpenAIProvider
+    provider = {'base_url': 'https://api.openai.com/v1', 'protocol': 'responses',
+                'api_key': service.store.seal('provider-secret')}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        agent = runtime.Agent(runtime.build_model(provider, 'gpt-6.1-sol', service.store),
+                              model_settings=model_settings(provider, 'gpt-6.1-sol', 'max'))
+        first = await agent.run('First turn')
+        saved = service.store.seal(json.loads(ModelMessagesTypeAdapter.dump_json(first.all_messages())))
+        assert (await agent.run('Next turn', message_history=runtime.load_history(service.store.open(saved)))).output == 'Done'
+    assert 'reasoning.encrypted_content' in requests[0]['include']
+    reasoning = next(item for item in requests[1]['input'] if item.get('type') == 'reasoning')
+    assert reasoning['encrypted_content'] == 'opaque-reasoning'
+    assistant = next(item for item in requests[1]['input'] if item.get('role') == 'assistant')
+    assert assistant['phase'] == 'final_answer'

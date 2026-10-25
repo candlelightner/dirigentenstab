@@ -27,7 +27,6 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
-from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -36,6 +35,7 @@ from .diagnostics import diagnose, OperationError
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_operation_id
 from .mcp import MCP
 from .mcp_tools import RemoteTools
+from . import thinking
 
 
 REQUESTS_PER_WINDOW = 20
@@ -86,11 +86,10 @@ def build_model(provider, model_id, store):
         raise ValueError('Configure a model identifier before starting a conversation')
     client = OpenAIProvider(base_url=provider['base_url'], api_key=store.open(provider['api_key']) or 'unused')
     model_class = OpenAIResponsesModel if provider['protocol'] == 'responses' else OpenAIChatModel
-    return model_class(model_id, provider=client,
-                       profile=OpenAIModelProfile(openai_supports_strict_tool_definition=False))
+    return model_class(model_id, provider=client, profile=thinking.model_profile(provider, model_id))
 
 
-async def provider_models(provider, store):
+async def provider_catalogue(provider, store):
     headers = {}
     if key := store.open(provider['api_key']):
         headers['Authorization'] = 'Bearer ' + key
@@ -105,8 +104,12 @@ async def provider_models(provider, store):
     catalogue = json.loads(body)
     if not isinstance(catalogue, dict) or not isinstance(catalogue.get('data'), list):
         raise ValueError('Provider returned an invalid model catalogue; enter a model ID manually')
-    return [item['id'] for item in catalogue['data'][:1000]
+    return [item for item in catalogue['data'][:1000]
             if isinstance(item, dict) and isinstance(item.get('id'), str) and len(item['id']) <= 256]
+
+
+async def provider_models(provider, store):
+    return [item['id'] for item in await provider_catalogue(provider, store)]
 
 
 discover_models = provider_models
@@ -163,18 +166,38 @@ class Runtime:
                                         self.service.store.seal(saved) if saved else None, run['id']))
         self.model_cache = {}
 
-    async def models(self, identity, provider_id):
+    async def _catalogue(self, identity, provider_id):
         allowed = await self.service.providers(identity)
         if not any(p['id'] == provider_id for p in allowed):
             raise PermissionError('Provider is unavailable')
         provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (provider_id,))
-        key = (provider_id, provider['base_url'], provider['api_key'])
+        if not provider:
+            raise PermissionError('Provider is unavailable')
+        key = (provider_id, provider['base_url'], provider['api_key'], provider['protocol'])
         cached = self.model_cache.get(key)
         if cached and time.monotonic() - cached[0] < 60:
-            return cached[1]
-        models = await provider_models(provider, self.service.store)
+            return provider, cached[1]
+        models = await provider_catalogue(provider, self.service.store)
         self.model_cache = {key: (time.monotonic(), models)}
-        return models
+        return provider, models
+
+    async def models(self, identity, provider_id):
+        _, models = await self._catalogue(identity, provider_id)
+        return [model['id'] for model in models]
+
+    async def thinking_capabilities(self, identity, provider_id, model_id):
+        try:
+            provider, models = await self._catalogue(identity, provider_id)
+        except (httpx.HTTPError, ValueError):
+            allowed = await self.service.providers(identity)
+            if not any(p['id'] == provider_id for p in allowed):
+                raise PermissionError('Provider is unavailable') from None
+            provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (provider_id,))
+            result = thinking.capabilities(provider, model_id)
+            result['source'] = 'Model API unavailable. ' + result['source']
+            return result
+        metadata = next((model for model in models if model['id'] == model_id), None)
+        return thinking.capabilities(provider, model_id, metadata)
 
     async def conversations(self, identity, agent_id):
         await self.service.authorize(identity, agent_id)
@@ -371,6 +394,13 @@ class Runtime:
             raise ValueError('Select a model provider in this agent’s settings first')
         context = await self.service.context(record)
         instructions = self.service.redact(record['instructions'])
+        model_id = record['model'] or provider['default_model']
+        level = record.get('thinking', 'default')
+        if level != 'default':
+            capabilities = await self.thinking_capabilities(identity, record['provider_id'], model_id)
+            if level not in capabilities['options']:
+                raise ValueError('Selected thinking level is unavailable for this model; refresh its thinking settings')
+        model_settings = {'max_tokens': 8192, 'timeout': 60, **thinking.model_settings(provider, model_id, level)}
         def check_window(messages):
             if 'window_deadline' in budget and time.monotonic() >= budget['window_deadline']:
                 raise ExecutionCheckpoint('time')
@@ -436,7 +466,7 @@ class Runtime:
                         'deployment_id': getattr(exc, 'operation_id', None)}
 
         agent = Agent(
-            build_model(provider, record['model'] or provider['default_model'], self.service.store),
+            build_model(provider, model_id, self.service.store),
             instructions=(instructions + '\nReuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
                           'List-valued CloudMonkey parameters must be comma-separated strings, never JSON arrays. '
                           'Prefer exact available_api_names instead of repeated searches for known commands. '
@@ -454,7 +484,7 @@ class Runtime:
                           'Administrative environment (informational; tools enforce access):\n'
                           + json.dumps(self.service.redact(context), ensure_ascii=False)
                           + '\nExecution recovery: ' + json.dumps(budget.get('state', {}).get('recovery'))),
-            retries=1, model_settings={'max_tokens': 8192, 'timeout': 60}, capabilities=[ProcessHistory(check_window)],
+            retries=1, model_settings=model_settings, capabilities=[ProcessHistory(check_window)],
             toolsets=[RemoteTools(self.service, identity, agent_id, binding, invoke)
                       for binding in await MCP(self.service).bindings(identity, agent_id)],
         )

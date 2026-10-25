@@ -22,7 +22,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 12
+    assert reopened.one('PRAGMA user_version')['user_version'] == 13
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -31,6 +31,7 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('DROP TABLE mcp_assignments')
     store.execute('DROP TABLE mcp_servers')
     store.execute('DROP TABLE legacy_agent_credentials')
+    store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('ALTER TABLE agents RENAME COLUMN credentials TO runtime')
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB NOT NULL')
     store.execute("ALTER TABLE agents ADD COLUMN runtime_policy TEXT NOT NULL DEFAULT '[]'")
@@ -68,6 +69,7 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     store.execute('ALTER TABLE agents RENAME COLUMN credentials TO runtime')
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB')
     store.execute('UPDATE agents SET provisioning=?', (old_provisioning,))
+    store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('PRAGMA user_version=11')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
@@ -79,6 +81,23 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     assert reopened.one('SELECT token FROM mcp_servers')['token'] == mcp_token
     assert reopened.one('SELECT * FROM mcp_assignments') == {
         'agent_id': 'agent', 'server_id': 'search', 'tools': '["web_search"]'}
+
+
+def test_thinking_migration_preserves_credentials_and_conversations_with_model_default(store):
+    credentials = store.seal({'id': 'account-key', 'apikey': 'unchanged-key'})
+    messages = store.seal([{'private': 'unchanged conversation'}])
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                  ('agent', 'Agent', 'domain', 'account', 'user', credentials))
+    store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                  ('conversation', 'agent', 'human', 'Existing conversation', 1, messages))
+    store.execute('ALTER TABLE agents DROP COLUMN thinking')
+    store.execute('PRAGMA user_version=12')
+    reopened = Store(str(store.path), str(store.path.parent / 'master'))
+    agent = reopened.one('SELECT * FROM agents')
+    assert agent['thinking'] == 'default' and agent['credentials'] == credentials
+    assert reopened.one('SELECT messages FROM conversations')['messages'] == messages
+    reopened.execute("UPDATE agents SET thinking='high' WHERE id='agent'")
+    assert Store(str(store.path), str(store.path.parent / 'master')).one('SELECT thinking FROM agents')['thinking'] == 'high'
 
 
 async def test_revoked_cloudstack_account_invalidates_session(store):

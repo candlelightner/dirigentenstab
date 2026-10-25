@@ -463,18 +463,22 @@ class Service:
         self.store.audit(identity['userid'], 'configure-provider', provider_id)
         return provider_id
 
-    async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None):
+    async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None,
+                           *, thinking=None):
         await self.authorize(identity, agent_id)
         if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
             raise ValueError('Provider missing')
         if len(model) > 300 or len(instructions) > 32000:
             raise ValueError('Agent configuration too large')
+        if thinking is not None and (not isinstance(thinking, str)
+                                     or not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', thinking)):
+            raise ValueError('Invalid thinking level')
         if can_provision is not None:
             if identity['type'] != 1:
                 raise PermissionError('Only a platform administrator can change provisioning permission')
             self.store.execute('UPDATE agents SET can_provision=? WHERE id=?', (bool(can_provision), agent_id))
-        self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=? WHERE id=?',
-                           (provider_id or None, model, instructions, agent_id))
+        self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking) WHERE id=?',
+                           (provider_id or None, model, instructions, thinking, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, call, user_id, name):
