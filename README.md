@@ -25,6 +25,16 @@ For an existing CloudStack installation, use `sudo ./setup.sh --install --existi
 
 Configure a provider in the web UI, run **Test tool calling**, and assign its model to an agent. OpenAI-compatible Chat Completions and Responses are supported. Local inference is a separate service; see the [tested llama.cpp example](docs/LOCAL_INFERENCE.md). No commercial API is required.
 
+## Agent prompts and external tools
+
+Select an agent and open **Configure** to edit its **System prompt**. The saved prompt applies to that agent's subsequent model calls, including delegated work; it does not change CloudStack permissions.
+
+Open **Configure → MCP tools** to assign exact tool names from an optional remote HTTPS / Streamable HTTP MCP server, such as a web-search service. Human administrators authorized for the main agent's CloudStack domain can register endpoints and encrypted bearer credentials. A blank credential field retains the stored value; use the clear option to remove it. Child administrators can narrow assignments within their own scope. A tool must be explicitly assigned to the agent and every ancestor agent; new agents start without MCP tools. Disabling a server or removing an ancestor's assignment prevents subsequent calls. Local stdio servers and process execution are unavailable.
+
+For **Tavily**, select the main agent, then **Configure → MCP tools → New server**. Enter name `Tavily`, endpoint `https://mcp.tavily.com/mcp/`, and your `tvly-...` key in **API key / bearer token**. Keep the key out of the URL; the backend sends it using [Tavily’s supported bearer authentication](https://github.com/tavily-ai/tavily-mcp#remote-mcp-server). Explicitly assign `tavily_search` to the main agent and every ancestor/target agent that should use it. Optionally assign `tavily_extract`, `tavily_crawl`, `tavily_map`, or `tavily_research`; see the [current tool names](https://docs.tavily.com/documentation/mcp). Registering a server grants no agent access until tools are assigned. Tavily uses the same generic MCP integration.
+
+External tool results are untrusted data. Generic MCP calls use the existing durable execution tracking; an uncertain outcome requires administrator review before another mutation. Only assign tools and send queries to services you intend to trust with that data. See [security](docs/SECURITY.md) for the boundaries.
+
 ## Security boundaries
 
 - Human passwords remain with CloudStack. Application sessions are server-side, expiring and revocable; cookies use HttpOnly, Secure and SameSite Strict.

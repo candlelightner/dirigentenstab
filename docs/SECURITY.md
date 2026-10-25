@@ -4,7 +4,7 @@ Dirigentenstab is an administrative application. An authorized agent can change 
 
 ## Credentials and sessions
 
-All CloudStack keys, provider keys, guest private keys, CloudStack browser sessions, and conversation messages use Fernet authenticated encryption. The master key is a separate file mounted as a Docker secret. SQLite UUIDs, display names, provider URLs, conversation titles and audit metadata remain plaintext. Back up the master key independently; losing it makes encrypted records unrecoverable.
+All CloudStack keys, provider keys, MCP bearer credentials, guest private keys, CloudStack browser sessions, and conversation messages use Fernet authenticated encryption. The master key is a separate file mounted as a Docker secret. SQLite UUIDs, display names, provider and MCP URLs, tool assignments, conversation titles and audit metadata remain plaintext. Back up the master key independently; losing it makes encrypted records unrecoverable.
 
 The application never stores a human CloudStack password. Login attempts are bounded by persistent per-client and per-username limits. Session cookies are opaque, HttpOnly, Secure and SameSite Strict; only hashes are indexed in SQLite. Logout revokes the local session even if CloudStack is temporarily unavailable. CloudStack user/account status is checked again on protected operations. There is no public registration.
 
@@ -29,6 +29,16 @@ The configured provider receives the prompt, compact domain context and requeste
 Managed template cloud-init includes a generated *guest host* private key, allowing a public key to be pinned before SSH. This key is unique to the guest and has no host privileges. User-data is encrypted locally and redacted from generic API responses. Models never receive guest client private keys, CloudStack keys or provider keys. Existing VMs without enrolled SSH credentials or host-key pins fail with a missing-access error.
 
 Guest users have no password, no root SSH and no default sudo. File transfers expose only that agent's application workspace; local path arguments are basenames, with an 8 MiB file limit. The application has no Docker socket, hypervisor socket, SSH agent or arbitrary host directory mount.
+
+## External MCP tools
+
+MCP is optional and uses Pydantic AI's existing remote Streamable HTTP support. Only HTTPS endpoints without embedded credentials, query strings or fragments are accepted; local stdio/process transports are unavailable. Endpoint and bearer-credential administration requires a human CloudStack administrator authorized for the main agent's domain. Child administrators cannot replace an inherited endpoint or secret; they may assign only tools allowed by every ancestor agent. This application tool assignment does not grant CloudStack infrastructure permissions.
+
+Assignments default to empty, including newly created agents. The backend verifies live CloudStack ancestry and intersects explicit tool names across the full agent chain. Authorization, current endpoint configuration and effective assignments are checked again before dispatch, so an ancestor revocation or server disable applies to subsequent calls. Missing ancestry fails closed. Agent tools cannot register servers, change assignments or retrieve credentials. Credentials stay encrypted at rest and are decrypted only for backend HTTP authentication; echoed credentials are redacted from results and saved histories.
+
+MCP server instructions, model sampling and elicitation are disabled. Tool descriptions and results remain untrusted external data, never an authorization source. A custom per-agent system prompt cannot override backend permission checks. Configured servers receive tool arguments, which may contain private data: review the selected service and its tools before granting access.
+
+Generic external tools may have side effects even when their metadata claims otherwise. Every MCP call therefore uses durable mutation tracking and its tool-call identity. Completed results are reused; ambiguous failures are not automatically replayed and require administrator review. Disabling an endpoint prevents new calls but cannot undo a request already accepted remotely.
 
 ## Operations
 

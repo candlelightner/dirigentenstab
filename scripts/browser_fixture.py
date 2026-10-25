@@ -22,6 +22,7 @@ from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from dirigentenstab import runtime as runtime_module
 from dirigentenstab.auth import Auth, attach
 from dirigentenstab.cloud import Cloud
+from dirigentenstab.limits import APP_ROOT_AGENT
 from dirigentenstab.service import Service
 from dirigentenstab.settings import Settings
 from dirigentenstab.store import Store
@@ -37,13 +38,13 @@ PRIVATE_VALUES = ('fixture-runtime-api-DO-NOT-EXPOSE', 'fixture-runtime-secret-D
 DOMAINS = [{'id': ROOT_DOMAIN, 'name': 'ROOT', 'path': 'ROOT', 'level': 0},
            {'id': 'main-domain', 'name': 'Agents--ds-00000000000000000000', 'path': 'ROOT/Agents',
             'parentdomainid': ROOT_DOMAIN, 'level': 1},
-           {'id': AGENT_DOMAIN, 'name': 'Research', 'path': 'ROOT/Agents/Research', 'parentdomainid': 'main-domain'}]
+           {'id': AGENT_DOMAIN, 'name': 'Research', 'path': 'ROOT/Agents/Research', 'parentdomainid': 'main-domain', 'level': 2}]
 for branch in range(12):
     parent = AGENT_DOMAIN
     for depth in range(4):
         identifier = f'domain-{branch}-{depth}'
         DOMAINS.append({'id': identifier, 'name': f'Team {branch} Level {depth}', 'parentdomainid': parent,
-                        'path': f'ROOT/Agents/Research/Team-{branch}/Level-{depth}'})
+                        'path': f'ROOT/Agents/Research/Team-{branch}/Level-{depth}', 'level': depth + 3})
         parent = identifier
 
 
@@ -216,14 +217,14 @@ def main():
         store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
                       (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
                        store.seal(''), ''))
-    for identifier, domain, name in [('main', 'main-domain', 'Agents'), *[
+    for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'), *[
             (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
         store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,model) '
                       'VALUES(?,?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
                        store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
                        store.seal({'apikey': PRIVATE_VALUES[2], 'secretkey': PRIVATE_VALUES[3]}), 'fixture', 'fixture-model'))
     store.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
-                  ('main', 'Agents', 'fixture-model', '', 'complete', 0))
+                  (APP_ROOT_AGENT, 'Agents', 'fixture-model', '', 'complete', 0))
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')

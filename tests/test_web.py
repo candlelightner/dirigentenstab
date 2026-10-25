@@ -46,7 +46,8 @@ def test_history_excludes_system_instructions_and_keeps_tool_activity():
 @pytest.mark.asyncio
 async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
     agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
-             'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': False}
+             'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': False,
+             'instructions': 'Original prompt'}
 
     class Auth:
         calls = 0
@@ -61,6 +62,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
 
     class Service:
         rotations = []
+        updates = []
 
         async def hierarchy(self, identity):
             return {'domains': [{'id': 'domain', 'name': 'Research', 'path': '/ROOT/Research'}],
@@ -75,6 +77,10 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
 
         async def rotate_credentials(self, identity, agent_id):
             self.rotations.append((identity['userid'], agent_id))
+
+        async def update_agent(self, identity, agent_id, provider_id, model, instructions):
+            self.updates.append((identity['userid'], agent_id, instructions))
+            agent['instructions'] = instructions
 
     class Runtime:
         sent = []
@@ -111,6 +117,14 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         assert runtime.sent == [('human', 'agent', 'Hello research')]
         user.find('Configure').click()
         await user.should_see('Rotate credentials')
+        user.find('System prompt').clear().type('Explain research in German.')
+        before_save = auth.calls
+        user.find('Save').click()
+        await asyncio.sleep(0.1)
+        assert service.updates == [('human', 'agent', 'Explain research in German.')]
+        assert auth.calls > before_save
+        user.find('Configure').click()
+        await user.should_see('Explain research in German.')
         user.find('Rotate credentials').click()
         await asyncio.sleep(0.1)
         assert service.rotations == [('human', 'agent')]
@@ -137,3 +151,101 @@ def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
     assert nodes[0]['children'][0]['label'] == 'Research'
     assert nodes[0]['children'][0]['children'][0]['label'] == 'Meaningful--ds-1234'
     assert 'alice' not in str(nodes) and 'Agents--ds-' not in str(nodes)
+
+
+@pytest.mark.parametrize('manage', [True, False])
+async def test_mcp_ui_separates_server_administration_and_agent_assignments(monkeypatch, manage):
+    from dirigentenstab import mcp
+
+    agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
+             'account_id': 'cloud-account', 'model': 'local-model'}
+    identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+
+    class Auth:
+        calls = 0
+        enabled = True
+
+        async def identity(self, token):
+            assert token == 'session'
+            self.calls += 1
+            if not self.enabled:
+                raise PermissionError('Session expired')
+            return identity
+
+    class Service:
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent], 'users': []}
+
+        async def authorize(self, current, agent_id):
+            assert current == identity and agent_id == 'agent'
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        async def conversations(self, current, agent_id):
+            return []
+
+    class Integration:
+        saved = []
+        assigned = []
+
+        def __init__(self, service):
+            pass
+
+        async def configuration(self, current, agent_id):
+            assert current == identity and agent_id == 'agent'
+            return {'can_manage_servers': manage, 'servers': [
+                {'id': 'search', 'name': 'Search service', 'url': 'https://search.example/mcp',
+                 'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['web_search']}]}
+
+        async def save_server(self, current, name, url, token=None, server_id=None, enabled=True):
+            assert current == identity and manage
+            self.saved.append((name, url, token, server_id, enabled))
+            return 'search'
+
+        async def assign(self, current, agent_id, server_id, tools):
+            assert current == identity
+            self.assigned.append((agent_id, server_id, tools))
+
+    monkeypatch.setattr(mcp, 'MCP', Integration)
+    auth = Auth()
+    async with user_simulation() as user:
+        build_ui(Service(), auth, Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Configure')
+        user.find('Configure').click()
+        await user.should_see('System prompt')
+        user.find('MCP tools').click()
+        await user.should_see('Assigned tool names')
+        if manage:
+            await user.should_see('API key / bearer token (blank keeps existing)')
+            before_save = auth.calls
+            user.find('Save server settings').click()
+            await user.should_see('Server saved.')
+            assert Integration.saved == [('Search service', 'https://search.example/mcp', None, 'search', True)]
+            assert auth.calls > before_save
+            user.find('Clear saved bearer token').click()
+            user.find('Save server settings').click()
+            await asyncio.sleep(0.1)
+            assert Integration.saved[-1][2] == ''
+        else:
+            await user.should_not_see('API key / bearer token (blank keeps existing)')
+            await user.should_not_see('Save server settings')
+            await user.should_see('Ancestor allows: web_search')
+        user.find('Assigned tool names').clear().type('web_search')
+        before_save = auth.calls
+        user.find('Save assigned tools').click()
+        await user.should_see('Assigned tools saved for this agent.')
+        assert Integration.assigned == [('agent', 'search', ['web_search'])]
+        assert auth.calls > before_save
+        redirects = []
+        monkeypatch.setattr(user.navigate, 'to', redirects.append)
+        auth.enabled = False
+        user.find('Save assigned tools').click()
+        await asyncio.sleep(0.1)
+        assert redirects == ['/login']
+        assert Integration.assigned == [('agent', 'search', ['web_search'])]
