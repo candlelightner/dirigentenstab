@@ -23,6 +23,7 @@ from dirigentenstab import runtime as runtime_module
 from dirigentenstab.auth import Auth, attach
 from dirigentenstab.cloud import Cloud
 from dirigentenstab.limits import APP_ROOT_AGENT
+from dirigentenstab.mcp import MCP
 from dirigentenstab.service import Service
 from dirigentenstab.settings import Settings
 from dirigentenstab.store import Store
@@ -229,6 +230,19 @@ def main():
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
     service = FixtureService(store, settings)
+    async def discover_mcp(self, identity, agent_id, server_id):
+        configuration = await self.configuration(identity, agent_id)
+        server = next((row for row in configuration['servers'] if row['id'] == server_id and row['enabled']), None)
+        if not server:
+            raise PermissionError('MCP server is unavailable')
+        if (args.state_dir / 'mcp-unavailable').exists():
+            raise RuntimeError('MCP server discovery failed in browser fixture')
+        tools = [{'name': 'tavily_search', 'description': 'Search the web for relevant sources.'},
+                 {'name': 'tavily_extract', 'description': 'Extract content from selected URLs.'}]
+        allowed = server['allowed_tools']
+        return [tool for tool in tools if allowed is None or tool['name'] in allowed]
+
+    MCP.discover = discover_mcp
     auth = Auth(service)
     runtime_module.REQUESTS_PER_WINDOW = 2
     runtime_module.TOOLS_PER_WINDOW = 2

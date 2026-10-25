@@ -548,9 +548,32 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     enabled = ui.checkbox('Server enabled', value=True)
                 else:
                     ui.label('Server endpoints are managed by administrators of the main agent domain.').classes('text-sm')
-                assigned = ui.textarea('Assigned tool names (one per line or comma-separated)').classes('w-full')
+                ui.label('Available tools').classes('font-semibold')
+                tool_list = ui.column().classes('w-full shrink-0 max-h-64 overflow-y-auto gap-2')
                 inherited = ui.label('').classes('text-sm whitespace-pre-wrap')
+                discovery_status = ui.label('').props('role=status').classes('text-sm')
                 feedback = ui.label('').props('role=status').classes('text-sm')
+                choices = {key: set(row['tools']) for key, row in servers.items()}
+                catalogues, checkboxes = {}, {}
+                displayed, ready, generation = None, None, 0
+
+                def remember():
+                    if displayed:
+                        choices[displayed] = {name for name, checkbox in checkboxes.items() if checkbox.value}
+
+                def render(server_id):
+                    nonlocal displayed
+                    displayed = server_id
+                    checkboxes.clear()
+                    tool_list.clear()
+                    catalogue = catalogues.get(server_id, {})
+                    checked = choices.get(server_id, set())
+                    with tool_list:
+                        for tool_name in sorted(catalogue.keys() | checked):
+                            with ui.column().classes('w-full shrink-0 gap-0 min-w-0'):
+                                checkboxes[tool_name] = ui.checkbox(tool_name, value=tool_name in checked)
+                                ui.label(catalogue.get(tool_name, '(unavailable)')).classes(
+                                    'text-sm whitespace-pre-wrap break-words')
 
                 def load():
                     row = servers.get(selected.value, {})
@@ -560,43 +583,103 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         token.set_value('')
                         clear_token.set_value(False)
                         enabled.set_value(bool(row.get('enabled', True)))
-                    assigned.set_value('\n'.join(row.get('tools', [])))
                     allowed = row.get('allowed_tools')
                     inherited.set_text('Ancestor allows: ' + (', '.join(allowed) or 'no tools')
-                                       if allowed is not None else 'Enter exact tool names from the server; wildcards are not allowed.')
+                                       if allowed is not None else 'Select only the external tools this agent needs.')
+
+                async def discover():
+                    nonlocal generation, ready
+                    remember()
+                    generation += 1
+                    request_generation, server_id = generation, selected.value
+                    ready = None
+                    assignment_button.disable()
+                    render(server_id)
+                    if not server_id:
+                        refresh_tools.disable()
+                        discovery_status.set_text('Save server settings to discover tools.')
+                        return
+                    refresh_tools.disable()
+                    discovery_status.set_text('Loading available tools…')
+                    try:
+                        tools = await integration.discover(await actor(), agent_id, server_id)
+                    except Exception as exc:
+                        if generation == request_generation and selected.value == server_id:
+                            error = diagnose(exc, agent_id=agent_id, tool='discover_mcp_tools')
+                            discovery_status.set_text(str(error) + ' Refresh tools to retry. Your selections are preserved.')
+                    else:
+                        if generation == request_generation and selected.value == server_id:
+                            remember()
+                            catalogues[server_id] = {tool['name']: tool['description'] for tool in tools}
+                            render(server_id)
+                            ready = server_id
+                            assignment_button.enable()
+                            discovery_status.set_text(f'{len(tools)} tools available. Select tools to allow for this agent.')
+                    finally:
+                        if generation == request_generation and selected.value == server_id:
+                            refresh_tools.enable()
 
                 async def selection_changed():
                     await actor()
+                    remember()
                     load()
+                    await discover()
 
                 async def save_server():
-                    server_id = await integration.save_server(
-                        await actor(), name.value.strip(), url.value.strip(),
-                        '' if clear_token.value else token.value or None,
-                        server_id=selected.value or None, enabled=enabled.value)
-                    token.set_value('')
-                    updated = await integration.configuration(await actor(), agent_id)
+                    nonlocal generation, ready
+                    previous = selected.value
+                    values = ((name.value or '').strip(), (url.value or '').strip(),
+                              '' if clear_token.value else token.value or None, bool(enabled.value))
+                    remember()
+                    generation += 1
+                    save_generation = generation
+                    ready = None
+                    assignment_button.disable()
+                    try:
+                        server_id = await integration.save_server(
+                            await actor(), *values[:3], server_id=previous or None, enabled=values[3])
+                        token.set_value('')
+                        updated = await integration.configuration(await actor(), agent_id)
+                    except Exception:
+                        if generation == save_generation and selected.value == previous:
+                            refresh_tools.set_enabled(bool(previous))
+                            discovery_status.set_text('Server settings were not confirmed. Refresh tools to retry. '
+                                                      'Your selections are preserved.')
+                        raise
+                    remember()
                     servers.clear()
                     servers.update({server['id']: server for server in updated['servers']})
+                    for key, row in servers.items():
+                        choices.setdefault(key, set(row['tools']))
+                    if generation != save_generation or selected.value != previous:
+                        return
                     selected.set_options({'': 'New server', **{key: row['name'] for key, row in servers.items()}}, value=server_id)
                     load()
-                    feedback.set_text('Server saved. Assign exact tool names to enable access for this agent.')
+                    feedback.set_text('Server saved. Select tools to enable access for this agent.')
+                    if server_id == previous:
+                        await discover()
 
                 async def save_assignment():
-                    names = (assigned.value or '').replace(',', '\n').splitlines()
-                    await integration.assign(await actor(), agent_id, selected.value,
-                                             [name.strip() for name in names if name.strip()])
-                    servers[selected.value]['tools'] = [name.strip() for name in names if name.strip()]
-                    feedback.set_text('Assigned tools saved for this agent.')
+                    server_id = selected.value
+                    if not server_id or ready != server_id:
+                        raise ValueError('Refresh available tools before saving assignments')
+                    remember()
+                    names = sorted(choices[server_id])
+                    await integration.assign(await actor(), agent_id, server_id, names)
+                    servers[server_id]['tools'] = names
+                    if selected.value == server_id:
+                        feedback.set_text('Assigned tools saved for this agent.')
 
                 selected.on_value_change(lambda: protect(selection_changed))
                 if manage:
                     ui.button('Save server settings', on_click=lambda: protect(save_server)).props('outline')
-                ui.button('Save assigned tools', on_click=lambda: protect(save_assignment)).bind_enabled_from(
-                    selected, 'value', backward=bool)
+                refresh_tools = ui.button('Refresh tools', icon='refresh', on_click=lambda: protect(discover)).props('outline')
+                assignment_button = ui.button('Save assigned tools', on_click=lambda: protect(save_assignment))
+                assignment_button.disable()
                 ui.button('Close MCP tools', on_click=dialog.close).props('flat')
                 load()
             dialog.open()
+            await discover()
 
         async def configure_agent():
             current = await actor()

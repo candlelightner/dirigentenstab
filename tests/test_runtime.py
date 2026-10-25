@@ -44,7 +44,7 @@ async def mcp_remote(service, monkeypatch):
                  'inputSchema': {'type': 'object', 'properties': {'query': {'type': 'string'},
                                                                'page_token': {'type': 'string'}},
                                  'required': ['query']}, 'annotations': {'readOnlyHint': True}}
-                for name in ('tavily_search', 'unassigned')]}
+                for name in ('tavily_search', 'unassigned', 'tvly-SUPERSECRET')]}
         else:
             assert body['method'] == 'tools/call'
             state.calls.append(body['params'])
@@ -723,6 +723,7 @@ async def test_mcp_sdk_filters_tools_and_keeps_results_untrusted_redacted_and_du
     from dirigentenstab.cloud import redact
 
     service.redact = lambda value: redact(value, ['SUPERSECRET'])
+    mcp_remote.binding['tools'].append('tvly-SUPERSECRET')
     custom = 'Explain research in German for this agent.'
     service.store.execute('UPDATE agents SET instructions=? WHERE id=?', (custom, 'parent'))
 

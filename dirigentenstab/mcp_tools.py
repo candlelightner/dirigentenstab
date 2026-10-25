@@ -48,7 +48,7 @@ class RemoteTools(WrapperToolset):
                     parameters_json_schema=json.loads(self.service.redact(json.dumps(tool.tool_def.parameters_json_schema))),
                     metadata=None, return_schema=None,
                 )) for name, tool in tools.items()
-                if name.removeprefix(prefix) in allowed}
+                if name.removeprefix(prefix) in allowed and self.service.redact(name) == name}
 
     async def dispatch(self, ctx, direct_call, name, arguments):
         await self.policy.check(self.identity, self.agent_id, self.binding['id'], name, self.binding['version'])

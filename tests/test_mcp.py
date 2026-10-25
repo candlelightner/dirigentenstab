@@ -225,3 +225,149 @@ async def test_tavily_api_key_uses_existing_encrypted_bearer_configuration(envir
     assert api_key not in e.service.redact('Authorization: Bearer ' + api_key)
     with pytest.raises(PermissionError):
         await e.mcp.check(e.child, 'middle-agent', server, 'tavily_extract', binding['version'])
+
+
+@pytest.fixture
+def remote_catalogue(monkeypatch):
+    from dirigentenstab import mcp as mcp_module
+
+    state = SimpleNamespace(connections=[], on_list=None, tools=[
+        SimpleNamespace(name='tavily_search', description='Search the web'),
+        SimpleNamespace(name='tavily_extract', description='Read a web page')])
+
+    class Remote:
+        def __init__(self, url, **kwargs):
+            state.connections.append({'url': url, **kwargs})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def list_tools(self):
+            if state.on_list:
+                await state.on_list()
+            return state.tools
+
+        async def direct_call_tool(self, *args):
+            pytest.fail('Discovery must never invoke an MCP tool')
+
+    monkeypatch.setattr(mcp_module, 'MCPServerStreamableHTTP', Remote)
+    return state
+
+
+async def test_discovery_bootstraps_main_agent_without_assigning_tools(environment, remote_catalogue):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/', 'tvly-synthetic-secret')
+    tools = await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
+    assert [t['name'] for t in tools] == ['tavily_extract', 'tavily_search']
+    assert e.store.all('SELECT * FROM mcp_assignments') == []
+    assert remote_catalogue.connections == [{
+        'url': 'https://mcp.tavily.com/mcp/', 'headers': {'Authorization': 'Bearer tvly-synthetic-secret'},
+        'allow_sampling': False, 'include_instructions': False, 'max_retries': 0, 'timeout': 10, 'read_timeout': 60}]
+    assert 'tvly-synthetic-secret' not in json.dumps(tools)
+
+
+async def test_discovery_filters_to_parent_ceiling_without_requiring_own_assignment(environment, remote_catalogue):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/')
+    assert await e.mcp.discover(e.child, 'middle-agent', server) == []
+    assert remote_catalogue.connections == []
+    await e.mcp.assign(e.root, APP_ROOT_AGENT, server, ['tavily_search'])
+    assert await e.mcp.discover(e.child, 'middle-agent', server) == [
+        {'name': 'tavily_search', 'description': 'Search the web'}]
+    assert remote_catalogue.connections[0]['headers'] == {}
+    assert e.store.one('SELECT * FROM mcp_assignments WHERE agent_id=?', ('middle-agent',)) is None
+
+
+async def test_discovery_enforces_human_scope_and_enabled_server(environment, remote_catalogue):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/')
+    with pytest.raises(PermissionError):
+        await e.mcp.discover(e.child, APP_ROOT_AGENT, server)
+    with pytest.raises(ValueError, match='unavailable'):
+        await e.mcp.discover(e.root, APP_ROOT_AGENT, 'missing-server')
+    await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/', server_id=server, enabled=False)
+    with pytest.raises(ValueError, match='unavailable'):
+        await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
+    assert remote_catalogue.connections == []
+
+
+async def test_discovery_rechecks_parent_revocation_after_network(environment, remote_catalogue):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/')
+    await e.mcp.assign(e.root, APP_ROOT_AGENT, server, ['tavily_search'])
+    await e.mcp.assign(e.child, 'middle-agent', server, ['tavily_search'])
+
+    async def revoke():
+        await e.mcp.assign(e.root, APP_ROOT_AGENT, server, [])
+
+    remote_catalogue.on_list = revoke
+    assert await e.mcp.discover(e.child, 'leaf-agent', server) == []
+
+
+@pytest.mark.parametrize('change', ['disable', 'version', 'identity', 'ancestry'])
+async def test_discovery_revalidates_after_network(environment, remote_catalogue, change):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/')
+    await e.mcp.assign(e.root, APP_ROOT_AGENT, server, ['tavily_search'])
+
+    async def alter():
+        if change == 'disable':
+            await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/', server_id=server, enabled=False)
+        elif change == 'version':
+            await e.mcp.save_server(e.root, 'Tavily', 'https://other.example/mcp', server_id=server)
+        elif change == 'identity':
+            e.child['domains'].remove('middle')
+        else:
+            del e.domains['main']
+
+    remote_catalogue.on_list = alter
+    with pytest.raises(PermissionError):
+        await e.mcp.discover(e.child, 'middle-agent', server)
+
+
+async def test_discovery_redacts_descriptions_and_filters_nonportable_names(environment, remote_catalogue):
+    e = environment
+    secret = 'tvly-synthetic-secret'
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/', secret)
+    remote_catalogue.tools = [SimpleNamespace(name='tavily_search', description=secret + 'x' * 2000),
+                              SimpleNamespace(name=secret, description='Do not expose credentials as names'),
+                              SimpleNamespace(name='bad.tool.name', description='No mapping'),
+                              SimpleNamespace(name='*', description='No wildcard'),
+                              SimpleNamespace(name='z' * 49, description='Too long'),
+                              SimpleNamespace(name='tavily_extract', description=None)]
+    tools = await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
+    assert [t['name'] for t in tools] == ['tavily_extract', 'tavily_search']
+    assert tools[0]['description'] == ''
+    assert len(tools[1]['description']) == 1000
+    assert secret not in str(tools)
+
+
+@pytest.mark.parametrize('failure', ['authentication', 'timeout'])
+async def test_discovery_failures_hide_endpoint_credentials_and_remote_payload(environment, remote_catalogue, failure):
+    e = environment
+    secret = 'tvly-synthetic-secret'
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/', secret)
+
+    async def fail():
+        if failure == 'authentication':
+            raise RuntimeError('Remote rejected credential ' + secret)
+        if failure == 'timeout':
+            raise TimeoutError('Remote echoed ' + secret)
+
+    remote_catalogue.on_list = fail
+    with pytest.raises(RuntimeError, match='MCP tool discovery failed; check the endpoint and credentials') as error:
+        await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
+    assert secret not in str(error.value)
+    assert e.store.all('SELECT * FROM mcp_assignments') == []
+
+
+async def test_discovery_rejects_oversized_catalogue_without_silent_truncation(environment, remote_catalogue):
+    e = environment
+    server = await e.mcp.save_server(e.root, 'Tavily', 'https://mcp.tavily.com/mcp/')
+    remote_catalogue.tools = [SimpleNamespace(name='tavily_search', description='Search')] * 1001
+    with pytest.raises(ValueError, match='MCP tool catalogue exceeds the size limit'):
+        await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
+    assert e.store.all('SELECT * FROM mcp_assignments') == []

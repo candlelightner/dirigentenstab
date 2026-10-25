@@ -1,9 +1,12 @@
 """Human-managed remote tools; CloudStack remains the administrative scope boundary."""
 
+import asyncio
 import json
 import re
 import uuid
 from urllib.parse import urlsplit
+
+from pydantic_ai.mcp import MCPServerStreamableHTTP
 
 from .limits import APP_ROOT_AGENT
 from .settings import endpoint
@@ -103,6 +106,40 @@ class MCP:
                            (server_id, name.strip(), url, encrypted, enabled))
         self.store.audit(identity['userid'], 'configure-mcp-server', server_id)
         return server_id
+
+    async def discover(self, identity, agent_id, server_id):
+        agent = await self.service.authorize(identity, agent_id)
+        server = self.store.one('SELECT * FROM mcp_servers WHERE id=? AND enabled=1', (server_id,))
+        if not server:
+            raise ValueError('MCP server is unavailable')
+        chain = await self._chain(agent)
+        ceiling = self._effective(chain[:-1], server_id) if len(chain) > 1 else None
+        if ceiling == set():
+            return []
+        token = self.store.open(server['token'])
+        try:
+            async with asyncio.timeout(30), MCPServerStreamableHTTP(
+                server['url'], headers={'Authorization': 'Bearer ' + token} if token else {},
+                allow_sampling=False, include_instructions=False, max_retries=0,
+                timeout=10, read_timeout=60,
+            ) as remote:
+                catalogue = await remote.list_tools()
+        except Exception:
+            raise RuntimeError('MCP tool discovery failed; check the endpoint and credentials') from None
+        if len(catalogue) > 1000:
+            raise ValueError('MCP tool catalogue exceeds the size limit')
+        agent = await self.service.authorize(identity, agent_id)
+        current = self.store.one('SELECT version FROM mcp_servers WHERE id=? AND enabled=1', (server_id,))
+        if not current or current['version'] != server['version']:
+            raise PermissionError('MCP tool assignment or server configuration changed')
+        chain = await self._chain(agent)
+        ceiling = self._effective(chain[:-1], server_id) if len(chain) > 1 else None
+        tools = {tool.name: {'name': tool.name, 'description': self.service.redact(tool.description or '')[:1000]}
+                 for tool in catalogue if TOOL_NAME.fullmatch(tool.name)
+                 and self.service.redact(tool.name) == tool.name
+                 and (ceiling is None or tool.name in ceiling)}
+        self.store.audit(identity['userid'], 'discover-mcp-tools', agent_id + '/' + server_id)
+        return [tools[name] for name in sorted(tools)]
 
     async def assign(self, identity, agent_id, server_id, tools):
         agent = await self.service.authorize(identity, agent_id)

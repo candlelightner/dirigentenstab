@@ -1,5 +1,6 @@
 """Real Chromium + NiceGUI browser tests; infrastructure/model providers are CI fixtures."""
 
+import json
 import os
 import socket
 import ssl
@@ -379,19 +380,27 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         assert await bearer.get_attribute('type') == 'password'
         await bearer.fill(secret)
         await page.get_by_role('button', name='Save server settings', exact=True).click()
-        await page.get_by_text('Server saved.', exact=False).wait_for()
+        await page.get_by_text('2 tools available.', exact=False).wait_for()
         assert await bearer.input_value() == ''
-        assigned = page.get_by_label('Assigned tool names (one per line or comma-separated)', exact=True)
-        await assigned.fill('tavily_search')
+        search_tool = page.get_by_role('checkbox', name='tavily_search', exact=True)
+        extract_tool = page.get_by_role('checkbox', name='tavily_extract', exact=True)
+        await search_tool.wait_for()
+        assert await search_tool.get_attribute('aria-checked') == 'false'
+        assert await extract_tool.get_attribute('aria-checked') == 'false'
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        assert store.all('SELECT * FROM mcp_assignments') == []
+        await search_tool.click()
+        await page.get_by_role('checkbox', name='tavily_search', exact=True, checked=True).wait_for()
         await page.get_by_role('button', name='Save assigned tools', exact=True).click()
         await page.get_by_text('Assigned tools saved for this agent.', exact=True).wait_for()
-        store = Store(str(state / 'browser.db'), str(state / 'master'))
         server = store.one('SELECT * FROM mcp_servers')
         assert server['url'] == 'https://mcp.tavily.com/mcp'
         assert store.open(server['token']) == secret and secret.encode() not in server['token']
+        assert json.loads(store.one('SELECT tools FROM mcp_assignments WHERE agent_id=?', (APP_ROOT_AGENT,))['tools']) == ['tavily_search']
         assert store.one('SELECT instructions FROM agents WHERE id=?', (APP_ROOT_AGENT,))['instructions'] == prompt
         assert secret not in await page.content()
 
+        await page.set_viewport_size({'width': 390, 'height': 844})
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await selector.fill('Main Agent')
@@ -399,12 +408,19 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await page.get_by_role('button', name='Configure', exact=True).click()
         assert await page.get_by_label('System prompt', exact=True).input_value() == prompt
         await page.get_by_role('button', name='MCP tools', exact=True).click()
-        assert await assigned.input_value() == 'tavily_search'
+        await page.get_by_role('checkbox', name='tavily_search', exact=True, checked=True).wait_for()
+        assert await extract_tool.get_attribute('aria-checked') == 'false'
+        (state / 'mcp-unavailable').touch()
+        await page.get_by_role('button', name='Refresh tools', exact=True).click()
+        await page.get_by_text('Your selections are preserved.', exact=False).wait_for()
+        assert await search_tool.get_attribute('aria-checked') == 'true'
+        assert json.loads(store.one('SELECT tools FROM mcp_assignments WHERE agent_id=?', (APP_ROOT_AGENT,))['tools']) == ['tavily_search']
+        (state / 'mcp-unavailable').unlink()
         assert await bearer.input_value() == ''
         await page.get_by_role('checkbox', name='Clear saved bearer token', exact=True).click()
         await page.get_by_role('checkbox', name='Clear saved bearer token', exact=True, checked=True).wait_for()
         await page.get_by_role('button', name='Save server settings', exact=True).click()
-        await page.get_by_text('Server saved.', exact=False).wait_for()
+        await page.get_by_text('2 tools available.', exact=False).wait_for()
         assert store.open(store.one('SELECT token FROM mcp_servers')['token']) == ''
         await page.screenshot(path=str(state / 'mcp-settings.png'), full_page=True)
         assert not errors
