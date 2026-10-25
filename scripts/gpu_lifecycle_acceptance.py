@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit native web-UI allocation test; hardware pool preparation is a human operator step."""
+"""Explicit managed web-UI allocation test with policy-scoped GPU pool preparation."""
 import argparse
 import asyncio
 import json
@@ -137,7 +137,7 @@ async def acceptance(options):
                 await page.get_by_role('option', name=title, exact=True).click()
             else:
                 prompt = (state['prefix']+'. Allocation test only; no driver installation, GPU workload or template creation. '
-                    'Do not modify pre-existing VMs. Set execute_api managed=true for each deployment to enroll managed SSH. '
+                    'Do not modify pre-existing VMs. Set execute_api managed=true for every GPU deployment and lifecycle operation, including stop and offering changes. '
                     'Create exactly three new disposable VMs with displaynames beginning '
                     f"'{state['prefix']}-8Q-', zoneid={config['zone_id']}, templateid={config['template_id']}, "
                     f"serviceofferingid={config['offering8']}, startvm=true. Verify all THREE Running together with "
@@ -147,9 +147,9 @@ async def acceptance(options):
                     f"'{state['prefix']}-24Q', same zone/template, serviceofferingid={config['offering24']}, startvm=true. "
                     'Verify it Running using listVirtualMachines, then stop it and change it to the CPU offering. '
                     'Finish with those four VMs Stopped on CPU offerings. Reuse IDs and completed results, avoid '
-                    'discovery loops, never replace an uncertain dispatch. Host mdev pools are prepared separately by '
-                    'a human operator; never request privileged fallback for a native API denial. If the required '
-                    'profile capacity is unavailable, stop and report the operator preparation needed.')
+                    'discovery loops, never replace an uncertain dispatch. Managed GPU operations use the existing '
+                    'controller to prepare permitted unused owned pools. Never bypass policy or retry a native '
+                    'denial with a privileged identity. Stop and report capacity or policy failures.')
                 state['phase'] = 'submitted'
                 save(state)
                 await page.get_by_label('Message', exact=True).fill(prompt)

@@ -9,7 +9,9 @@ import pytest
 from cryptography.fernet import Fernet
 
 from dirigentenstab import cloud as cloud_module
+from dirigentenstab import service as service_module
 from dirigentenstab.cloud import Cloud, CloudError, redact, validate
+from dirigentenstab.gpu import GPU_COMMANDS, GPU_CONTEXT
 from dirigentenstab.service import Service
 from dirigentenstab.store import Store
 
@@ -599,6 +601,79 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     assert reopened.one('SELECT previous FROM credential_rotations')['previous'] == journal
     restarted = Service(reopened, SimpleNamespace())
     assert restarted.redact('legacy-secret pending-secret') == '[redacted] [redacted]'
+
+
+@pytest.mark.parametrize('command', sorted(GPU_COMMANDS))
+async def test_managed_gpu_lifecycle_uses_authenticated_controller_and_native_calls_stay_native(store, monkeypatch, command):
+    add_parent(store)
+    service = Service(store, SimpleNamespace(max_output=65536))
+    requests, native, local = [], [], []
+
+    class AgentCloud:
+        gpu = True
+        reads = 0
+
+        async def raw(self, command, params):
+            self.reads += 1
+            if command == 'listVirtualMachines':
+                return {'virtualmachine': [{'id': 'vm', 'serviceofferingid': 'gpu'}]}
+            assert command == 'listServiceOfferings'
+            return {'serviceoffering': [{'id': params['id'], 'gpucount': int(self.gpu and params['id'] == 'gpu')}]}
+
+        async def execute(self, command, params):
+            native.append((command, params))
+            return {'path': 'native'}
+
+    cloud = AgentCloud()
+
+    async def client(agent):
+        assert agent['id'] == 'parent'
+        return cloud
+
+    async def deploy(agent, client, params):
+        local.append(params)
+        return {'path': 'local'}
+
+    async def helper(settings, action, **request):
+        assert action == 'execute'
+        requests.append(request)
+        return {'path': 'controller'}
+
+    service.cloud_client, service._deploy_managed = client, deploy
+    monkeypatch.setattr(service_module, 'helper_call', helper)
+    params = {'serviceofferingid': 'gpu'} if command == 'deployVirtualMachine' else {'id': 'vm'}
+    context = {'session': 'backend-session', 'run_id': 'durable-run', 'call_id': 'tool-call'}
+    for invalid in (None, {key: value for key, value in context.items() if key != 'session'}):
+        token = GPU_CONTEXT.set(invalid)
+        try:
+            with pytest.raises(PermissionError, match='authenticated durable'):
+                await service.execute('parent', command, params, managed=True)
+        finally:
+            GPU_CONTEXT.reset(token)
+    assert not requests and not native and not local
+    token = GPU_CONTEXT.set(context)
+    try:
+        assert await service.execute('parent', command, params, managed=True) == {'path': 'controller'}
+        assert requests[-1] == {'agent_id': 'parent', 'command': command, 'params': params,
+                                'session': 'backend-session',
+                                'context': {'run_id': 'durable-run', 'call_id': 'tool-call'}}
+        if command in {'scaleVirtualMachine', 'changeServiceForVirtualMachine'}:
+            await service.execute('parent', command, {**params, 'serviceofferingid': 'cpu'}, managed=True)
+            assert requests[-1]['params']['serviceofferingid'] == 'cpu'
+    finally:
+        GPU_CONTEXT.reset(token)
+    reads, routed = cloud.reads, len(requests)
+    assert await service.execute('parent', command, params) == {'path': 'native'}
+    assert cloud.reads == reads and len(requests) == routed
+    cloud.gpu = False
+    if command == 'deployVirtualMachine':
+        assert await service.execute('parent', command, params, managed=True) == {'path': 'local'}
+        service.gpu_local, cloud.gpu = True, True
+        assert await service.execute('parent', command, params, managed=True) == {'path': 'local'}
+    else:
+        with pytest.raises(ValueError, match='GPU lifecycle'):
+            await service.execute('parent', command, params, managed=True)
+    assert len(requests) == routed
 
 
 @pytest.mark.parametrize('failure', ['transport', 'async-job', 'http-rejection'])

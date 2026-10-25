@@ -12,8 +12,8 @@ import httpx
 from .cloud import Cloud, CloudError, redact, validate
 from .settings import endpoint, dashboard_endpoint
 from .hierarchy import validate_child
-from .limits import APP_ROOT_AGENT, check_vm_policy
-from .gpu import helper_call
+from .limits import APP_ROOT_AGENT, check_vm_policy, gpu_count
+from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 
 _UNSET = object()
 
@@ -197,9 +197,37 @@ class Service:
         agent = await self.agent(agent_id)
         cloud = await self.cloud_client(agent)
         try:
-            if managed and command not in {'createTemplate', 'deployVirtualMachine'}:
-                raise ValueError('Managed enrollment supports VM deployment and private template creation')
-            if managed and command == 'createTemplate':
+            gpu_request = None
+            if managed and command not in GPU_COMMANDS | {'createTemplate'}:
+                raise ValueError('Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations')
+            if managed and command in GPU_COMMANDS and not self.gpu_local:
+                validate(None, params)
+                vm = None
+                if command != 'deployVirtualMachine':
+                    vm = next((v for v in (await cloud.raw('listVirtualMachines', {'id': params.get('id')})).get(
+                        'virtualmachine', []) if v['id'] == params.get('id')), None)
+                    if not vm:
+                        raise PermissionError('VM is unavailable to this agent')
+                offering_ids = {value for value in (params.get('serviceofferingid'), (vm or {}).get('serviceofferingid')) if value}
+                gpu = False
+                for offering_id in offering_ids:
+                    offering = next((o for o in (await cloud.raw('listServiceOfferings', {'id': offering_id})).get(
+                        'serviceoffering', []) if o['id'] == offering_id), None)
+                    if not offering:
+                        raise PermissionError('Compute offering is unavailable to this agent')
+                    gpu |= gpu_count(offering) > 0
+                if gpu:
+                    context = GPU_CONTEXT.get() or {}
+                    if not all(isinstance(context.get(field), str) and context[field] for field in ('session', 'run_id', 'call_id')):
+                        raise PermissionError('Managed GPU operations require an authenticated durable agent execution')
+                    gpu_request = {'agent_id': agent_id, 'command': command, 'params': params,
+                                   'session': context['session'],
+                                   'context': {field: context[field] for field in ('run_id', 'call_id')}}
+                elif command != 'deployVirtualMachine':
+                    raise ValueError('Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations')
+            if gpu_request:
+                result = await helper_call(self.settings, 'execute', **gpu_request)
+            elif managed and command == 'createTemplate':
                 result = await self._create_private_template(agent, cloud, params)
             elif managed and command == 'deployVirtualMachine':
                 async with self._deploy_lock:

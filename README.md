@@ -47,6 +47,8 @@ External tool results are untrusted data. Generic MCP calls use the existing dur
 
 CloudStack `execute_api` calls use native behavior by default, preserving caller-supplied names, user-data and publication settings. For application-managed SSH enrollment, explicitly set `managed=true` when deploying from a cloud-init-compatible template. The backend adds guest sudo only for explicitly approved templates; enrollment does not remove privileges or secrets already baked into an image. The selected offering's root disk must fit the template; fixed disk offerings may ignore `rootdisksize`. The same option on `createTemplate` selects the durable private-template workflow; it does not restrict ordinary native template creation.
 
+With the optional GPU controller installed, `managed=true` also selects its GPU lifecycle workflow. An authorized agent can prepare permitted profiles from its unused owned pool and deploy using its own CloudStack identity. Existing ancestor policies, native quotas, device ownership and attachment checks apply; policy changes and pool ownership grants remain human platform-administrator actions. Use `managed=true` for GPU start/stop and offering changes to retain controller recovery and release-on-stop behavior.
+
 ## Security boundaries
 
 - Human passwords remain with CloudStack. Application sessions are server-side, expiring and revocable; cookies use HttpOnly, Secure and SameSite Strict.

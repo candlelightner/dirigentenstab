@@ -75,6 +75,7 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
     elif isinstance(exc, ValueError):
         category, description = 'configuration', 'The request or configuration is invalid. Review the selected settings.'
         safe_messages = {
+            'Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations',
             'Configure a model identifier before starting a conversation',
             'Select a model provider in this agent’s settings first',
             'This conversation already has an execution in progress',

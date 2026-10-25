@@ -374,7 +374,7 @@ async def test_managed_enrollment_requires_explicit_opt_in(command, params):
         helpers.append(('template', selected, selected_cloud, arguments))
         return {'enrolled': 'template'}
 
-    service = SimpleNamespace(agent=agent, cloud_client=cloud_client, _deploy_lock=asyncio.Lock(),
+    service = SimpleNamespace(agent=agent, cloud_client=cloud_client, _deploy_lock=asyncio.Lock(), gpu_local=True,
                               _deploy_managed=deploy, _create_private_template=template,
                               store=SimpleNamespace(audit=lambda *args, **kwargs: None),
                               settings=SimpleNamespace(max_output=65536), redact=lambda value: value)

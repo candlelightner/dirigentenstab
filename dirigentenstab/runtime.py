@@ -553,6 +553,7 @@ class Runtime:
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
                           'execute_api with managed=True opts into SSH enrollment; the backend adds sudo only for approved templates. '
+                          'Use managed=True for controller-prepared GPU deployment and lifecycle operations, including stop/release. '
                           'Enrollment does not remove privileges or secrets already baked into an image. '
                           'The selected offering’s root disk must fit the template; fixed disk offerings may ignore rootdisksize. '
                           'Use managed=True on createTemplate for private-template recovery. '
@@ -581,8 +582,9 @@ class Runtime:
 
         @agent.tool(sequential=True)
         async def execute_api(ctx: RunContext, command: str, params: dict, managed: bool = False) -> dict:
-            """Call CloudStack as this account. managed=True opts into VM SSH/private-template enrollment."""
-            token = GPU_CONTEXT.set({'run_id': budget['operation_id'], 'call_id': ctx.tool_call_id})
+            """Call CloudStack as this account. managed=True enables VM SSH, GPU lifecycle, or private-template enrollment."""
+            token = GPU_CONTEXT.set({'run_id': budget['operation_id'], 'call_id': ctx.tool_call_id,
+                                     'session': identity.get('_session')})
             try:
                 return await invoke(self.service.execute, agent_id, command, params, call_id=ctx.tool_call_id,
                                     **({'managed': True} if managed else {}))
