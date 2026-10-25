@@ -1,5 +1,7 @@
 # Dirigentenstab 0.1.5
 
+Make CloudStack's actual account role and API-key rules the sole infrastructure permission authority. Remove the hardcoded infrastructure API allowlist and duplicate persisted `runtime_policy`. Search, description and execution use the native key's catalogue while keeping technical host/credential/input protections. Rotation clones native ordered rules for each separate runtime/provisioning pair, verifies ownership and permissions, and recovers interrupted revocation without reissuing keys. An authenticated platform administrator can explicitly adopt selected native replacement keys; permission changes require no Python code edit and ordinary rotation adds no grants.
+
 Prepare an agent-driven GPU build without giving agents host or GPU-administrator access. Add private template creation from an owned stopped managed root volume, durable intent/recovery, and managed deployment of the resulting private image. Only explicitly approved build templates grant sudo inside newly created guests; the managed SSH identity remains non-root. Existing templates keep their previous permissions.
 
 Stream operator-approved, SHA-256-verified large guest assets over existing pinned-key SFTP while retaining the 8 MiB limit for normal workspace transfers. Proprietary payloads stay in private deployment storage and never enter GitHub, image layers, provider context or public HTTP routes.
@@ -10,7 +12,7 @@ With `ENABLE_GPU_CONTROL=true`, the standard installer supplies `mdevctl`, `xmls
 
 Add an optional administrator-only **CloudStack Dashboard** quicklink in the desktop header and mobile hierarchy menu. `CLOUDSTACK_UI_URL` is independent of the API endpoint; platform settings can override or hide it. The link opens a separate tab with normal native authentication, without API keys/session tokens in its URL. The reference host uses a separate tailnet-only HTTPS endpoint and retains its existing Serve routes and private management bind.
 
-Migration 009 adds template-creation records, one explicit template capability and platform settings. Back up SQLite consistently with its matching encryption key, TLS secrets and environment before deployment. Keep the previous versioned image/digest for rollback. Existing guest disks, NVIDIA configuration, legacy archives, SSH and Tailscale routes are retained.
+Migration 009 adds template-creation records, one explicit template capability and platform settings; migration 010 removes the redundant agent permission column. Back up SQLite consistently with its matching encryption key, TLS secrets and environment before deployment. Preserve post-rotation credentials in the matching backup: restoring an older database may reference revoked native keys. Keep the previous versioned image/digest for rollback and use its matching schema snapshot. Existing guest disks, NVIDIA configuration, legacy archives, SSH and Tailscale routes are retained.
 
 See [GPU preparation](GPU_PREPARATION.md) for actual profile/offering/build-template identifiers, driver delivery, licensing prerequisites and the remaining human-initiated GPU acceptance gate. No final GPU image or GPU workload is created by this update.
 

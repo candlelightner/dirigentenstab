@@ -66,7 +66,11 @@ async def perform(options, app, login=None):
     try:
         identity = await auth.identity(token)
         if options.command == 'rotate':
-            await app.rotate_credentials(identity, options.identifier, options.allow_api)
+            await app.rotate_credentials(identity, options.identifier)
+        elif options.command == 'adopt-key':
+            selected = {purpose: getattr(options, purpose + '_key_id') for purpose in ('runtime', 'provisioning')
+                        if getattr(options, purpose + '_key_id')}
+            await app.rotate_credentials(identity, options.identifier, native_key_ids=selected)
         elif options.command == 'approve-template':
             if identity['type'] != 1:
                 raise PermissionError('Template approval requires platform administrator')
@@ -104,18 +108,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
                                             'rotate', 'revoke', 'repair-provisioning', 'repair-execution',
-                                            'recover-templates', 'approve-template'])
+                                            'recover-templates', 'approve-template', 'adopt-key'])
     parser.add_argument('identifier', nargs='?')
     parser.add_argument('--login-file')
     parser.add_argument('--deployment-id')
     parser.add_argument('--confirmed-rejection', action='store_true')
-    parser.add_argument('--allow-api', action='append', default=[], help='Explicit platform-admin runtime policy extension during rotation')
+    parser.add_argument('--runtime-key-id', help='Exact CloudStack-native runtime key pair UUID to adopt')
+    parser.add_argument('--provisioning-key-id', help='Exact CloudStack-native provisioning key pair UUID to adopt')
     parser.add_argument('--guest-admin', action='store_true', help='Approve sudo inside newly deployed guests of this template only')
     options = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root; this command reads the private application master key.')
-    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection', 'approve-template'} and not options.identifier:
+    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection', 'approve-template', 'adopt-key'} and not options.identifier:
         parser.error('This command requires an identifier from status output.')
+    if options.command == 'adopt-key' and not (options.runtime_key_id or options.provisioning_key_id):
+        parser.error('adopt-key requires an explicit --runtime-key-id and/or --provisioning-key-id from CloudStack')
     login = None
     if options.command not in {'status', 'recover-deployments', 'recover-templates', 'resolve-rejection'}:
         if options.login_file:

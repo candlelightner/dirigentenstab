@@ -202,14 +202,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
                 setTimeout(fit,500); })();
         </script>""")
-        # Quasar skips layout-width breakpoints while a dialog prevents scrolling; screen behavior still updates.
+        # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
         with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300 '
-                ':behavior="$q.screen.width <= 900 ? \'mobile\' : \'desktop\'"').classes('bg-stone-50') as drawer:
+                ':model-value="null"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
                     ui.label('Agents').classes('text-lg font-semibold')
                     ui.space()
-                    ui.button(icon='close', on_click=drawer.hide).props('flat round aria-label="Close agent hierarchy"')
+                    ui.button(icon='close', on_click=lambda: drawer.run_method('hide')).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
@@ -225,7 +225,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     gpu_button = ui.button('GPU policies', icon='memory').props('outline').classes('w-full')
         with ui.column().classes('workspace'):
             with ui.row().classes('w-full items-center no-wrap gap-2'):
-                ui.button('Agents', icon='account_tree', on_click=drawer.toggle).props(
+                ui.button('Agents', icon='account_tree', on_click=lambda: drawer.run_method('toggle')).props(
                     'outline aria-label="Open agent hierarchy"')
                 agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
                                          label='Chat directly with an agent', with_input=True).classes(
@@ -311,7 +311,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
             if close_navigation:
-                drawer.hide()
+                drawer.run_method('hide')
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
@@ -361,7 +361,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if identifier != state['agent']:
                     await show_agent(identifier)
                 else:
-                    drawer.hide()
+                    drawer.run_method('hide')
             elif kind == 'domain':
                 current = await actor()
                 updated = await service.hierarchy(current)
@@ -373,7 +373,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.label(domain['name']).classes('text-2xl font-semibold')
                     ui.label(domain.get('path', '')).classes('text-stone-600')
                     ui.label('CloudStack domain: ' + identifier).classes('text-xs text-stone-500 break-all')
-                    drawer.hide()
+                    drawer.run_method('hide')
                     for agent in updated.get('agents', []):
                         if agent['domain_id'] == identifier:
                             ui.button('Chat with ' + agent['name'],

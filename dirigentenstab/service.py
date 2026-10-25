@@ -9,7 +9,7 @@ import uuid
 
 import httpx
 
-from .cloud import Cloud, CloudError, PROVISION_APIS, RUNTIME_APIS, redact, validate
+from .cloud import Cloud, CloudError, PROVISION_APIS, redact, runtime_api, validate
 from .settings import endpoint, dashboard_endpoint
 from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, VM_POLICY_COMMANDS, check_vm_policy
@@ -131,7 +131,7 @@ class Service:
                 'hierarchy': {'parent': domain.get('parentdomainid'),
                               'children': [{'id': d['id'], 'path': d.get('path', d['name'])}
                                            for d in domains if d.get('parentdomainid') == domain['id']]},
-                'available_api_names': sorted(set(await cloud.catalogue()) & RUNTIME_APIS),
+                'available_api_names': sorted(name for name in await cloud.catalogue(refresh=True) if runtime_api(name)),
                 'approved_guest_assets': await self.guest_assets(agent['id']),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'delegate'],
@@ -163,17 +163,17 @@ class Service:
 
     async def search_api(self, agent_id, query):
         agent = await self.agent(agent_id)
-        catalogue = await (await self.cloud_client(agent)).catalogue()
+        catalogue = await (await self.cloud_client(agent)).catalogue(refresh=True)
         terms = query.lower().split()[:10]
-        matches = [a for name, a in catalogue.items() if name in RUNTIME_APIS
+        matches = [a for name, a in catalogue.items() if runtime_api(name)
                    and all(term in (name + ' ' + a.get('description', '')).lower() for term in terms)]
         return [{'name': a['name'], 'description': a.get('description', '')[:300]} for a in matches[:30]]
 
     async def describe_api(self, agent_id, command):
         agent = await self.agent(agent_id)
-        if command not in RUNTIME_APIS:
-            raise PermissionError('API not available to runtime tools')
-        api = (await (await self.cloud_client(agent)).catalogue()).get(command)
+        if not runtime_api(command):
+            raise PermissionError('Credential and host control APIs require a trusted platform workflow')
+        api = (await (await self.cloud_client(agent)).catalogue(refresh=True)).get(command)
         if not api:
             raise PermissionError('API not available to this identity')
         from .cloud import FORBIDDEN_PARAMS
@@ -502,34 +502,36 @@ class Service:
                            (provider_id or None, model, instructions, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
-    async def _key(self, cloud, user_id, name, allowed):
-        if not allowed:
-            raise PermissionError('Refusing to issue a key without explicit restricted permissions')
+    async def _key(self, cloud, user_id, name, rules):
+        if not rules:
+            raise PermissionError('Native key permissions are empty or unknown; no unrestricted key was issued')
         params = {'id': user_id, 'name': name, 'enddate': time.strftime('%Y-%m-%dT%H:%M:%S+0000',
                                                                      time.gmtime(time.time() + 90 * 86400))}
-        for index, api in enumerate(sorted(allowed)):
-            params[f'rules[{index}].rule'] = api
-            params[f'rules[{index}].permission'] = 'allow'
+        for index, rule in enumerate(rules):
+            params[f'rules[{index}].rule'] = rule['rule']
+            params[f'rules[{index}].permission'] = rule['permission']
         value = first(await cloud.raw('registerUserKeys', params), 'userkeys')
         return {'id': value['id'], 'apikey': value['apikey'], 'secretkey': value['secretkey']}
 
-    async def _credentials(self, cloud, user_id, operation_id, runtime_allowed=None):
+    async def _credentials(self, cloud, user_id, operation_id, runtime_allowed=None, *, native_rules=None):
         # On a retry, delete any previously issued keys whose response was lost before persistence.
         keys = (await cloud.raw('listUserKeys', {'userid': user_id})).get('userapikey', [])
         for key in keys:
             if key.get('name', '').startswith('ds-' + operation_id):
                 await cloud.raw('deleteUserKeys', {'keypairid': key['id']})
-        issuer = set(await cloud.catalogue())
-        allowed = RUNTIME_APIS & issuer
-        if runtime_allowed is not None:
-            allowed &= set(runtime_allowed)
-        runtime = await self._key(cloud, user_id, 'ds-' + operation_id + '-runtime', allowed)
-        # CloudStack 4.23 requires a signing key to cover every permission it delegates to a child.
-        envelope = (PROVISION_APIS | allowed) & issuer
-        provisioning = await self._key(cloud, user_id, 'ds-' + operation_id + '-provision', envelope)
+        if native_rules is None:
+            issuer = set(await cloud.catalogue())
+            allowed = {name for name in issuer if runtime_api(name)}
+            if runtime_allowed is not None:
+                allowed &= set(runtime_allowed)
+            # Native signing keys must cover every permission they delegate to a child.
+            native_rules = {purpose: [{'rule': name, 'permission': 'allow'} for name in sorted(names)]
+                            for purpose, names in [('runtime', allowed), ('provisioning', (PROVISION_APIS | allowed) & issuer)]}
+        runtime = await self._key(cloud, user_id, 'ds-' + operation_id + '-runtime', native_rules['runtime'])
+        provisioning = await self._key(cloud, user_id, 'ds-' + operation_id + '-provision', native_rules['provisioning'])
         self._remember(runtime)
         self._remember(provisioning)
-        return {'runtime': runtime, 'provisioning': provisioning, 'runtime_policy': sorted(allowed)}
+        return {'runtime': runtime, 'provisioning': provisioning}
 
     async def create_subgroup(self, agent_id, name, model=None, instructions=None):
         parent = await self.agent(agent_id)
@@ -608,11 +610,11 @@ class Service:
                     raise PermissionError('New credentials failed domain validation')
             with self.store.connect() as conn:
                 conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,'
-                             'provider_id,model,instructions,can_provision,runtime_policy) VALUES(?,?,?,?,?,?,?,?,?,?,1,?) '
+                             'provider_id,model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,?,1) '
                              'ON CONFLICT(id) DO NOTHING',
                              (op_id, op['name'], op['domain_id'], op['account_id'], op['user_id'],
                               self.store.seal(credentials['runtime']), self.store.seal(credentials['provisioning']),
-                              op['provider_id'], op['model'], op['instructions'], json.dumps(credentials['runtime_policy'])))
+                              op['provider_id'], op['model'], op['instructions']))
                 conn.execute("UPDATE provisioning SET phase='complete',credentials=NULL,error=NULL,updated=? WHERE id=?",
                              (time.time(), op_id))
             self.store.audit(op['parent_id'] or 'bootstrap', 'create-subgroup', op_id)
@@ -638,16 +640,46 @@ class Service:
         op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
         return await self._provision(op, cloud, root['id'])
 
-    async def rotate_credentials(self, identity, agent_id, additional_apis=()):
-        if additional_apis and (identity.get('type') != 1 or not set(additional_apis) <= RUNTIME_APIS):
-            raise PermissionError('Only platform administrators can explicitly extend runtime API policy')
+    @staticmethod
+    async def _native_rules(cloud, key_id):
+        response = await cloud.raw('listUserKeyRules', {'keypairid': key_id})
+        rules = response.get('keypermission')
+        if (not isinstance(rules, list) or not rules or len(rules) > 2048
+                or int(response.get('count', len(rules))) != len(rules)):
+            raise PermissionError('Native key permissions are missing or incomplete; previous credentials retained')
+        result = []
+        for rule in rules:
+            if (not isinstance(rule, dict) or not isinstance(rule.get('rule'), str)
+                    or not 0 < len(rule['rule']) <= 255 or any(ord(c) < 32 for c in rule['rule'])
+                    or rule.get('permission') not in {'allow', 'deny'}):
+                raise PermissionError('Native key permissions cannot be verified; previous credentials retained')
+            result.append({key: rule[key] for key in ('rule', 'permission')})
+        return result
+
+    @staticmethod
+    def _native_pair(available, agent, *, key_id=None, credentials=None):
+        matches = [key for key in available if
+                   (key.get('id') == key_id if key_id else key.get('apikey') == (credentials or {}).get('apikey'))]
+        if len(matches) != 1:
+            raise PermissionError('The exact native key pair could not be found; previous credentials retained')
+        key = matches[0]
+        if (key.get('userid') != agent['user_id'] or key.get('accountid') != agent['account_id']
+                or key.get('domainid') != agent['domain_id'] or str(key.get('state', '')).lower() != 'enabled'
+                or credentials and key.get('apikey') != credentials.get('apikey')
+                or not all(isinstance(key.get(name), str) and key[name] for name in ('id', 'apikey', 'secretkey'))):
+            raise PermissionError('Native key pair must be enabled and belong to this exact agent user/account/domain')
+        return {name: key[name] for name in ('id', 'apikey', 'secretkey')}
+
+    async def rotate_credentials(self, identity, agent_id, *, native_key_ids=None):
+        if native_key_ids and (identity.get('type') != 1 or not set(native_key_ids) <= {'runtime', 'provisioning'}):
+            raise PermissionError('Only a human platform administrator may adopt an explicitly selected native key')
         agent = await self.authorize(identity, agent_id)
         async with self._provision_lock:
             service = self
             class HumanIssuer:
                 async def raw(self, command, params=None):
                     if command not in PROVISION_APIS:
-                        raise PermissionError('API unavailable to credential rotation')
+                        raise PermissionError('API unavailable to credential reconciliation')
                     return await service.human_call(identity, command, params)
 
                 async def catalogue(self):
@@ -655,39 +687,67 @@ class Service:
             cloud = HumanIssuer()
             rotation = self.store.one('SELECT * FROM credential_rotations WHERE agent_id=?', (agent_id,))
             if not rotation:
-                current = {p: self.store.open(agent[p]) for p in ('runtime', 'provisioning')}
+                current = {purpose: self.store.open(agent[purpose]) for purpose in ('runtime', 'provisioning')}
                 self.store.execute('INSERT INTO credential_rotations VALUES(?,?,?,NULL,?,?)',
                                    (agent_id, uuid.uuid4().hex, self.store.seal(current), 'issuing', time.time()))
                 rotation = self.store.one('SELECT * FROM credential_rotations WHERE agent_id=?', (agent_id,))
             current = self.store.open(rotation['previous'])
             if rotation['replacement']:
                 keys = self.store.open(rotation['replacement'])
+                if native_key_ids and any(keys[purpose]['id'] != key_id for purpose, key_id in native_key_ids.items()):
+                    raise PermissionError('A different credential reconciliation is already pending')
             else:
-                try:
-                    current_policy = set(await (await self.cloud_client(agent)).catalogue())
-                except CloudError:
-                    current_policy = set(json.loads(agent['runtime_policy']))
-                    if not current_policy:
-                        raise PermissionError('Previous runtime policy unknown; restore or review it before rotation') from None
-                keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'],
-                                               current_policy | set(additional_apis))
+                available = (await cloud.raw('listUserKeys', {'userid': agent['user_id']})).get('userapikey', [])
+                previous = {purpose: self._native_pair(available, agent, key_id=current[purpose].get('id'),
+                                credentials=current[purpose]) for purpose in ('runtime', 'provisioning')
+                            if purpose not in (native_key_ids or {})}
+                rules = {purpose: await self._native_rules(cloud, pair['id']) for purpose, pair in previous.items()}
+                if native_key_ids:
+                    keys = {**current, **previous}
+                    for purpose, key_id in native_key_ids.items():
+                        keys[purpose] = self._native_pair(available, agent, key_id=key_id)
+                    keys['adopted'] = list(native_key_ids)
+                else:
+                    if previous['runtime']['id'] == previous['provisioning']['id']:
+                        raise PermissionError('Runtime and provisioning must use separate native key pairs')
+                    keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'], native_rules=rules)
+                current.update(previous)
+                self.store.execute('UPDATE credential_rotations SET previous=? WHERE agent_id=?',
+                                   (self.store.seal(current), agent_id))
+                keys['source_rules'] = rules
+                if keys['runtime']['id'] == keys['provisioning']['id']:
+                    raise PermissionError('Runtime and provisioning must use separate native key pairs')
                 self.store.execute("UPDATE credential_rotations SET replacement=?,phase='validating',updated=? WHERE agent_id=?",
                                    (self.store.seal(keys), time.time(), agent_id))
-            for purpose in ('runtime', 'provisioning'):
-                check = await self.client(keys[purpose]).raw('listDomains', {'id': agent['domain_id']})
-                if not any(d['id'] == agent['domain_id'] for d in check.get('domain', [])):
-                    raise PermissionError('Replacement credentials failed domain validation; old keys retained')
-            self.store.execute('UPDATE agents SET runtime=?,provisioning=?,runtime_policy=? WHERE id=?',
-                               (self.store.seal(keys['runtime']), self.store.seal(keys['provisioning']),
-                                json.dumps(keys['runtime_policy']), agent_id))
-            new_cloud = self.client(keys['provisioning'])
-            for key in current.values():
-                if key.get('id'):
-                    available = (await new_cloud.raw('listUserKeys', {'userid': agent['user_id']})).get('userapikey', [])
-                    if any(k['id'] == key['id'] for k in available):
-                        await new_cloud.raw('deleteUserKeys', {'keypairid': key['id']})
+            if rotation['phase'] != 'revoking':
+                available = (await cloud.raw('listUserKeys', {'userid': agent['user_id']})).get('userapikey', [])
+                for purpose in ('runtime', 'provisioning'):
+                    keys[purpose] = self._native_pair(available, agent, key_id=keys[purpose]['id'])
+                    self._remember(keys[purpose])
+                    check = await self.client(keys[purpose]).raw('listDomains', {'id': agent['domain_id']})
+                    if not any(domain['id'] == agent['domain_id'] for domain in check.get('domain', [])):
+                        raise PermissionError('Replacement credentials failed domain validation; old keys retained')
+                    if purpose not in keys.get('adopted', []):
+                        previous = self._native_pair(available, agent, key_id=current[purpose].get('id'),
+                                                     credentials=current[purpose])
+                        expected = keys.get('source_rules', {}).get(purpose)
+                        live = await self._native_rules(cloud, previous['id'])
+                        replacement = await self._native_rules(cloud, keys[purpose]['id'])
+                        if (expected is not None and live != expected) or live != replacement:
+                            raise PermissionError('Native permissions changed during rotation; old keys retained')
+                with self.store.connect() as conn:
+                    conn.execute('UPDATE agents SET runtime=?,provisioning=? WHERE id=?',
+                                 (self.store.seal(keys['runtime']), self.store.seal(keys['provisioning']), agent_id))
+                    conn.execute("UPDATE credential_rotations SET phase='revoking',updated=? WHERE agent_id=?",
+                                 (time.time(), agent_id))
+            retained = {keys[purpose]['id'] for purpose in ('runtime', 'provisioning')}
+            available = (await cloud.raw('listUserKeys', {'userid': agent['user_id']})).get('userapikey', [])
+            for previous in current.values():
+                key_id = previous.get('id')
+                if key_id and key_id not in retained and any(key['id'] == key_id for key in available):
+                    await cloud.raw('deleteUserKeys', {'keypairid': key_id})
             self.store.execute('DELETE FROM credential_rotations WHERE agent_id=?', (agent_id,))
-            self.store.audit(identity['userid'], 'rotate-credentials', agent_id)
+            self.store.audit(identity['userid'], 'adopt-native-key' if keys.get('adopted') else 'rotate-credentials', agent_id)
 
     async def revoke_agent(self, identity, agent_id):
         agent = await self.authorize(identity, agent_id, include_disabled=True)

@@ -44,17 +44,17 @@ To prepare another installation, use `scripts/stage_guest_asset.py --source PRIV
 
 ## Agent capabilities and administrator boundary
 
-`createTemplate` and `changeServiceForVirtualMachine` are the only added runtime APIs. Existing `listServiceOfferings` selects an authorized offering; GPU offering administration is not exposed as an agent tool. Physical discovery, offering creation, quotas and policy changes remain authenticated human platform-administrator operations. The scoped controller performs only lifecycle actions explicitly permitted by those policies.
+CloudStack's native role/API-key rules decide which infrastructure operations an agent may use, including `createTemplate` and `changeServiceForVirtualMachine`. There is no Python infrastructure allowlist or duplicate SQLite permission policy. `listServiceOfferings` selects an authorized offering. Physical discovery, offering creation, quotas and privileged host policy changes remain human platform-administrator/controller workflows; generic tools retain technical host/credential protections. The controller performs only lifecycle actions permitted by its host policies and the requesting agent's native CloudStack identity.
 
-For an existing agent, a human platform administrator explicitly enables the new API using the existing durable key rotation:
+For an existing agent, ordinary rotation preserves its authoritative native key rules. To change its key-rule envelope, create a specifically scoped replacement key in CloudStack, then explicitly adopt its UUID as a human platform administrator:
 
 ```sh
-sudo .venv/bin/python scripts/admin.py rotate AGENT_ID --allow-api createTemplate
-sudo .venv/bin/python scripts/admin.py rotate AGENT_ID --allow-api changeServiceForVirtualMachine
+sudo .venv/bin/python scripts/admin.py rotate AGENT_ID
+sudo .venv/bin/python scripts/admin.py adopt-key AGENT_ID --runtime-key-id CLOUDSTACK_KEY_PAIR_UUID
 sudo .venv/bin/python scripts/admin.py approve-template TRUSTED_TEMPLATE_ID --guest-admin
 ```
 
-Template approval is an explicit guest privilege grant: use it only for a trusted build base. Ordinary key rotation preserves previous policy; it does not silently grant new APIs. Newly provisioned agents receive the current scoped runtime allowlist. No unrestricted administrator key enters the agent container or context.
+An explicitly selected provisioning pair may be adopted with `--provisioning-key-id`; both IDs may be supplied for recovery when both original pairs are unavailable. The CLI verifies the exact native agent user/account/domain and key validity, keeps the two credentials separate, and never selects a key automatically. A runtime grant does not automatically widen provisioning credentials; child issuance remains limited by its native signer. Template approval is an explicit guest privilege grant: use it only for a trusted build base. No unrestricted administrator key enters the agent container or context.
 
 Private template creation accepts only an owned, stopped managed VM's root volume. Public/featured images, owner overrides, arbitrary URLs and unmanaged sources are denied. The app verifies native account/domain ownership and readiness before approving the result for managed deployment. Creation intent/result is encrypted and durable; unresolved dispatches block repetition. `recover-templates` only locates and binds existing ready private templates; it never creates another image. An owned interrupted chat can then use `repair-execution RUN_ID --deployment-id TEMPLATE_OPERATION_ID` and its existing Continue action.
 

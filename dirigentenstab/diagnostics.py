@@ -29,14 +29,23 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         category, description = 'timeout', 'The operation timed out.'
     elif isinstance(exc, PermissionError):
         category, description = 'authorization', 'Access denied or session expired. Sign in again if needed.'
+        if str(exc) in {'API unavailable to this CloudStack identity and API key', 'API not available to this identity'}:
+            description = 'CloudStack does not permit this API for this agent’s current account and API key.'
     elif isinstance(exc, CloudError):
         category = 'cloudstack'
         description = ('CloudStack rejected the operation. Check permissions, resource limits and parameters.'
                        if exc.rejected else 'CloudStack could not complete the operation. Check API connectivity and permissions.')
         if exc.rejected and any(word in str(exc).lower() for word in ('quota', 'limit exceeded', 'maximum')):
             description = 'CloudStack rejected the operation because a resource quota or limit was exceeded.'
-        elif exc.rejected and any(code in str(exc) for code in ('401', '403')):
-            description = 'CloudStack rejected the credentials or API permission. Check this agent’s restricted access.'
+        elif exc.rejected and any(marker in str(exc) for marker in ('HTTP 401:', 'error 401:')):
+            category = 'authentication'
+            description = 'CloudStack rejected this agent’s API credentials. An administrator must reconcile its keys.'
+        elif 'expung' in str(exc).lower() and 'permission' in str(exc).lower():
+            category = 'authorization'
+            description = 'CloudStack denied permanent VM deletion (expunge) for this agent’s API key.'
+        elif exc.rejected and any(code in str(exc) for code in ('401', '403', '531')):
+            category = 'authorization'
+            description = 'CloudStack denied this operation for the agent’s account, domain or API key.'
     elif isinstance(exc, ModelHTTPError):
         category = 'model-provider'
         code = exc.status_code

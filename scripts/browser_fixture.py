@@ -116,7 +116,7 @@ class FixtureCloud(Cloud):
                                         'note': PRIVATE_VALUES[0]}]}
         raise ValueError('This CI fixture only supports listing domains and VMs')
 
-    async def catalogue(self):
+    async def catalogue(self, *, refresh=False):
         return {'listVirtualMachines': {'name': 'listVirtualMachines', 'description': 'List authorized guest VMs',
                                         'params': [], 'isasync': False, 'response': []}}
 
