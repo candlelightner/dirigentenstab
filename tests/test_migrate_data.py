@@ -223,3 +223,38 @@ async def test_migration_retries_only_terminal_rejection(tmp_path, monkeypatch, 
             await migration.deploy({'agents': [agent]}, service, agent)
         assert service.dispatched == 0
         assert agent['deployment_id'] == 'old'
+
+
+@pytest.mark.parametrize(('target', 'accepted'), [('./folder/file', True), ('folder//file', True),
+    ('folder/', True), ('folder/.', True), ('folder/../folder/file', False),
+    ('folder/file/', False), ('missing/', False)])
+def test_restore_accepts_only_redundant_safe_symlink_normalization(tmp_path, target, accepted):
+    content = b'unchanged synthetic workspace data'
+    archive = tmp_path / '.migration-workspace.tar.gz'
+    with tarfile.open(archive, 'w:gz') as file:
+        member = tarfile.TarInfo('folder/file')
+        member.size = len(content)
+        file.addfile(member, io.BytesIO(content))
+        link = tarfile.TarInfo('link')
+        link.type, link.linkname = tarfile.SYMTYPE, target
+        file.addfile(link)
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # Simulate the already extracted directory: rerun must verify without extracting again.
+    final = tmp_path / 'legacy'
+    (final / 'folder').mkdir(parents=True)
+    (final / 'folder/file').write_bytes(content)
+    (final / 'link').symlink_to(os.path.normpath(target))
+    (final / ('.dirigentenstab-migration-' + checksum + '.json')).write_text(
+        json.dumps({'archive_sha256': checksum}))
+    (tmp_path / '.migration-files.json').write_text(json.dumps({'files': [{'path': 'folder/file',
+        'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()}],
+        'links': [{'path': 'link', 'target': target}]}))
+    program = migration.RESTORE_PROGRAM.replace("pathlib.Path('/home/dirigent/workspace')",
+                                                'pathlib.Path(' + repr(str(tmp_path)) + ')')
+    program = program.replace('assert os.getuid()!=0 and base.is_mount()', 'assert base.is_dir()')
+    result = subprocess.run([sys.executable, '-c', program, checksum], capture_output=True, timeout=10)
+    assert (result.returncode == 0) == accepted
+    assert (final / 'folder/file').read_bytes() == content
+    if accepted:
+        receipt = json.loads(result.stdout)
+        assert receipt['normalized_links'] == 1 and receipt['archive_sha256'] == checksum

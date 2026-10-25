@@ -653,11 +653,20 @@ for entry in metadata['files']:
     assert p.is_file() and not p.is_symlink() and p.stat().st_size==entry['size']
     with p.open('rb') as f: assert hashlib.file_digest(f,'sha256').hexdigest()==entry['sha256']
     total+=entry['size']
+normalized_links=0
 for entry in metadata['links']:
-    assert os.readlink(final/entry['path'])==entry['target']
+    link=final/entry['path']
+    actual=os.readlink(link)
+    expected_target=entry['target']
+    if actual!=expected_target:
+        clean='/'.join(part for part in expected_target.split('/') if part not in {'','.'}) or '.'
+        assert actual==os.path.normpath(expected_target)==clean
+        if expected_target.endswith('/') or expected_target.endswith('/.'):
+            assert (link.parent/actual).is_dir()
+        normalized_links+=1
 archive.unlink(missing_ok=True)
 report.unlink(missing_ok=True)
-print(json.dumps({'files':len(metadata['files']),'bytes':total,'links':len(metadata['links']),'archive_sha256':expected}))
+print(json.dumps({'files':len(metadata['files']),'bytes':total,'links':len(metadata['links']),'normalized_links':normalized_links,'archive_sha256':expected}))
 '''
 
 
