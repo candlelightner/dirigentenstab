@@ -158,8 +158,13 @@ async def acceptance(options):
                     await asyncio.sleep(1)
             state['status'] = run['status']
             save(state)
+            await page.locator('.q-message').first.wait_for(timeout=60000)
+            if run['status'] == 'completed':
+                await page.get_by_text('Completed', exact=True).wait_for(timeout=60000)
             for width, height, name in [(1440, 900, 'desktop'), (390, 844, 'mobile')]:
                 await page.set_viewport_size({'width': width, 'height': height})
+                if width == 390:
+                    await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
                 await page.screenshot(path=str(STATE.with_suffix('.'+name+'.png')), full_page=True)
             if run['status'] != 'completed':
                 raise RuntimeError('Acceptance incomplete; reopen original conversation, operation '+run['id'])
