@@ -260,7 +260,11 @@ async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(bro
         assert await link.get_attribute('target') == '_blank'
         assert 'noopener' in await link.get_attribute('rel')
         await page.set_viewport_size({'width': 390, 'height': 844})
-        await page.wait_for_timeout(400)
+        await page.locator('.q-drawer--mobile').wait_for(state='attached')
+        # Resizing a desktop session may preserve its open drawer; fresh mobile sessions start closed.
+        if await page.get_by_label('Search agents and domains', exact=True).is_visible():
+            await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
+        await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await link.wait_for()
         await page.get_by_role('button', name='Platform settings', exact=True).click()
@@ -298,6 +302,9 @@ async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
             await page.reload()
             await page.wait_for_function('window.socket?.connected && window.did_handshake')
             await page.set_viewport_size({'width': 390, 'height': 844})
+            await page.locator('.q-drawer--mobile').wait_for(state='attached')
+            if await page.get_by_label('Search agents and domains', exact=True).is_visible():
+                await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
             await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await page.get_by_role('button', name='GPU policies', exact=True).click()
