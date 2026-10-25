@@ -7,7 +7,7 @@ import time
 import uuid
 
 import httpx
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -18,6 +18,8 @@ from pydantic_ai.messages import (
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ToolCallPart,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
@@ -26,6 +28,34 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .guest import Guest
+from .diagnostics import diagnose
+
+
+def load_history(value):
+    """Recover usage metadata damaged by v0.1.2's token-name secret redaction."""
+    for message in value:
+        if message.get('kind') == 'response' and isinstance(message.get('usage'), dict):
+            # These are telemetry counts, not credentials. Unknown counts stay unknown/zero.
+            message['usage'] = {key: item for key, item in message['usage'].items()
+                                if item != '[redacted]'}
+            details = message['usage'].get('details')
+            if isinstance(details, dict):
+                message['usage']['details'] = {key: item for key, item in details.items()
+                                               if item != '[redacted]'}
+    messages = ModelMessagesTypeAdapter.validate_python(value)
+    pending = {}
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, ToolCallPart):
+                pending[part.tool_call_id] = part
+            elif isinstance(part, ToolReturnPart) or part.part_kind == 'retry-prompt':
+                pending.pop(getattr(part, 'tool_call_id', None), None)
+    if pending:
+        messages.append(ModelRequest(parts=[ToolReturnPart(
+            tool_name=part.tool_name, tool_call_id=part.tool_call_id,
+            content='Execution interrupted. Outcome unknown; inspect durable operation state before retrying mutations.')
+            for part in pending.values()]))
+    return messages
 
 
 def build_model(provider, model_id, store):
@@ -99,6 +129,22 @@ class Runtime:
         self.guest = Guest(service)
         self.slots = asyncio.Semaphore(4)
         self.running = set()
+        self.service.store.execute("UPDATE chat_runs SET status='interrupted',updated=? WHERE status='running'",
+                                   (time.time(),))
+        self.model_cache = {}
+
+    async def models(self, identity, provider_id):
+        allowed = await self.service.providers(identity)
+        if not any(p['id'] == provider_id for p in allowed):
+            raise PermissionError('Provider is unavailable')
+        provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (provider_id,))
+        key = (provider_id, provider['base_url'], provider['api_key'])
+        cached = self.model_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        models = await provider_models(provider, self.service.store)
+        self.model_cache = {key: (time.monotonic(), models)}
+        return models
 
     async def conversations(self, identity, agent_id):
         await self.service.authorize(identity, agent_id)
@@ -115,6 +161,10 @@ class Runtime:
         await self.service.authorize(identity, conversation['agent_id'])
         return {name: conversation[name] for name in ('id', 'agent_id', 'title', 'imported')} | {
             'messages': self.service.redact(self.service.store.open(conversation['messages'])),
+            'runs': [{k: row[k] for k in ('id', 'status', 'tool', 'category')} | {
+                'events': self.service.redact(self.service.store.open(row['events']))}
+                for row in self.service.store.all('SELECT * FROM chat_runs WHERE conversation_id=? ORDER BY created',
+                                                  (conversation_id,))],
         }
 
     async def _agent(self, identity, agent_id, budget, depth, emit):
@@ -136,7 +186,8 @@ class Runtime:
                 await self.service.authorize(identity, agent_id)
                 return self.service.redact(await operation(*args, **kwargs))
             except (PermissionError, ValueError, RuntimeError) as exc:
-                return {'error': str(self.service.redact(str(exc)))[:512]}
+                error = diagnose(exc, agent_id=agent_id, tool=operation.__name__)
+                return {'error': str(error), 'category': error.category}
 
         @agent.tool_plain
         async def search_api(query: str) -> dict:
@@ -179,7 +230,6 @@ class Runtime:
             await self.service.authorize(identity, target)
             budget['remaining'] -= 1
             child = await self._agent(identity, target, budget, depth + 1, emit)
-            await emit({'type': 'tool_call', 'name': 'delegate', 'content': {'agent_id': target}})
             task = self.service.redact(task)
             conversation_id = str(uuid.uuid4())
             messages = [ModelRequest(parts=[UserPromptPart(task)]),
@@ -227,47 +277,114 @@ class Runtime:
             raise ValueError('This conversation already has an execution in progress')
         if len(json.dumps(history_json)) > 2 * 1024 * 1024:
             raise ValueError('Conversation reached its context limit; start a new conversation')
-        self.running.add(conversation_id)
         prompt = self.service.redact(prompt)
-        history = ModelMessagesTypeAdapter.validate_python(history_json)
+        history = load_history(history_json)
+        operation_id = str(uuid.uuid4())
+        events_log, started, targets = [], {}, {}
+        last_checkpoint = 0
+        active_tool = None
+        partial_text, partial_message_index = '', None
+        captured = []
+        messages = history + [ModelRequest(parts=[UserPromptPart(prompt)])]
+        self.service.store.execute(
+            'INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
+            (operation_id, conversation_id, 'running', agent_id, time.time(), time.time(),
+             self.service.store.seal([])))
+        self.running.add(conversation_id)
+
+        def checkpoint():
+            nonlocal last_checkpoint
+            saved = list(captured or messages)
+            if partial_text and partial_message_index is not None and len(saved) <= partial_message_index:
+                saved.append(ModelResponse(parts=[TextPart(partial_text)]))
+            safe = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(saved)))
+            self.service.store.execute('UPDATE conversations SET messages=? WHERE id=?',
+                                       (self.service.store.seal(safe), conversation_id))
+            self.service.store.execute('UPDATE chat_runs SET events=?,tool=?,updated=? WHERE id=?',
+                                       (self.service.store.seal(events_log), active_tool, time.time(), operation_id))
+            last_checkpoint = time.monotonic()
 
         async def emit(event):
+            nonlocal active_tool
+            event = self.service.redact(event | {'operation_id': operation_id, 'agent_id': agent_id})
+            if event['type'] in {'tool_call', 'tool_result'}:
+                events_log.append(event)
+                active_tool = event['name'] if event['type'] == 'tool_call' else None
+            if event['type'] != 'text' or time.monotonic() - last_checkpoint > 1:
+                checkpoint()
             if on_event:
-                await on_event(self.service.redact(event))
+                try:
+                    await on_event(event)
+                except Exception as exc:
+                    # A disconnected browser cannot discard durable activity or stop tracking a mutation.
+                    diagnose(exc, operation_id=operation_id, agent_id=agent_id, tool=active_tool)
 
         async def stream(_context, events):
+            nonlocal partial_text, partial_message_index
             async for event in events:
                 if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                    partial_text, partial_message_index = event.part.content, len(captured)
                     await emit({'type': 'text', 'text': event.part.content})
                 elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                    partial_text += event.delta.content_delta
                     await emit({'type': 'text', 'text': event.delta.content_delta})
                 elif isinstance(event, FunctionToolCallEvent):
+                    partial_text = ''
+                    started[event.part.tool_call_id] = time.monotonic()
+                    args = self.service.redact(event.part.args_as_dict())
+                    targets[event.part.tool_call_id] = next((str(args[k])[:80] for k in
+                                                            ('command', 'name', 'vm_id', 'agent_id') if args.get(k)), '')
                     await emit({'type': 'tool_call', 'name': event.part.tool_name,
-                                'content': str(self.service.redact(event.part.args))[:65536]})
+                                'call_id': event.part.tool_call_id, 'target': targets[event.part.tool_call_id],
+                                'content': args})
                 elif isinstance(event, FunctionToolResultEvent) and event.part is not None:
+                    content = self.service.redact(event.part.content)
+                    count = len(content) if isinstance(content, list) else next(
+                        (len(v) for v in content.values() if isinstance(v, list)), None) if isinstance(content, dict) else None
+                    summary = (f'{count} results' if count is not None else
+                               'Operation failed' if isinstance(content, dict) and 'error' in content else 'Finished')
                     await emit({'type': 'tool_result', 'name': event.part.tool_name,
-                                'content': str(self.service.redact(event.part.content))[:65536]})
+                                'call_id': event.part.tool_call_id, 'target': targets.get(event.part.tool_call_id, ''),
+                                'summary': summary,
+                                'duration': round(time.monotonic() - started.get(event.part.tool_call_id,
+                                                                               time.monotonic()), 2),
+                                'failed': event.part.part_kind == 'retry-prompt' or isinstance(content, dict) and 'error' in content,
+                                'content': str(content)[:16384] if not isinstance(content, dict)
+                                else content if len(json.dumps(content, default=str)) <= 16384
+                                else {'summary': str(content)[:16384], 'truncated': True}})
 
-        messages = history + [ModelRequest(parts=[UserPromptPart(prompt)]),
-                              ModelResponse(parts=[TextPart('Execution interrupted; retry the task if needed.')])]
+        status = 'failed'
         try:
+            await emit({'type': 'run_started', 'conversation_id': conversation_id})
             async with self.slots, asyncio.timeout(360):
                 budget = {'remaining': 8, 'usage': RunUsage()}
                 agent = await self._agent(identity, agent_id, budget, 0, emit)
-                result = await agent.run(prompt, message_history=history, usage=budget['usage'],
-                                         event_stream_handler=stream,
-                                         usage_limits=UsageLimits(request_limit=20, tool_calls_limit=30))
-                messages = result.all_messages()
-                self.service.store.audit(identity['userid'], 'chat', agent_id)
-                return {'conversation_id': conversation_id, 'output': self.service.redact(result.output)}
-        except asyncio.CancelledError:
-            self.service.store.audit(identity['userid'], 'chat', agent_id, 'cancelled')
-            raise
-        except Exception:
-            self.service.store.audit(identity['userid'], 'chat', agent_id, 'failed')
-            raise ValueError('Agent execution failed; check provider settings, permissions and runtime limits') from None
+                with capture_run_messages() as captured:
+                    result = await agent.run(prompt, message_history=history, usage=budget['usage'],
+                                             event_stream_handler=stream,
+                                             usage_limits=UsageLimits(request_limit=20, tool_calls_limit=30))
+                    messages = result.all_messages()
+                pending = self.service.store.one(
+                    "SELECT id FROM provisioning WHERE parent_id=? AND phase<>'complete'", (agent_id,))
+                status = 'reconciliation' if pending else 'completed'
+                self.service.store.audit(identity['userid'], 'chat', operation_id)
+                return {'conversation_id': conversation_id, 'operation_id': operation_id,
+                        'status': status, 'output': self.service.redact(result.output)}
+        except (Exception, asyncio.CancelledError) as exc:
+            pending = self.service.store.one(
+                "SELECT id FROM provisioning WHERE parent_id=? AND phase<>'complete'", (agent_id,))
+            status = 'reconciliation' if pending else 'interrupted' if isinstance(exc, asyncio.CancelledError) else 'failed'
+            error = diagnose(exc, operation_id=operation_id, agent_id=agent_id, tool=active_tool,
+                             reconciliation=bool(pending))
+            self.service.store.execute('UPDATE chat_runs SET category=? WHERE id=?', (error.category, operation_id))
+            self.service.store.audit(identity['userid'], 'chat', operation_id, status)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise error from None
         finally:
-            safe_messages = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(messages)))
-            self.service.store.execute('UPDATE conversations SET messages=? WHERE id=?',
-                                       (self.service.store.seal(safe_messages), conversation_id))
-            self.running.discard(conversation_id)
+            try:
+                checkpoint()
+                self.service.store.execute('UPDATE chat_runs SET status=?,updated=? WHERE id=?',
+                                           (status, time.time(), operation_id))
+            finally:
+                self.running.discard(conversation_id)

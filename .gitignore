@@ -10,4 +10,4 @@ secrets/
 data/
 *.egg-info/
 dist/
-browser-results/
+browser-results*/

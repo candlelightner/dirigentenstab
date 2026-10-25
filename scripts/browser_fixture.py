@@ -34,13 +34,38 @@ PRIVATE_VALUES = ('fixture-runtime-api-DO-NOT-EXPOSE', 'fixture-runtime-secret-D
                   'fixture-provision-api-DO-NOT-EXPOSE', 'fixture-provision-secret-DO-NOT-EXPOSE',
                   'fixture-provider-key-DO-NOT-EXPOSE', 'fixture-VM-password-DO-NOT-EXPOSE')
 DOMAINS = [{'id': ROOT_DOMAIN, 'name': 'ROOT', 'path': 'ROOT', 'level': 0},
-           {'id': AGENT_DOMAIN, 'name': 'Research', 'path': 'ROOT/Research', 'parentdomainid': ROOT_DOMAIN}]
+           {'id': 'main-domain', 'name': 'Agents--ds-00000000000000000000', 'path': 'ROOT/Agents',
+            'parentdomainid': ROOT_DOMAIN, 'level': 1},
+           {'id': AGENT_DOMAIN, 'name': 'Research', 'path': 'ROOT/Agents/Research', 'parentdomainid': 'main-domain'}]
+for branch in range(12):
+    parent = AGENT_DOMAIN
+    for depth in range(4):
+        identifier = f'domain-{branch}-{depth}'
+        DOMAINS.append({'id': identifier, 'name': f'Team {branch} Level {depth}', 'parentdomainid': parent,
+                        'path': f'ROOT/Agents/Research/Team-{branch}/Level-{depth}'})
+        parent = identifier
 
 
 def fake_api(state):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
+
+        def do_GET(self):
+            if self.path == '/v1/models':
+                value, status = {'data': [{'id': 'fixture-model'}, {'id': 'second-model'}]}, 200
+            elif self.path == '/empty/models':
+                value, status = {'data': []}, 200
+            elif self.path == '/unauthorized/models':
+                value, status = {'error': 'private provider error'}, 401
+            else:
+                value, status = {}, 404
+            data = json.dumps(value).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_POST(self):
             params = {key: values[-1] for key, values in parse_qs(
@@ -103,7 +128,16 @@ class FixtureService(Service):
 
 async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
-    if any(part.part_kind == 'tool-return' for part in messages[-1].parts):
+    prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
+                   if part.part_kind == 'user-prompt'), '')
+    if 'markdown stress' in prompt:
+        yield ('## Infrastructure report\n\n**Ready** and *checked*. `inline` [CloudStack](https://cloudstack.apache.org)\n\n'
+               '> Bounded details\n\n1. First\n2. Second\n\n- Safe\n- Readable\n\n'
+               '```python\n' + 'print("long line") ' * 100 + '\n```\n\n'
+               '| Name | ' + ' | '.join(f'Column {n}' for n in range(20)) + ' |\n' +
+               '| --- ' * 21 + '|\n' + ('| example ' * 21 + '|\n') * 40 +
+               '\n<script>window.injected=true</script>\n<img src=x onerror="window.injected=true">')
+    elif any(part.part_kind == 'tool-return' for part in messages[-1].parts):
         yield 'Infrastructure '
         yield 'checked. The research VM is running.'
     else:
@@ -146,6 +180,19 @@ def main():
                    store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
                    store.seal({'apikey': PRIVATE_VALUES[2], 'secretkey': PRIVATE_VALUES[3]}), 'fixture', 'fixture-model'))
     api_port = fake_api(args.state_dir)
+    store.execute('UPDATE providers SET base_url=? WHERE id=?', (f'http://127.0.0.1:{api_port}/v1', 'fixture'))
+    for identifier, endpoint in [('unsupported', 'unsupported'), ('empty', 'empty'), ('unauthorized', 'unauthorized')]:
+        store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+                      (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
+                       store.seal(''), ''))
+    for identifier, domain, name in [('main', 'main-domain', 'Agents'), *[
+            (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,model) '
+                      'VALUES(?,?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
+                       store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
+                       store.seal({'apikey': PRIVATE_VALUES[2], 'secretkey': PRIVATE_VALUES[3]}), 'fixture', 'fixture-model'))
+    store.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
+                  ('main', 'Agents', 'fixture-model', '', 'complete', 0))
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master))
     service = FixtureService(store, settings)

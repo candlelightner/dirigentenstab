@@ -91,9 +91,15 @@ class Service:
         visible = {domain['id'] for domain in domains}
         agents = self.store.all('SELECT id,name,domain_id,account_id,user_id,provider_id,model,instructions,'
                                 'can_provision,enabled FROM agents')
-        agents = [a for a in agents if a['domain_id'] in visible]
+        main = self.store.one('SELECT id FROM provisioning WHERE parent_id IS NULL AND phase=?', ('complete',))
+        agents = [a | {'is_main': bool(main and a['id'] == main['id'])}
+                  for a in agents if a['domain_id'] in visible and a['enabled']]
         users = (await self.human_call(identity, 'listUsers', {'listall': 'true'})).get('user', [])
-        return {'domains': domains, 'agents': agents,
+        visible_agents = {a['id'] for a in agents}
+        pending = [op for op in self.store.all(
+            "SELECT id,parent_id,name,phase FROM provisioning WHERE phase<>'complete'")
+            if op['parent_id'] in visible_agents]
+        return {'domains': domains, 'agents': agents, 'pending_provisioning': pending,
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}
                           for user in users if user.get('domainid') in visible],
                 'status': 'CloudStack connected'}

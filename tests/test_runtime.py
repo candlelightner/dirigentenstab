@@ -122,7 +122,8 @@ async def test_failed_runtime_suppresses_provider_secrets_and_preserves_retryabl
     assert 'SUPERSECRET' not in str(error.value)
     conversation = (await manager.conversations({'userid': 'human'}, 'parent'))[0]
     restored = await manager.restore({'userid': 'human'}, conversation['id'])
-    assert 'Execution interrupted' in str(restored['messages'])
+    assert 'Hello' in str(restored['messages'])
+    assert restored['runs'][-1]['status'] == 'failed'
     assert not manager.running
 
 
@@ -168,3 +169,162 @@ async def test_provider_requires_actual_nonce_tool_invocation(service, monkeypat
                         FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart('reachable')])) )
     result = await runtime.test_provider(provider, 'local', service.store)
     assert result['reachable'] and not result['tool_calling']
+
+
+async def test_second_turn_after_redaction_and_legacy_usage_recovery(service, monkeypatch):
+    from dirigentenstab.cloud import redact
+    from pydantic_ai.usage import RequestUsage
+    service.redact = redact
+    calls = []
+
+    async def subgroup(agent_id, name, model, instructions):
+        calls.append((agent_id, name))
+        return {'id': 'sandbox', 'name': name}
+
+    service.create_subgroup = subgroup
+
+    def model(messages, info):
+        if any(p.part_kind == 'tool-return' for p in messages[-1].parts):
+            return ModelResponse(parts=[TextPart('Sandbox ready')], usage=RequestUsage(input_tokens=42, output_tokens=3))
+        if any(p.part_kind == 'user-prompt' and p.content == 'Create Sandbox' for p in messages[-1].parts):
+            return ModelResponse(parts=[ToolCallPart('create_subgroup', {'name': 'Sandbox'})])
+        return ModelResponse(parts=[TextPart('32 domains, 21 VMs')], usage=RequestUsage(input_tokens=100, output_tokens=8))
+
+    async def stream(messages, info):
+        response = model(messages, info)
+        for part in response.parts:
+            if isinstance(part, ToolCallPart):
+                yield {0: DeltaToolCall(name=part.tool_name, json_args=part.args_as_json_str(), tool_call_id=part.tool_call_id)}
+            elif isinstance(part, TextPart):
+                yield part.content
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=stream))
+    manager = runtime.Runtime(service)
+    first = await manager.chat({'userid': 'human'}, 'parent', None, 'Inventory')
+    restored = await manager.restore({'userid': 'human'}, first['conversation_id'])
+    ModelMessagesTypeAdapter.validate_python(restored['messages'])
+    assert type(restored['messages'][-1]['usage']['input_tokens']) is int
+    # Actual v0.1.2 persisted shape: every field containing "token" was replaced.
+    restored['messages'][-1]['usage']['input_tokens'] = '[redacted]'
+    restored['messages'][-1]['usage']['details'] = {'reasoning_tokens': '[redacted]'}
+    service.store.execute('UPDATE conversations SET messages=? WHERE id=?',
+                          (service.store.seal(restored['messages']), first['conversation_id']))
+    second = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Create Sandbox')
+    assert second['output'] == 'Sandbox ready'
+    assert calls == [('parent', 'Sandbox')]
+    assert not manager.running
+
+
+async def test_provider_failure_keeps_completed_tools_and_correlation(service, monkeypatch, caplog):
+    from pydantic_ai.exceptions import ModelHTTPError
+    def model(messages, info):
+        if any(p.part_kind == 'tool-return' for p in messages[-1].parts):
+            raise ModelHTTPError(503, 'fixture', {'private': 'SUPERSECRET private conversation'})
+        return ModelResponse(parts=[ToolCallPart('execute_api', {'command': 'listDomains', 'params': {}},
+                                               tool_call_id='call-1')])
+
+    async def stream(messages, info):
+        response = model(messages, info)
+        for part in response.parts:
+            if isinstance(part, ToolCallPart):
+                yield {0: DeltaToolCall(name=part.tool_name, json_args=part.args_as_json_str(), tool_call_id=part.tool_call_id)}
+            elif isinstance(part, TextPart):
+                yield part.content
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=stream))
+    manager = runtime.Runtime(service)
+    with pytest.raises(ValueError) as error:
+        await manager.chat({'userid': 'human'}, 'parent', None, 'private conversation')
+    restored = await manager.restore({'userid': 'human'}, (await manager.conversations({'userid': 'human'}, 'parent'))[0]['id'])
+    assert any(p['part_kind'] == 'tool-return' for m in restored['messages'] for p in m['parts'])
+    run = restored['runs'][-1]
+    assert run['status'] == 'failed' and run['category'] == 'model-provider'
+    assert [e['type'] for e in run['events']] == ['tool_call', 'tool_result']
+    assert run['events'][0]['call_id'] == run['events'][1]['call_id'] == 'call-1'
+    assert error.value.operation_id == run['id']
+    assert 'Traceback' in caplog.text and run['id'] in caplog.text
+    assert 'SUPERSECRET' not in caplog.text + str(error.value)
+    assert 'private conversation' not in caplog.text
+
+
+async def test_disconnected_browser_does_not_lose_tracked_operation(service, monkeypatch):
+    async def stream(messages, info):
+        yield 'Done'
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=stream))
+    manager = runtime.Runtime(service)
+
+    async def disconnected(event):
+        raise ConnectionError('private socket credential')
+
+    result = await manager.chat({'userid': 'human'}, 'parent', None, 'inspect', disconnected)
+    restored = await manager.restore({'userid': 'human'}, result['conversation_id'])
+    assert restored['runs'][-1]['status'] == 'completed'
+
+
+def test_only_numeric_usage_counters_bypass_secret_redaction():
+    from dirigentenstab.cloud import redact
+    value = redact({'input_tokens': 12, 'output_tokens': 0, 'access_token': 1234,
+                    'nested': {'input_tokens': 'private-token', 'token': 'private'}})
+    assert value['input_tokens'] == 12 and value['output_tokens'] == 0
+    assert value['access_token'] == value['nested']['input_tokens'] == value['nested']['token'] == '[redacted]'
+
+
+@pytest.mark.parametrize('status,body,expected', [
+    (200, {'data': [{'id': 'first'}, {'id': 'second'}, {'invalid': 'missing'}]}, ['first', 'second']),
+    (200, {'data': []}, []), (404, {}, None), (401, {'error': 'private credentials'}, None),
+    (200, {'invalid': []}, None),
+])
+async def test_model_discovery_server_side_and_bounded(service, monkeypatch, status, body, expected):
+    import httpx
+    real_client = httpx.AsyncClient
+    observed = []
+
+    def handle(request):
+        observed.append(request)
+        return httpx.Response(status, json=body)
+
+    monkeypatch.setattr(runtime.httpx, 'AsyncClient', lambda **kwargs:
+                        real_client(**kwargs, transport=httpx.MockTransport(handle)))
+    provider = service.store.one('SELECT * FROM providers WHERE id=?', ('provider',))
+    if expected is None:
+        with pytest.raises((httpx.HTTPStatusError, ValueError)):
+            await runtime.provider_models(provider, service.store)
+    else:
+        assert await runtime.provider_models(provider, service.store) == expected
+    assert str(observed[0].url) == 'http://inference/v1/models'
+    assert observed[0].headers['Authorization'] == 'Bearer provider-secret'
+
+
+@pytest.mark.parametrize('code,category,description', [
+    (401, 'authentication', 'API key'), (403, 'authentication', 'account access'),
+    (404, 'model-provider', 'Model ID'), (429, 'model-provider', 'quota'),
+    (503, 'model-provider', 'unavailable'), (400, 'model-provider', 'compatibility'),
+])
+def test_specific_provider_errors_never_expose_payload(code, category, description, caplog):
+    from dirigentenstab.diagnostics import diagnose
+    from pydantic_ai.exceptions import ModelHTTPError
+    error = diagnose(ModelHTTPError(code, 'private model', {'error': 'secret private conversation'}),
+                     operation_id='operation', agent_id='agent', tool='execute_api')
+    assert error.category == category and description in str(error)
+    assert 'private' not in str(error) + caplog.text and 'secret' not in str(error) + caplog.text
+    assert 'agent=agent tool=execute_api' in caplog.text
+
+
+async def test_partial_stream_and_interruption_survive_reload(service, monkeypatch):
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    async def stream(messages, info):
+        yield 'Work completed before the connection failed.'
+        raise ModelHTTPError(503, 'fixture', {})
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=stream))
+    manager = runtime.Runtime(service)
+    with pytest.raises(ValueError):
+        await manager.chat({'userid': 'human'}, 'parent', None, 'inspect')
+    conversation = (await manager.conversations({'userid': 'human'}, 'parent'))[0]
+    restored = await manager.restore({'userid': 'human'}, conversation['id'])
+    assert 'Work completed before the connection failed.' in str(restored['messages'])
+    assert restored['runs'][-1]['status'] == 'failed'
+    service.store.execute("UPDATE chat_runs SET status='running'")
+    restarted = runtime.Runtime(service)
+    assert (await restarted.restore({'userid': 'human'}, conversation['id']))['runs'][-1]['status'] == 'interrupted'
