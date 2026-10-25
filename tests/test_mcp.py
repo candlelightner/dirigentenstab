@@ -17,9 +17,9 @@ def environment(tmp_path):
     store = Store(str(tmp_path / 'state.db'), str(key))
     for agent_id, domain_id in [(APP_ROOT_AGENT, 'main'), ('middle-agent', 'middle'),
                                 ('leaf-agent', 'leaf'), ('other-agent', 'other')]:
-        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) '
-                      'VALUES(?,?,?,?,?,?,?)',
-                      (agent_id, agent_id, domain_id, 'account', 'user', store.seal({}), store.seal({})))
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) '
+                      'VALUES(?,?,?,?,?,?)',
+                      (agent_id, agent_id, domain_id, 'account', 'user', store.seal({})))
     domains = {
         'main': {'id': 'main', 'level': 1, 'parentdomainid': 'native-root'},
         'middle': {'id': 'middle', 'level': 2, 'parentdomainid': 'main'},
@@ -200,13 +200,21 @@ async def test_empty_registry_does_not_require_hierarchy_reader(environment):
 
 def test_migration_preserves_existing_agents(environment):
     e = environment
+    original = {row['id']: row['credentials'] for row in e.store.all('SELECT id,credentials FROM agents')}
+    old_provisioning = e.store.seal({'id': 'legacy-provisioning-key'})
     e.store.execute('DROP TABLE mcp_assignments')
     e.store.execute('DROP TABLE mcp_servers')
+    e.store.execute('DROP TABLE legacy_agent_credentials')
+    e.store.execute('ALTER TABLE agents RENAME COLUMN credentials TO runtime')
+    e.store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB')
+    e.store.execute('UPDATE agents SET provisioning=?', (old_provisioning,))
     e.store.execute('PRAGMA user_version=10')
     store = Store(str(e.store.path), str(e.key))
-    assert len(store.all('SELECT id FROM agents')) == 4
+    assert {row['id']: row['credentials'] for row in store.all('SELECT id,credentials FROM agents')} == original
+    assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
+    assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 11
+    assert store.one('PRAGMA user_version')['user_version'] == 12
 
 
 @pytest.mark.parametrize('url', ['https://mcp.tavily.com/mcp', 'https://mcp.tavily.com/mcp/'])

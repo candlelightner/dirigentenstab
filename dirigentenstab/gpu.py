@@ -50,7 +50,7 @@ def narrows(policy, parent):
 async def helper_call(settings, action, **payload):
     path = getattr(settings, 'gpu_helper_socket', '')
     if not path:
-        raise PermissionError('GPU operations require the platform GPU controller and an explicit domain policy')
+        raise PermissionError('Host GPU preparation requires the platform GPU controller and an explicit operator policy')
     request = {'action': action, **payload}
     data = json.dumps(request).encode() + b'\n'
     if len(data) > 65536:

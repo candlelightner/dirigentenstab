@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit real web-UI 3x8Q -> 1x24Q allocation test; no driver installation/workload."""
+"""Explicit native web-UI allocation test; hardware pool preparation is a human operator step."""
 import argparse
 import asyncio
 import json
@@ -67,7 +67,7 @@ async def cleanup(cloud, state, *, domain_id, account):
 
 
 async def platform_cleanup(app, state):
-    # Expunge stays an explicit root-operator action; never widen the agent's runtime role for cleanup.
+    # Explicit --cleanup uses protected operator credentials for these exact verified test VMs only.
     path = Path('/var/lib/dirigentenstab/setup/cloudstack-admin.json')
     if (await asyncio.to_thread(path.stat)).st_mode & 0o077:
         raise PermissionError('Platform maintenance credentials must be root-private')
@@ -137,7 +137,8 @@ async def acceptance(options):
                 await page.get_by_role('option', name=title, exact=True).click()
             else:
                 prompt = (state['prefix']+'. Allocation test only; no driver installation, GPU workload or template creation. '
-                    'Do not modify pre-existing VMs. Create exactly three new disposable VMs with displaynames beginning '
+                    'Do not modify pre-existing VMs. Set execute_api managed=true for each deployment to enroll managed SSH. '
+                    'Create exactly three new disposable VMs with displaynames beginning '
                     f"'{state['prefix']}-8Q-', zoneid={config['zone_id']}, templateid={config['template_id']}, "
                     f"serviceofferingid={config['offering8']}, startvm=true. Verify all THREE Running together with "
                     'listVirtualMachines ids as a comma-separated string. Then stop only those three, change EACH '
@@ -146,8 +147,9 @@ async def acceptance(options):
                     f"'{state['prefix']}-24Q', same zone/template, serviceofferingid={config['offering24']}, startvm=true. "
                     'Verify it Running using listVirtualMachines, then stop it and change it to the CPU offering. '
                     'Finish with those four VMs Stopped on CPU offerings. Reuse IDs and completed results, avoid '
-                    'discovery loops, never replace an uncertain dispatch. Backend performs only policy-authorized '
-                    'owned-pool transitions. Report references on failure.')
+                    'discovery loops, never replace an uncertain dispatch. Host mdev pools are prepared separately by '
+                    'a human operator; never request privileged fallback for a native API denial. If the required '
+                    'profile capacity is unavailable, stop and report the operator preparation needed.')
                 state['phase'] = 'submitted'
                 save(state)
                 await page.get_by_label('Message', exact=True).fill(prompt)

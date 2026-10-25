@@ -11,7 +11,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 from admin import service
-from dirigentenstab.cloud import CloudError, runtime_api
+from dirigentenstab.cloud import CloudError
 
 
 async def perform(options):
@@ -114,20 +114,16 @@ async def perform(options):
         except CloudError as exc:
             assert re.search(r'CloudStack (?:HTTP|error) (?:401|403|531):', str(exc)), 'Unexpected CloudStack failure'
         receipt['unrelated_read_denied'] = True
-        parent_cloud = await app.cloud_client(main, 'provisioning')
+        parent_cloud = await app.cloud_client(main)
         accounts = (await parent_cloud.raw('listAccounts', {'id': child['account_id'], 'listall': True})).get('account', [])
         assert len(accounts) == 1 and accounts[0]['accounttype'] == 2 and accounts[0]['domainid'] == child['domain_id']
         keys = (await parent_cloud.raw('listUserKeys', {'userid': child['user_id']})).get('userapikey', [])
-        assert len([k for k in keys if k['name'].startswith('ds-' + child['id'] + '-')]) == 2
-        runtime_key = app.store.open(child['runtime'])
-        rules = (await parent_cloud.raw('listUserKeyRules', {'keypairid': runtime_key['id']})).get('keypermission', [])
-        allowed = {rule['rule'] for rule in rules if rule['permission'] == 'allow'}
-        assert allowed and allowed == set(await child_cloud.catalogue())
-        assert all(runtime_api(name) for name in allowed)
-        assert all(rule['permission'] == 'allow' for rule in rules)
-        assert not {'registerUserKeys', 'listUserKeys', 'deleteUserKeys'} & allowed
-        receipt.update(unrelated_admin_denied=True, runtime_key_rules=len(rules),
-                       isolation_evidence='CloudStack domain-access rejection plus authoritative restricted key rules')
+        credential = app.store.open(child['credentials'])
+        assert len(keys) == 1 and keys[0]['id'] == credential['id']
+        catalogue = await child_cloud.catalogue(refresh=True)
+        assert catalogue and 'listDomains' in catalogue
+        receipt.update(single_native_key_verified=True, native_api_count=len(catalogue),
+                       isolation_evidence='CloudStack domain-access rejection with the agent account identity')
         await page.get_by_label('Chat directly with an agent', exact=True).fill('Sandbox')
         await page.get_by_role('option', name='Sandbox', exact=True).click()
         await page.get_by_text('Sandbox', exact=True).last.wait_for()

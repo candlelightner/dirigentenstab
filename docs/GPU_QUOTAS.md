@@ -1,9 +1,9 @@
 # GPU quotas and compute offerings
 
 CloudStack owns GPU devices, passthrough, vGPU profiles and resource accounting.
-Dirigentenstab agents are Domain Administrators and operate with their own
-restricted runtime keys. They cannot create GPU devices, bind PCI devices, alter
-host drivers or create compute offerings through generic tools.
+Each Dirigentenstab agent uses its own account's single API key pair. Native
+CloudStack account, domain and role permissions decide which APIs it can call;
+there is no application API allow/deny list or privileged fallback.
 
 GPU resource type is **16** in the pinned
 [CloudStack 4.23 resource enumeration](https://github.com/apache/cloudstack/blob/4.23.0.0/api/src/main/java/com/cloud/configuration/Resource.java).
@@ -20,22 +20,19 @@ agent belongs to the separate `/Agents` domain, whose limits can be set to zero.
 Native system/root administrator accounts bypass resource limits; no managed
 agent receives one of those account types.
 
-Before deploy, start, scale, restore or recover, the backend verifies the actual
-compute offering using the calling agent's identity. Domain-restricted offerings
-must cover the VM owner's domain. For GPU operations it reads the current
-CloudStack parent chain and GPU usage through the application's root agent's
-read-only runtime APIs. This trusted check does not execute VM operations with a
-parent identity, expose credentials to a model, or maintain a local mutable
-hierarchy. Missing ancestor information fails closed. Every ancestor GPU limit
-of zero blocks GPU operations, including restarting an already counted VM.
+Every generic VM and offering operation uses the calling agent account's one API
+key pair. CloudStack authorizes the command and enforces offering visibility,
+account/domain limits and reservations. Dirigentenstab does not add a GPU API
+policy, query parent credentials to widen access, or route a rejected request
+through the privileged host controller. Native-authorized `createServiceOffering`
+and `updateServiceOffering` remain available like any other discovered API.
 
-CloudStack remains the final atomic quota authority. The backend preflight is
-not a replacement for its reservations, account limits or aggregate counters.
-Use modern offerings with a vGPU profile and a positive native `gpucount`.
-Legacy `pciDevice`/`vgpuType` offerings without a native count are rejected because
-[native GPU reservations depend on that count](https://github.com/apache/cloudstack/blob/4.23.0.0/server/src/main/java/com/cloud/vm/UserVmManagerImpl.java).
-Stopped VMs normally retain their GPUs and count toward limits; CloudStack's
-`gpu.detach.on.stop` setting changes that behavior.
+Use modern offerings with a vGPU profile and positive native `gpucount` for native
+GPU accounting. Stopped VMs normally retain their GPUs and count toward limits;
+CloudStack's `gpu.detach.on.stop` setting changes that behavior. Physical mdev
+creation and safe pool transitions are separate human-operated host preparation,
+subject to real profile capacity, explicit device ownership and libvirt attachment
+checks. Those host controls do not grant or remove the agent's CloudStack APIs.
 
 ## Real acceptance test
 
@@ -49,8 +46,8 @@ The test creates owned, tracked administrative domains and compute-offering
 metadata beneath the application root. It sets a parent GPU quota to zero and
 both a child and grandchild to unlimited. It uses a real discovered GPU profile,
 requires the native deployment error to identify a GPU quota violation, and
-checks that an offering restricted to a sibling domain is unavailable. It also
-checks the application's ancestor guard independently.
+checks that an offering restricted to a sibling domain is unavailable. These
+assertions exercise CloudStack directly with the leaf agent's credentials.
 
 Every attempted test deployment sets `startvm=false`. No GPU assignment, PCI
 binding, existing VM shutdown or driver reconfiguration occurs. A failure that
@@ -65,8 +62,8 @@ The deliberately denied GPU quotas remain on the owned test domains; other
 domains' limits remain unchanged. These tests establish quota and authorization
 behavior, not successful CUDA/vGPU workloads or licensing compatibility.
 
-The real CloudStack 4.23.0.0 acceptance run passed with a discovered Tesla P40
+The historical CloudStack 4.23.0.0 acceptance run passed with a discovered Tesla P40
 passthrough profile and local-storage GPU offerings. Native CloudMonkey calls
 returned HTTP 535 for the ancestor GPU quota of zero and HTTP 531 for the
-sibling-only offering. The backend independently rejected both requests. No VM
-was created by these denied requests and no GPU assignment was attempted.
+sibling-only offering. That release also had a backend preflight, since removed so native permissions
+remain the sole authority. No VM was created by these denied requests and no GPU assignment was attempted.

@@ -80,10 +80,10 @@ def service(tmp_path):
     store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key) VALUES(?,?,?,?,?)',
                   ('provider', 'Local', 'chat', 'http://inference/v1', store.seal('provider-secret')))
     for name in ('parent', 'child', 'other'):
-        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,'
-                      'provider_id,model) VALUES(?,?,?,?,?,?,?,?,?)',
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,'
+                      'provider_id,model) VALUES(?,?,?,?,?,?,?,?)',
                       (name, name, name + '-domain', name + '-account', name + '-user',
-                       store.seal({'apikey': name + '-secret'}), store.seal({}), 'provider', name))
+                       store.seal({'apikey': name + '-secret'}), 'provider', name))
 
     class Service:
         settings = SimpleNamespace(workspace=str(tmp_path / 'transfers'), max_output=1024,
@@ -687,12 +687,16 @@ async def test_recovered_private_template_continues_the_same_owned_task(service,
     assert dispatched == ['createTemplate']
 
 
-async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_replay(service, monkeypatch):
+@pytest.mark.parametrize('managed', [False, True])
+async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_replay(service, monkeypatch, managed):
     from dirigentenstab.diagnostics import OperationError
     from dirigentenstab.gpu import operation_id
     args = {'command': 'deployVirtualMachine', 'params': {'templateid': 'base', 'serviceofferingid': 'gpu'}}
+    if managed:
+        args['managed'] = True
     calls = []
-    async def execute(*values):
+    async def execute(*values, **options):
+        assert options == ({'managed': True} if managed else {})
         calls.append(values)
         raise OperationError('gpu', 'Saved host operation requires reconciliation', 'reference', reconciliation=True)
     service.execute = execute

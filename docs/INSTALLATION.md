@@ -39,7 +39,7 @@ CloudStack 4.23 performs an upstream whole-filesystem VMware VDDK library search
 
 ## Existing CloudStack
 
-Configure the private `CLOUDSTACK_URL`, HTTPS `PUBLIC_ORIGIN` and a root-private JSON credential file containing `apikey` and `secretkey`. Set `CLOUDSTACK_BOOTSTRAP_CREDENTIALS_FILE` to its path and restrict it to mode 0600. The API identity must be authorized to create the top-level Agents domain and restricted administrative key pairs.
+Configure the private `CLOUDSTACK_URL`, HTTPS `PUBLIC_ORIGIN` and a root-private JSON credential file containing `apikey` and `secretkey`. Set `CLOUDSTACK_BOOTSTRAP_CREDENTIALS_FILE` to its path and restrict it to mode 0600. The API identity must be authorized to create the top-level Agents domain and issue one API key pair for its managed account without extra per-key rules.
 
 ```sh
 sudo ./setup.sh --install --existing

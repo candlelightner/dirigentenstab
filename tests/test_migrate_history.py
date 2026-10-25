@@ -24,9 +24,9 @@ def configured(tmp_path):
     key.write_bytes(Fernet.generate_key() + b'\n')
     key.chmod(0o600)
     store = Store(str(tmp_path / 'app.db'), str(key))
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) '
-                  'VALUES(?,?,?,?,?,?,?)', ('target', 'Target', 'domain', 'account', 'user',
-                                           store.seal({}), store.seal({})))
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) '
+                  'VALUES(?,?,?,?,?,?)', ('target', 'Target', 'domain', 'account', 'user',
+                                           store.seal({})))
     root = tmp_path / 'legacy-agents'
     history = root / '.codex/sessions/2026/01'
     history.mkdir(parents=True)

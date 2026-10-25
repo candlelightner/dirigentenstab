@@ -20,44 +20,12 @@ class CloudError(RuntimeError):
         self.operation_id = operation_id
 
 
-PROVISION_APIS = frozenset('''
-listApis listDomains listAccounts listUsers listRoles createDomain createAccount
-registerUserKeys listUserKeys listUserKeyRules deleteUserKeys listCapabilities
-'''.split())
-FORBIDDEN_PARAMS = frozenset('''
-extraconfig cleanupextraconfig details hypervisor hostid hostids hosttags
-path mountpoint filesystem command apikey secretkey signature signatureversion
-sessionkey response filter exclude filepath externaldetails externalid importsource
-'''.split())
+AUTH_PARAMS = frozenset({'apikey', 'secretkey', 'signature', 'signatureversion', 'sessionkey',
+                         'command', 'response'})
 SENSITIVE_FIELD = re.compile(r'(?i)(password|secret|private.?key|api.?key|sessionkey|cookie|token|userdata)')
 TOKEN_COUNT = re.compile(r'^(?:input|output|cache_write|cache_read|input_audio|cache_audio_read|output_audio|prompt_cache_hit|prompt_cache_miss|reasoning)_tokens$')
 NAME = re.compile(r'^[a-z][a-zA-Z0-9]{1,80}$')
 PARAM_NAME = re.compile(r'^[a-z][a-z0-9]*(?:\[\d{1,3}\]\.[a-z][a-z0-9]*)?$')
-
-# These expose credentials or bypass the scoped host helper; infrastructure grants come only from CloudStack.
-PRIVATE_CONTROL_APIS = frozenset('''
-login logout getUserKeys registerUserKeys listUserKeys listUserKeyRules deleteUserKeys
-createRole updateRole deleteRole enableRole disableRole importRole
-createRolePermission updateRolePermission deleteRolePermission
-createProjectRole updateProjectRole deleteProjectRole
-createProjectRolePermission updateProjectRolePermission deleteProjectRolePermission
-getVMPassword getKubernetesClusterConfig getVirtualMachineUserData createConsoleEndpoint listConsoleSessions
-addHost addBaremetalHost updateHost updateHostPassword deleteHost reconnectHost
-prepareHostForMaintenance cancelHostMaintenance declareHostAsDegraded cancelHostAsDegraded
-configureHAForHost enableHAForHost disableHAForHost releaseHostReservation
-enableOutOfBandManagementForHost disableOutOfBandManagementForHost changeOutOfBandManagementPassword
-createStoragePool updateStoragePool deleteStoragePool changeStoragePoolScope syncStoragePool
-addImageStore addImageStoreS3 updateImageStore deleteImageStore addSecondaryStorage
-updateConfiguration resetConfiguration addLdapConfiguration deleteLdapConfiguration ldapConfig
-issueCertificate provisionCertificate revokeCertificate uploadCustomCertificate
-provisionTemplateDirectDownloadCertificate revokeTemplateDirectDownloadCertificate uploadTemplateDirectDownloadCertificate
-discoverGpuDevices createGpuDevice deleteGpuDevice manageGpuDevice unmanageGpuDevice
-'''.split())
-
-
-def runtime_api(command):
-    return isinstance(command, str) and bool(NAME.fullmatch(command)) and command not in PRIVATE_CONTROL_APIS
-
 
 def redact(value, secrets=()):
     if isinstance(value, dict):
@@ -75,10 +43,10 @@ def redact(value, secrets=()):
     return value
 
 
-def validate(metadata: dict, params: dict, *, runtime=True):
+def validate(metadata: dict | None, params: dict):
     if not isinstance(params, dict) or len(params) > 128:
         raise ValueError('Parameters must be an object with at most 128 entries')
-    specifications = {p['name']: p for p in metadata.get('params', [])}
+    specifications = {p['name']: p for p in (metadata or {}).get('params', [])}
     provided = {key.split('[')[0] for key in params if isinstance(key, str)}
     for spec in specifications.values():
         if spec.get('required') and spec['name'] not in provided:
@@ -87,12 +55,14 @@ def validate(metadata: dict, params: dict, *, runtime=True):
         if not isinstance(key, str) or not PARAM_NAME.fullmatch(key):
             raise ValueError('Invalid parameter name')
         base = key.split('[')[0]
-        if base not in specifications or (runtime and base in FORBIDDEN_PARAMS):
-            raise ValueError(f'Parameter not permitted: {base}')
-        spec = specifications[base]
+        if base in AUTH_PARAMS:
+            raise ValueError('CloudStack authentication is selected by the server')
+        if metadata is not None and base not in specifications:
+            raise ValueError(f'Unknown CloudStack parameter: {base}')
+        spec = specifications.get(base, {})
         kind = spec.get('type', 'string').lower()
         nested = '[' in key
-        if nested and kind not in {'map', 'object'}:
+        if metadata is not None and nested and kind not in {'map', 'object'}:
             raise ValueError(f'Parameter is not a map: {base}')
         if value is None or isinstance(value, (dict, list)):
             raise ValueError('Use scalar values, comma-separated lists, or indexed map parameters')
@@ -111,8 +81,7 @@ def validate(metadata: dict, params: dict, *, runtime=True):
         # CloudMonkey interprets @file and quoted @file as local file reads, even without a shell.
         if text.lstrip('"').startswith('@') or '\x00' in text or len(text) > 65536:
             raise ValueError('File references, NULs and oversized values are forbidden')
-        if runtime and isinstance(value, str) and value.lower().startswith(('file:', 'host:', 'dir:', 'sharedmountpoint:')):
-            raise ValueError('Host filesystem references are platform-administrator only')
+        # Other paths/URLs are literal remote API values; CloudStack authorizes their use.
 
 
 class Cloud:
@@ -128,6 +97,7 @@ class Cloud:
     async def _process(self, directory, args, max_bytes):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('CMK_', 'OPENAI_', 'CLOUDSTACK_'))}
+        env['HOME'] = str(directory)
         env['CMK_CONFIG'] = str(Path(directory) / 'config')
         proc = await asyncio.create_subprocess_exec(
             self.settings.cmk, *args, env=env, stdin=asyncio.subprocess.DEVNULL,
@@ -190,12 +160,18 @@ class Cloud:
                     await proc.communicate()
 
     async def raw(self, command, params=None):
-        if not NAME.fullmatch(command):
+        if not isinstance(command, str) or not NAME.fullmatch(command):
             raise ValueError('Invalid CloudStack command')
+        if command.lower() in {'help', 'version', 'switch', 'set', 'sync', 'exit'}:
+            raise ValueError('CloudMonkey local commands are not CloudStack APIs')
         args = []
         for key, value in (params or {}).items():
-            if not PARAM_NAME.fullmatch(key):
+            if not isinstance(key, str) or not PARAM_NAME.fullmatch(key):
                 raise ValueError('Invalid parameter')
+            if key in AUTH_PARAMS:
+                raise ValueError('CloudStack authentication is selected by the server')
+            if key == 'filepath':
+                raise ValueError('CloudMonkey local file uploads are forbidden')
             text = str(value).lower() if isinstance(value, bool) else str(value)
             if text.lstrip('"').startswith('@') or '\x00' in text:
                 raise ValueError('Local file inputs are forbidden')
@@ -208,14 +184,22 @@ class Cloud:
             if not isinstance(val, str) or any(c in val for c in '\r\n'):
                 raise ValueError('Invalid credential record')
         config[self.profile] = {'url': self.settings.cloudstack_url, 'username': '', 'password': '',
-                                **self.credentials, 'signaturealgorithm': 'auto'}
+                                **self.credentials, 'signaturealgorithm': 'HmacSHA1'}
         async with self._limit:
             with tempfile.TemporaryDirectory(prefix='ds-cmk-', dir='/dev/shm') as directory:
                 path = Path(directory) / 'config'
                 with open(path, 'w', opener=lambda p, f: os.open(p, f, 0o600)) as handle:  # noqa: ASYNC230 -- tmpfs only
                     config.write(handle)
-                # cmk sync populates its maintained catalogue; never invoke its interactive shell.
-                await self._process(directory, ['sync'], 8192)
+                cache_home = Path(directory) / '.cmk'
+                cache_home.mkdir(mode=0o700)
+                profiles = cache_home / 'profiles'
+                profiles.mkdir(mode=0o700)
+                descriptor = {'api': [{'name': command, 'isasync': False, 'description': '',
+                                       'params': [], 'response': []}]}
+                # Seed syntax only: native CloudStack, never CMK discovery, authorizes this request.
+                cache = profiles / (self.profile + '.cache')
+                with open(cache, 'w', opener=lambda p, f: os.open(p, f, 0o600)) as handle:  # noqa: ASYNC230 -- tmpfs only
+                    json.dump(descriptor, handle)
                 limit = 16 * 1024 * 1024 if command == 'listApis' else 4 * 1024 * 1024
                 data = await self._process(directory, [command, *args], limit)
         try:
@@ -240,16 +224,20 @@ class Cloud:
                 self._metadata_time = time.monotonic()
         return self._metadata
 
-    async def execute(self, command, params, *, runtime=True):
-        if runtime and not runtime_api(command) or not runtime and command not in PROVISION_APIS:
-            raise PermissionError('Credential and host controls require the trusted server-side workflow')
+    async def execute(self, command, params):
+        if not isinstance(command, str) or not NAME.fullmatch(command):
+            raise ValueError('Invalid CloudStack command')
+        if command.lower() in {'help', 'version', 'switch', 'set', 'sync', 'exit'}:
+            raise ValueError('CloudMonkey local commands are not CloudStack APIs')
         cached = self._metadata is not None and time.monotonic() - self._metadata_time <= 300
-        metadata = (await self.catalogue()).get(command)
-        if not metadata and cached:
-            metadata = (await self.catalogue(refresh=True)).get(command)
-        if not metadata:
-            raise PermissionError('API unavailable to this CloudStack identity and API key')
-        validate(metadata, params, runtime=runtime)
+        try:
+            metadata = (await self.catalogue()).get(command)
+            if not metadata and cached:
+                metadata = (await self.catalogue(refresh=True)).get(command)
+        except CloudError:
+            metadata = None
+        # Discovery validates inputs, never authorization: send the caller's signed request.
+        validate(metadata, params)
         try:
             result = await self.raw(command, params)
         except CloudError as exc:
@@ -260,7 +248,11 @@ class Cloud:
             job_id = result['jobid']
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
-                job = await self.raw('queryAsyncJobResult', {'jobid': job_id})
+                try:
+                    job = await self.raw('queryAsyncJobResult', {'jobid': job_id})
+                except CloudError:
+                    raise CloudError(f'CloudStack job status unavailable; job ID {job_id}. '
+                                     'Check status before retrying') from None
                 if job.get('jobstatus') == 1:
                     return job.get('jobresult', {})
                 if job.get('jobstatus') == 2:

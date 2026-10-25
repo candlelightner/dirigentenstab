@@ -425,3 +425,68 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await page.screenshot(path=str(state / 'mcp-settings.png'), full_page=True)
         assert not errors
         await browser.close()
+
+
+async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    store.execute("UPDATE agents SET can_provision=1 WHERE id='research'")
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        selector = page.get_by_label('Chat directly with an agent', exact=True)
+        details = page.locator('.agent-details')
+        header = details.locator('.q-expansion-item__container > .q-item').first
+        configure = details.get_by_role('button', name='Configure', exact=True)
+        subgroup = details.get_by_role('button', name='Create subgroup', exact=True)
+        for width, height in [(1440, 900), (390, 844)]:
+            await page.set_viewport_size({'width': width, 'height': height})
+            await selector.fill('Research')
+            await page.get_by_role('option', name='Research Admin', exact=True).click()
+            await configure.wait_for()
+            await subgroup.wait_for()
+            await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for()
+            assert await header.get_attribute('aria-expanded') == 'true'
+            await details.get_by_text('Domain details', exact=True).click()
+            account = details.get_by_text('Administrator account: research-account', exact=True)
+            await account.wait_for()
+            expanded_height = (await details.bounding_box())['height']
+            await header.click()
+            await configure.wait_for(state='hidden')
+            await subgroup.wait_for(state='hidden')
+            await account.wait_for(state='hidden')
+            await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for(state='hidden')
+            await details.get_by_text('Domain details', exact=True).wait_for(state='hidden')
+            assert await header.get_attribute('aria-expanded') == 'false'
+            assert await header.get_by_text('Research Admin', exact=True).is_visible()
+            assert await header.get_by_text('Domain administrator', exact=True).is_visible()
+            assert (await details.bounding_box())['height'] < expanded_height
+            assert await details.get_by_role('button').count() == 1
+            await header.focus()
+            await header.press('Enter')
+            await configure.wait_for()
+            await account.wait_for()
+            await configure.click()
+            await page.get_by_label('System prompt', exact=True).wait_for()
+            await page.get_by_role('button', name='Cancel', exact=True).click()
+            await page.get_by_role('dialog').wait_for(state='hidden')
+            assert await header.get_attribute('aria-expanded') == 'true'
+            await subgroup.click()
+            await page.get_by_text('Create subgroup under Research Admin', exact=True).wait_for()
+            await page.get_by_role('button', name='Cancel', exact=True).click()
+            await page.get_by_role('dialog').wait_for(state='hidden')
+            assert await header.get_attribute('aria-expanded') == 'true'
+            await header.focus()
+            await header.press('Space')
+            await configure.wait_for(state='hidden')
+            await page.screenshot(path=str(state / f'agent-details-collapsed-{width}.png'), full_page=True)
+            await selector.fill('Main Agent')
+            await page.get_by_role('option', name='Main Agent', exact=True).click()
+            await configure.wait_for()
+            assert await header.get_attribute('aria-expanded') == 'true'
+            assert await header.get_by_text('Main Agent', exact=True).is_visible()
+            assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await browser.close()

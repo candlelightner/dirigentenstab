@@ -142,8 +142,8 @@ async def controller(tmp_path):
     store = Store(str(tmp_path / 'app.db'), str(key))
     agents = {APP_ROOT_AGENT: MAIN, 'child': CHILD, 'other': OTHER}
     for aid, domain in agents.items():
-        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) VALUES(?,?,?,?,?,?,?)',
-                      (aid, aid, domain, domain+'-account', aid+'-user', store.seal({}), store.seal({})))
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                      (aid, aid, domain, domain+'-account', aid+'-user', store.seal({})))
         store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                       ('conversation-'+aid, aid, 'human', 'GPU task', 1, store.seal([])))
         store.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
@@ -170,7 +170,8 @@ async def controller(tmp_path):
             return value
         async def recover_deployments(self, operation_id=None):
             return
-        async def execute(self, aid, command, params):
+        async def execute(self, aid, command, params, *, managed=False):
+            assert managed == (command == 'deployVirtualMachine')
             await asyncio.sleep(.01)
             if command == 'deployVirtualMachine':
                 agent = await self.agent(aid)
@@ -212,7 +213,7 @@ async def controller(tmp_path):
 def request(call, command='deployVirtualMachine', agent=APP_ROOT_AGENT, **params):
     if command == 'deployVirtualMachine':
         params = {'templateid': 'base', 'serviceofferingid': 'o8', 'zoneid': 'zone', **params}
-    return {'action': 'execute', 'agent_id': agent, 'command': command, 'params': params,
+    return {'action': 'execute', 'session': 'human-session', 'agent_id': agent, 'command': command, 'params': params,
             'context': {'run_id': 'run-'+agent, 'call_id': call}}
 
 
@@ -297,6 +298,19 @@ async def test_stale_cloudstack_free_state_never_reuses_an_attached_device(contr
         await controller.dispatch(request('second'), 10001)
     assert controller.host.calls == before
     assert list(controller.cloud.vms) == [result['virtualmachine']['id']]
+
+
+@pytest.mark.parametrize('action', ['execute', 'authorize'])
+async def test_agent_context_cannot_trigger_host_controller_without_human_session(controller, action):
+    request_without_session = {key: value for key, value in request('agent-only').items() if key != 'session'}
+    request_without_session['action'] = action
+    before = list(controller.cloud.calls)
+    with pytest.raises(PermissionError, match='unauthorized operations or fields'):
+        await controller.dispatch(request_without_session, 10001)
+    with pytest.raises(PermissionError, match='current human platform-administrator'):
+        await controller.dispatch({**request_without_session, 'session': 'missing-session'}, 10001)
+    assert controller.cloud.calls == before
+    assert controller.host.calls == []
 
 
 async def test_subgroup_restrictions_and_native_quota_drift_fail_closed(controller):
