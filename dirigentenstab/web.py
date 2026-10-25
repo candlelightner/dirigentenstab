@@ -223,6 +223,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
                         'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
                     send_button = ui.button('Send', icon='send').props('aria-label="Send"')
+                    send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
+                                                  bool(value and value.strip()) and not state['busy'])
 
         tool_cards = {}
 
@@ -326,7 +328,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
-                await show_agent(identifier)
+                if identifier != state['agent']:
+                    await show_agent(identifier)
+                else:
+                    drawer.hide()
             elif kind == 'domain':
                 current = await actor()
                 updated = await service.hierarchy(current)
@@ -428,7 +433,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 raise error from None
             finally:
                 state['busy'] = False
-                send_button.enable()
+                send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
                 prompt.enable()
                 new_button.enable()
                 history_select.enable()

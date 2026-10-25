@@ -134,6 +134,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await login(page, url)
         message = page.get_by_label('Message', exact=True)
         assert await message.is_visible()
+        assert await page.get_by_role('button', name='Send', exact=True).is_disabled()
         assert (await message.bounding_box())['x'] < 60
         for name in ('Team 11 Level 3', 'Team 2 Level 3'):
             await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()

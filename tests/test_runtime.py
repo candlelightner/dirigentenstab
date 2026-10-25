@@ -328,3 +328,14 @@ async def test_partial_stream_and_interruption_survive_reload(service, monkeypat
     service.store.execute("UPDATE chat_runs SET status='running'")
     restarted = runtime.Runtime(service)
     assert (await restarted.restore({'userid': 'human'}, conversation['id']))['runs'][-1]['status'] == 'interrupted'
+
+
+def test_interrupted_tool_history_is_closed_without_reexecuting():
+    history = json.loads(ModelMessagesTypeAdapter.dump_json([
+        ModelRequest(parts=[UserPromptPart('Create Sandbox')]),
+        ModelResponse(parts=[ToolCallPart('create_subgroup', {'name': 'Sandbox'}, tool_call_id='interrupted')]),
+    ]))
+    recovered = runtime.load_history(history)
+    result = recovered[-1].parts[0]
+    assert result.part_kind == 'tool-return' and result.tool_call_id == 'interrupted'
+    assert 'Outcome unknown' in result.content

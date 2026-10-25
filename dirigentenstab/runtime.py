@@ -239,12 +239,14 @@ class Runtime:
                 (conversation_id, target, identity['userid'], 'Delegated: ' + task[:64],
                  time.time(), self.service.store.seal([])),
             )
+            captured_child = []
             try:
-                result = await child.run(task, usage=budget['usage'],
-                                         usage_limits=UsageLimits(request_limit=20, tool_calls_limit=30))
-                messages = result.all_messages()
+                with capture_run_messages() as captured_child:
+                    result = await child.run(task, usage=budget['usage'],
+                                             usage_limits=UsageLimits(request_limit=20, tool_calls_limit=30))
+                    messages = result.all_messages()
             finally:
-                safe_messages = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(messages)))
+                safe_messages = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(captured_child or messages)))
                 self.service.store.execute('UPDATE conversations SET messages=? WHERE id=?',
                                            (self.service.store.seal(safe_messages), conversation_id))
             self.service.store.audit(record['id'], 'delegate', target)

@@ -84,6 +84,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
 
         async def chat(self, identity, agent_id, conversation_id, prompt, on_event):
             self.sent.append((identity['userid'], agent_id, prompt))
+            await asyncio.sleep(0.03)
             await on_event({'type': 'text', 'text': 'Hello'})
             await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
             return {'conversation_id': 'conversation', 'output': 'Hello'}
@@ -104,6 +105,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         await user.should_see('Administrator account: cloud-account')
         user.find('Message').type('Hello research')
         user.find('Send').click()
+        user.find('Send').trigger('click')
         await asyncio.sleep(0.1)
         await user.should_see('Hello')
         assert runtime.sent == [('human', 'agent', 'Hello research')]
