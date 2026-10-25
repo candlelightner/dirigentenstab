@@ -615,7 +615,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
     from dirigentenstab.store import Store
 
     url, state = browser_app
-    title = 'thinking indicator compaction meter'
+    title = 'context meter tool roundtrip'
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
@@ -669,9 +669,14 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await meter.wait_for()
         assert '57,344 usable tokens' in await meter.inner_text()
         assert 'Auto-compact at 75%' in await meter.inner_text()
-        await page.get_by_text('Pending response complete.', exact=True).wait_for()
-        run = store.one('SELECT checkpoint FROM chat_runs ORDER BY created DESC LIMIT 1')
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        run = store.one('SELECT id,status,events,checkpoint FROM chat_runs ORDER BY created DESC LIMIT 1')
+        assert run['status'] == 'completed'
         assert store.open(run['checkpoint'])['context']['usable_tokens'] == 57344
+        events = store.open(run['events'])
+        tool_budget = next(event['budget']['context'] for event in events if event['type'] == 'tool_result')
+        assert type(tool_budget['estimated_tokens']) is int and tool_budget['estimated_tokens'] > 0
+        assert tool_budget['usable_tokens'] == 57344
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await selector.fill('Research')
@@ -682,4 +687,16 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await meter.wait_for()
         assert '57,344 usable tokens' in await meter.inner_text()
         await page.screenshot(path=str(state / 'compaction-context-mobile.png'), full_page=True)
+        checkpoint = store.open(run['checkpoint'])
+        checkpoint['context'].update(estimated_tokens='[redacted]', usable_tokens='[redacted]')
+        store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?', (store.seal(checkpoint), run['id']))
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await selector.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.get_by_label('Conversation', exact=True).fill(title)
+        await page.get_by_role('option', name=title, exact=True).click()
+        await page.get_by_text('Context usage unavailable for this activity.', exact=True).wait_for()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        assert 'in show_context' not in (state / 'browser-server.log').read_text()
         await browser.close()

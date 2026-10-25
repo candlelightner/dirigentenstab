@@ -45,7 +45,7 @@ def test_history_excludes_system_instructions_and_keeps_tool_activity():
 
 
 @pytest.mark.asyncio
-async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
+async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, caplog):
     agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
              'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': True,
              'instructions': 'Original prompt'}
@@ -87,6 +87,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
     class Runtime:
         sent = []
         release = asyncio.Event()
+        finished = asyncio.Event()
         fail = False
 
         async def conversations(self, identity, agent_id):
@@ -103,6 +104,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
             await on_event({'type': 'compaction', 'status': 'Context compacted.', 'summary': 'PRIVATE SUMMARY CONTENT'})
             await on_event({'type': 'text', 'text': 'Hello'})
             await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
+            self.finished.set()
             return {'conversation_id': 'conversation', 'output': 'Hello'}
 
     auth, runtime, service = Auth(), Runtime(), Service()
@@ -174,6 +176,17 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         user.find('New conversation').click()
         await asyncio.sleep(0.1)
         assert redirects == ['/login']
+        auth.enabled, runtime.fail = True, False
+        runtime.release.clear()
+        runtime.finished.clear()
+        user.find('Message').type('Finish after closing this page')
+        user.find('Send').click()
+        await user.should_see('thinking_indicator')
+        user.client.delete()
+        runtime.release.set()
+        await asyncio.wait_for(runtime.finished.wait(), 1)
+        await asyncio.sleep(0.05)
+        assert 'has been deleted' not in caplog.text
 
 
 def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
@@ -575,6 +588,10 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
             agent.update(provider_id=provider_id, model=model, instructions=instructions, **settings)
 
     class Runtime:
+        saved_context = {'estimated_tokens': 321, 'context_window': 2000, 'response_reserve': 500,
+                         'usable_tokens': 1500, 'percent': 21.4, 'threshold_percent': 75,
+                         'source': 'Saved approximate usage'}
+
         async def conversations(self, current, agent_id):
             return [{'id': 'saved', 'title': 'Saved context'}]
 
@@ -595,12 +612,11 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
 
         async def restore(self, current, conversation_id):
             return {'id': 'saved', 'agent_id': 'agent', 'messages': [], 'runs': [
-                {'id': 'run', 'status': 'completed', 'events': [], 'budget': {'context': {
-                    'estimated_tokens': 321, 'context_window': 2000, 'response_reserve': 500,
-                    'usable_tokens': 1500, 'percent': 21.4, 'threshold_percent': 75, 'source': 'Saved approximate usage'}}}]}
+                {'id': 'run', 'status': 'completed', 'events': [], 'budget': {'context': self.saved_context}}]}
 
+    runtime = Runtime()
     async with user_simulation() as user:
-        build_ui(Service(), Auth(), Runtime())
+        build_ui(Service(), Auth(), runtime)
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
         user.find('agent_selector').trigger('update:modelValue', {'value': 0})
@@ -639,3 +655,9 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         user.find('Conversation').trigger('update:modelValue', {'value': 0})
         await user.should_see('Context: ~321 / 1,500 usable tokens (21.4%)')
         await user.should_see('Saved approximate usage')
+        runtime.saved_context = runtime.saved_context | {'estimated_tokens': '[redacted]', 'usable_tokens': '[redacted]'}
+        user.find('New conversation').click()
+        await user.should_not_see('Saved approximate usage')
+        user.find('Conversation').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Context usage unavailable for this activity.')
+        assert not user.notify.messages, user.notify.messages
