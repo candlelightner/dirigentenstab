@@ -202,7 +202,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
                 setTimeout(fit,500); })();
         </script>""")
-        with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300').classes('bg-stone-50') as drawer:
+        # Quasar skips layout-width breakpoints while a dialog prevents scrolling; screen behavior still updates.
+        with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300 '
+                ':behavior="$q.screen.width <= 900 ? \'mobile\' : \'desktop\'"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
                     ui.label('Agents').classes('text-lg font-semibold')

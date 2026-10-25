@@ -25,20 +25,31 @@ async def test_cleanup_resumes_after_a_lost_reply_and_never_touches_baseline(mon
     import gpu_lifecycle_acceptance as script
     saved, removed = [], []
     monkeypatch.setattr(script, 'save', lambda state: saved.append(state['phase']))
-    state = {'baseline': ['original'], 'vm_ids': ['a', 'b', 'c', 'd'], 'config': {'cpu_offering': 'cpu'}}
+    state = {'baseline': ['original'], 'vm_ids': ['a', 'b', 'c', 'd'], 'config': {'cpu_offering': 'cpu'}, 'prefix': 'test-'}
     class Cloud:
         async def raw(self, command, params):
             if params.get('id') in {'a', *removed}:
                 return {}  # A prior successful removal lost its receipt.
             if params.get('id'):
-                return {'virtualmachine': [{'id': params['id'], 'state': 'Stopped', 'serviceofferingid': 'cpu'}]}
+                return {'virtualmachine': [{'id': params['id'], 'state': 'Stopped', 'serviceofferingid': 'cpu',
+                    'domainid': 'main', 'account': 'main-owner', 'displayname': 'test-'+params['id']}]}
             return {'virtualmachine': [{'id': 'original'}]}
         async def execute(self, command, params):
             assert command == 'destroyVirtualMachine' and params['expunge']
             removed.append(params['id'])
-    await script.cleanup(Cloud(), state)
+    await script.cleanup(Cloud(), state, domain_id='main', account='main-owner')
     assert removed == ['b', 'c', 'd'] and saved == ['cleanup', 'cleaned']
     state['vm_ids'] = ['original', 'a', 'b', 'c']
     with pytest.raises(AssertionError, match='non-baseline'):
-        await script.cleanup(Cloud(), state)
+        await script.cleanup(Cloud(), state, domain_id='main', account='main-owner')
+    assert removed == ['b', 'c', 'd']
+    state['vm_ids'] = ['e', 'f', 'g', 'h']
+    class ForeignCloud(Cloud):
+        async def raw(self, command, params):
+            result = await super().raw(command, params)
+            for vm in result.get('virtualmachine', []):
+                vm['domainid'] = 'unrelated'
+            return result
+    with pytest.raises(AssertionError, match='refused'):
+        await script.cleanup(ForeignCloud(), state, domain_id='main', account='main-owner')
     assert removed == ['b', 'c', 'd']

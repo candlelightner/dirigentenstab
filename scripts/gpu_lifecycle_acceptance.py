@@ -43,7 +43,7 @@ def evidence(events, prefix, offering8, offering24):
     return three + full
 
 
-async def cleanup(cloud, state):
+async def cleanup(cloud, state, *, domain_id, account):
     identifiers = state['vm_ids']
     if len(set(identifiers)) != 4 or set(identifiers) & set(state['baseline']):
         raise AssertionError('Cleanup requires exactly four verified non-baseline test VMs')
@@ -54,14 +54,31 @@ async def cleanup(cloud, state):
         if not values:
             continue
         if any(v['id'] != identifier or v['state'] != 'Stopped' or
-               v['serviceofferingid'] != state['config']['cpu_offering'] for v in values):
+               v['serviceofferingid'] != state['config']['cpu_offering'] or v.get('domainid') != domain_id or
+               v.get('account') != account or not v.get('displayname', '').startswith(state['prefix']) for v in values):
             raise AssertionError('Cleanup refused a VM that is no longer a stopped CPU-only test VM')
         await cloud.execute('destroyVirtualMachine', {'id': identifier, 'expunge': True})
-    remaining = (await cloud.raw('listVirtualMachines', {'listall': True})).get('virtualmachine', [])
+    remaining = (await cloud.raw('listVirtualMachines', {'listall': True, 'domainid': domain_id,
+                                                        'isrecursive': True})).get('virtualmachine', [])
     if sorted(v['id'] for v in remaining) != state['baseline']:
         raise AssertionError('Inventory differs from the original baseline; inspect without further deletion')
     state['phase'] = 'cleaned'
     save(state)
+
+
+async def platform_cleanup(app, state):
+    # Expunge stays an explicit root-operator action; never widen the agent's runtime role for cleanup.
+    path = Path('/var/lib/dirigentenstab/setup/cloudstack-admin.json')
+    if (await asyncio.to_thread(path.stat)).st_mode & 0o077:
+        raise PermissionError('Platform maintenance credentials must be root-private')
+    credentials = json.loads(await asyncio.to_thread(path.read_text))
+    cloud = app.client({key: credentials[key] for key in ('apikey', 'secretkey')})
+    owner = await app.agent(APP_ROOT_AGENT)
+    accounts = (await cloud.raw('listAccounts', {'id': owner['account_id'], 'listall': True})).get('account', [])
+    account = next((a for a in accounts if a['id'] == owner['account_id'] and a['domainid'] == owner['domain_id']), None)
+    if not account:
+        raise PermissionError('Cannot verify the test VMs’ exact native owner')
+    await cleanup(cloud, state, domain_id=owner['domain_id'], account=account['name'])
 
 
 async def acceptance(options):
@@ -87,7 +104,7 @@ async def acceptance(options):
     cloud = await app.cloud_client(await app.agent(APP_ROOT_AGENT))
     if state['phase'] in {'passed', 'cleanup'}:
         if options.cleanup:
-            await cleanup(cloud, state)
+            await platform_cleanup(app, state)
         print(json.dumps({k: state[k] for k in ('phase', 'operation_id', 'vm_ids')}))
         return
     # A submitted task is found by its unique title, never silently submitted again after interruption.
@@ -177,7 +194,7 @@ async def acceptance(options):
         finally:
             await browser.close()
     if options.cleanup and state.get('phase') == 'passed':
-        await cleanup(cloud, state)
+        await platform_cleanup(app, state)
     print(json.dumps({k: state[k] for k in ('phase', 'operation_id', 'vm_ids')}))
 
 
