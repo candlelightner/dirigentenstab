@@ -59,7 +59,7 @@ Back up the database and master key before changing remote credentials. The sche
 sudo .venv/bin/python scripts/admin.py migrate-keys
 ```
 
-Use `migrate-key AGENT_ID` for one account, or `adopt-key AGENT_ID --key-id CLOUDSTACK_KEY_PAIR_UUID` to select an existing replacement. Migration validates a single-user managed account and replacement access, commits the one active pair, then cleans up the superseded keys owned by that account. Ambiguous ownership or failure stops with recovery state; no privileged key is substituted. Native role/domain changes thereafter take effect without editing application policy.
+Use `migrate-key AGENT_ID` for one account, or `adopt-key AGENT_ID --key-id CLOUDSTACK_KEY_PAIR_UUID` to select an existing replacement. Adoption preserves that key's native CloudStack permissions. To replace legacy per-key restrictions with account-role authentication, use `rotate` or `migrate-key`, which issues a fresh pair through the human session. `listUserKeyRules` returns effective permissions, including inherited role rules, so its rule count cannot identify explicit key restrictions. Migration validates a single-user managed account and replacement access, commits the one active pair, then cleans up the superseded keys owned by that account. Ambiguous ownership or failure stops with recovery state; no privileged key is substituted. Native role/domain changes thereafter take effect without editing application policy.
 
 ## Migrating from Agentor
 

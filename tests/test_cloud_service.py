@@ -909,19 +909,19 @@ async def test_managed_agent_feature_gate_does_not_override_native_infrastructur
         await service.create_subgroup('parent', 'Managed agent')
 
 
-async def test_adoption_rejects_explicit_native_key_rules_without_replacing_old_credentials(store):
+@pytest.mark.parametrize('rule_count', [1, 449])
+async def test_adoption_keeps_native_permissions_without_interpreting_effective_rules(store, rule_count):
     original = add_parent(store)
     cloud = ProvisioningCloud()
     service = rotation_service(store, cloud)
     cloud.keys['selected'] = {**cloud.keys[original['id']], 'id': 'selected',
                               'apikey': 'selected-api', 'secretkey': 'selected-secret'}
-    cloud.key_rules['selected'] = [{'rule': '*', 'permission': 'allow'}]
-    with pytest.raises(PermissionError, match='use rotate or migrate-key'):
-        await service.rotate_credentials({'userid': 'human'}, 'parent', native_key_id='selected')
-    assert store.open(store.one('SELECT credentials FROM agents')['credentials']) == original
-    assert not any(command in {'registerUserKeys', 'deleteUserKeys'} for command, _ in cloud.calls)
-    await service.rotate_credentials({'userid': 'human'}, 'parent')
-    assert len(cloud.keys) == 1 and cloud.key_number == 1
+    rules = [{'rule': 'nativeOperation' + str(index), 'permission': 'allow'} for index in range(rule_count)]
+    cloud.key_rules['selected'] = rules
+    await service.rotate_credentials({'userid': 'human'}, 'parent', native_key_id='selected')
+    assert store.open(store.one('SELECT credentials FROM agents')['credentials'])['id'] == 'selected'
+    assert set(cloud.keys) == {'selected'} and cloud.key_rules['selected'] == rules
+    assert not any(command in {'registerUserKeys', 'listUserKeyRules'} for command, _ in cloud.calls)
 
 
 async def test_legacy_issuing_journal_reconciles_paired_orphans_before_single_key_cleanup(store):
