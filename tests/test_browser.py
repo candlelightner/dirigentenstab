@@ -58,7 +58,7 @@ async def login(page, url):
     await page.get_by_label('Username', exact=True).fill('alice')
     await page.get_by_label('Password', exact=True).fill('browser-fixture-password')
     await page.get_by_role('button', name='Sign in', exact=True).click()
-    await page.get_by_text('Select an agent to begin', exact=True).wait_for()
+    await page.get_by_text('Main Agent', exact=True).last.wait_for()
     await page.wait_for_function('window.socket?.connected && window.did_handshake')
 
 
@@ -66,7 +66,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
     url, state = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
-        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 1280, 'height': 900})
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
         page = await context.new_page()
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
@@ -75,12 +75,12 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         assert cookie['httpOnly'] and cookie['secure'] and cookie['sameSite'] == 'Strict'
         await page.get_by_label('Chat directly with an agent', exact=True).fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.get_by_text('Administrator account: research-account', exact=True).wait_for()
+        await page.get_by_text('Research Admin', exact=True).last.wait_for()
         await page.get_by_label('Message', exact=True).fill('Inspect the research VM')
         await page.get_by_role('button', name='Send', exact=True).click()
         output = 'Infrastructure checked. The research VM is running.'
         await page.get_by_text(output, exact=True).wait_for()
-        await page.get_by_text('Tool activity', exact=True).first.click()
+        await page.get_by_text('execute_api · Completed', exact=False).first.click()
         assert await page.get_by_text('execute_api', exact=False).count() >= 1
         from scripts.browser_fixture import PRIVATE_VALUES
         content = await page.content()
@@ -90,6 +90,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await page.get_by_label('Conversation', exact=True).fill('Inspect the research VM')
         await page.get_by_role('option', name='Inspect the research VM', exact=True).click()
         await page.get_by_text(output, exact=True).wait_for()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await page.get_by_role('button', name='Model providers', exact=True).click()
         await page.get_by_label('Base URL (including /v1)', exact=True).wait_for()
         await page.get_by_role('button', name='Close', exact=True).click()
@@ -119,4 +120,87 @@ async def test_browser_disabled_cloudstack_human_loses_existing_socket_access(br
         await page.get_by_role('button', name='Sign in', exact=True).wait_for()
         response = await context.request.get(url + '/')
         assert response.url.endswith('/login')
+        await browser.close()
+
+
+@pytest.mark.parametrize('engine', ['chromium', 'firefox'])
+async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app, engine):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await getattr(p, engine).launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 390, 'height': 844},
+                                            is_mobile=engine == 'chromium', has_touch=True)
+        page = await context.new_page()
+        await login(page, url)
+        message = page.get_by_label('Message', exact=True)
+        assert await message.is_visible()
+        assert await page.get_by_role('button', name='Send', exact=True).is_disabled()
+        assert (await message.bounding_box())['x'] < 60
+        for name in ('Team 11 Level 3', 'Team 2 Level 3'):
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            search = page.get_by_label('Search agents and domains', exact=True)
+            await search.fill(name)
+            await page.wait_for_timeout(350)  # Quasar's branch expansion transition.
+            try:
+                await page.locator('.q-tree').get_by_text(name, exact=True).click(timeout=10000)
+            except Exception:
+                await page.screenshot(path=str(state / 'selection-failure.png'), full_page=True)
+                raise
+            await search.wait_for(state='hidden')
+            await page.get_by_text(name, exact=True).last.wait_for()
+            assert (await message.bounding_box())['x'] < 60
+            assert await page.evaluate('window.scrollY === 0')
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        model = page.get_by_label('Model ID', exact=True)
+        await page.get_by_text('2 models available.', exact=False).wait_for()
+        await model.fill('custom-private-model')
+        await model.press('Enter')
+        provider = page.get_by_label('Model provider', exact=True)
+        for name, expected in [('Unsupported', 'custom Model ID'), ('Empty', 'No models discovered'),
+                               ('Unauthorized', 'rejected authentication'), ('Local fixture', '2 models available')]:
+            await provider.click()
+            await page.get_by_role('option', name=name, exact=True).click()
+            await page.get_by_text(expected, exact=False).last.wait_for()
+            assert await model.input_value() == 'custom-private-model'
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await page.get_by_text('custom-private-model', exact=False).last.wait_for()
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.get_by_label('Chat directly with an agent', exact=True).fill('Team 2 Level 3')
+        await page.get_by_role('option', name='Team 2 Level 3', exact=True).click()
+        await page.get_by_text('Model: Local fixture / custom-private-model', exact=True).wait_for()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_label('Model ID', exact=True).wait_for()
+        assert await page.get_by_label('Model ID', exact=True).input_value() == 'custom-private-model'
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await message.fill('markdown stress')
+        try:
+            await page.get_by_role('button', name='Send', exact=True).click()
+        except Exception:
+            await page.screenshot(path=str(state / 'submission-failure.png'), full_page=True)
+            print('Textarea at failed submission:', await message.input_value())
+            raise
+        await page.get_by_role('heading', name='Infrastructure report', exact=True).wait_for()
+        await page.get_by_text('Completed', exact=True).wait_for()
+        assert await page.locator('.markdown table').count() == 1
+        assert await page.locator('.markdown pre code').count() == 1
+        assert not await page.evaluate('window.injected === true')
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await page.screenshot(path=str(state / 'mobile-chat.png'), full_page=True)
+        await message.focus()
+        # A reduced visual viewport is how Android exposes the open keyboard to web layouts.
+        await page.set_viewport_size({'width': 390, 'height': 500})
+        await page.wait_for_timeout(500)
+        box = await message.bounding_box()
+        await page.screenshot(path=str(state / 'mobile-keyboard.png'), full_page=True)
+        assert box and box['y'] + box['height'] <= 500, await page.evaluate('''() => ({
+            viewport:visualViewport.height, elements:[...document.querySelectorAll('.q-header,.nicegui-content,.workspace,.conversation,.composer')]
+            .map(el=>({class:el.className,rect:el.getBoundingClientRect().toJSON(),min:getComputedStyle(el).minHeight}))})''')
+        await page.set_viewport_size({'width': 390, 'height': 844})
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_label('Search agents and domains', exact=True).fill('Team')
+        await page.locator('.q-tree').get_by_text('Research Admin', exact=True).wait_for()
+        await page.screenshot(path=str(state / 'mobile-drawer.png'), full_page=True)
         await browser.close()

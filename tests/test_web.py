@@ -16,16 +16,16 @@ def test_tree_uses_cloudstack_parents_and_only_safe_agent_labels():
         'users': [{'id': 'human', 'domainid': 'research', 'username': 'alice'}],
     }
     nodes = hierarchy_nodes(data)
-    research = nodes[0]['children'][0]
+    research = nodes[0]
     training = research['children'][0]
-    assert training['children'][0] == {'id': 'agent:local', 'label': 'Trainer · local-model'}
-    assert research['children'][1]['label'] == 'Administrator: alice'
+    assert training == {'id': 'agent:local', 'label': 'Trainer', 'icon': 'smart_toy', 'children': []}
+    assert 'Administrator: alice' not in str(nodes)
     assert 'DO-NOT-EXPOSE' not in str(nodes)
 
 
 def test_tree_preserves_scoped_root_without_inventing_missing_parent():
     nodes = hierarchy_nodes({'domains': [{'id': 'research', 'name': 'Research', 'parentdomainid': 'hidden'}]})
-    assert nodes == [{'id': 'domain:research', 'label': 'Research', 'children': []}]
+    assert nodes == [{'id': 'domain:research', 'label': 'Research', 'icon': 'folder', 'children': []}]
 
 
 def test_history_excludes_system_instructions_and_keeps_tool_activity():
@@ -84,6 +84,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
 
         async def chat(self, identity, agent_id, conversation_id, prompt, on_event):
             self.sent.append((identity['userid'], agent_id, prompt))
+            await asyncio.sleep(0.03)
             await on_event({'type': 'text', 'text': 'Hello'})
             await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
             return {'conversation_id': 'conversation', 'output': 'Hello'}
@@ -104,6 +105,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         await user.should_see('Administrator account: cloud-account')
         user.find('Message').type('Hello research')
         user.find('Send').click()
+        user.find('Send').trigger('click')
         await asyncio.sleep(0.1)
         await user.should_see('Hello')
         assert runtime.sent == [('human', 'agent', 'Hello research')]
@@ -119,3 +121,19 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         user.find('New conversation').click()
         await asyncio.sleep(0.1)
         assert redirects == ['/login']
+
+
+def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
+    nodes = hierarchy_nodes({
+        'domains': [{'id': 'native', 'name': 'ROOT', 'path': 'ROOT'},
+                    {'id': 'main-domain', 'name': 'Agents--ds-00000000000000000000', 'parentdomainid': 'native'},
+                    {'id': 'child-domain', 'name': 'Research--ds-aabbcc', 'parentdomainid': 'main-domain'},
+                    {'id': 'legacy', 'name': 'Meaningful--ds-1234', 'parentdomainid': 'child-domain'}],
+        'agents': [{'id': 'main', 'name': 'Agents', 'domain_id': 'main-domain', 'is_main': True},
+                   {'id': 'child', 'name': 'Research', 'domain_id': 'child-domain'}],
+        'users': [{'id': 'human', 'username': 'alice', 'domainid': 'main-domain'}],
+    })
+    assert nodes[0]['label'] == 'Main Agent' and nodes[0]['icon'] == 'smart_toy'
+    assert nodes[0]['children'][0]['label'] == 'Research'
+    assert nodes[0]['children'][0]['children'][0]['label'] == 'Meaningful--ds-1234'
+    assert 'alice' not in str(nodes) and 'Agents--ds-' not in str(nodes)

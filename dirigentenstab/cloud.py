@@ -51,13 +51,15 @@ path mountpoint filesystem command apikey secretkey signature signatureversion
 sessionkey response filter exclude filepath externaldetails externalid importsource
 '''.split())
 SENSITIVE_FIELD = re.compile(r'(?i)(password|secret|private.?key|api.?key|sessionkey|cookie|token|userdata)')
+TOKEN_COUNT = re.compile(r'^(?:input|output|cache_write|cache_read|input_audio|cache_audio_read|output_audio|prompt_cache_hit|prompt_cache_miss|reasoning)_tokens$')
 NAME = re.compile(r'^[a-z][a-zA-Z0-9]{1,80}$')
 PARAM_NAME = re.compile(r'^[a-z][a-z0-9]*(?:\[\d{1,3}\]\.[a-z][a-z0-9]*)?$')
 
 
 def redact(value, secrets=()):
     if isinstance(value, dict):
-        return {k: '[redacted]' if SENSITIVE_FIELD.search(str(k)) else redact(v, secrets)
+        return {k: v if TOKEN_COUNT.fullmatch(str(k)) and type(v) is int and v >= 0
+                else '[redacted]' if SENSITIVE_FIELD.search(str(k)) else redact(v, secrets)
                 for k, v in value.items()}
     if isinstance(value, list):
         return [redact(item, secrets) for item in value]

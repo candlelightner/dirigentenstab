@@ -2,21 +2,33 @@ import html
 import json
 import os
 
+import httpx
+
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 from nicegui import app, ui
 
 from .runtime import Runtime, provider_models, test_provider
+from .diagnostics import diagnose
 from .settings import Settings
 from .store import Store
 
 
+def agent_label(agent):
+    return 'Main Agent' if agent.get('is_main') else agent['name']
+
+
 def hierarchy_nodes(data):
-    domains = {
-        domain['id']: {'id': 'domain:' + domain['id'], 'label': domain['name'], 'children': []}
-        for domain in data.get('domains', [])
-    }
-    roots = []
+    """Join authoritative CloudStack parents to managed-agent presentation metadata."""
+    agents = {a['domain_id']: a for a in data.get('agents', [])}
+    domains, roots = {}, []
+    for domain in data.get('domains', []):
+        agent = agents.get(domain['id'])
+        domains[domain['id']] = {
+            'id': 'agent:' + agent['id'] if agent else 'domain:' + domain['id'],
+            'label': agent_label(agent) if agent else domain['name'],
+            'icon': 'smart_toy' if agent else 'folder', 'children': [],
+        }
     for domain in data.get('domains', []):
         node = domains[domain['id']]
         parent = domains.get(domain.get('parentdomainid'))
@@ -24,29 +36,54 @@ def hierarchy_nodes(data):
             roots.append(node)
         else:
             parent['children'].append(node)
-    for agent in data.get('agents', []):
-        parent = domains.get(agent['domain_id'])
-        if parent is not None:
-            state = agent.get('model') or 'model not configured'
-            parent['children'].append({'id': 'agent:' + agent['id'], 'label': f'{agent["name"]} · {state}'})
-    for user in data.get('users', []):
-        parent = domains.get(user.get('domainid'))
-        if parent is not None:
-            parent['children'].append({'id': 'human:' + user['id'],
-                                       'label': 'Administrator: ' + user.get('username', user['id'])})
-    return roots
+    # CloudStack's native ROOT is a container, never a managed AI identity.
+    native_roots = {d['id'] for d in data.get('domains', [])
+                    if d.get('path') == 'ROOT' or d.get('level') == 0 or
+                    (d['name'] == 'ROOT' and not d.get('parentdomainid'))}
+    return [child for node in roots for child in
+            (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])]
+
+
+def tool_label(event):
+    name = event.get('name', 'Tool')
+    content = event.get('content', {})
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            content = {}
+    target = event.get('target') or next((str(content[k])[:80] for k in ('command', 'name', 'vm_id', 'agent_id') if content.get(k)), '') \
+        if isinstance(content, dict) else ''
+    status = 'Failed' if event.get('failed') else 'Running' if event['type'] == 'tool_call' else 'Completed'
+    mode = 'Read' if name in {'search_api', 'describe_api'} or (name == 'execute_api' and
+                    target.startswith(('list', 'query', 'get'))) else 'Action'
+    duration = f" · {event['duration']}s" if event.get('duration') is not None else ''
+    return f'{name} · {status} · {mode}' + (f' · {target}' if target else '') + duration + (
+        ' · ' + event['summary'] if event.get('summary') else '')
 
 
 def history_parts(history):
-    """Render only supported persisted conversation parts as plain text."""
+    """Keep chronological messages and correlated tools, including pre-v0.1.3 histories."""
+    saved = {(e['type'], e.get('call_id')): e for run in history.get('runs', []) for e in run['events']}
+    emitted = set()
     for message in history.get('messages', []):
         for part in message.get('parts', []):
             kind = part.get('part_kind')
             if kind in {'user-prompt', 'text'}:
                 yield 'human' if kind == 'user-prompt' else 'agent', str(part.get('content', ''))
             elif kind in {'tool-call', 'tool-return'}:
-                value = part.get('args', '') if kind == 'tool-call' else part.get('content', '')
-                yield 'tool', part.get('tool_name', 'Tool') + '\n' + json.dumps(value, ensure_ascii=False)
+                event_type = 'tool_call' if kind == 'tool-call' else 'tool_result'
+                key = (event_type, part.get('tool_call_id'))
+                event = saved.get(key) or {
+                    'type': event_type, 'name': part.get('tool_name', 'Tool'),
+                    'call_id': part.get('tool_call_id'),
+                    'content': part.get('args' if kind == 'tool-call' else 'content', ''),
+                }
+                emitted.add(key)
+                yield 'activity', event
+    for key, event in saved.items():
+        if key not in emitted:
+            yield 'activity', event
 
 
 def build_ui(service, auth, runtime=None):
@@ -75,6 +112,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
     @ui.page('/')
     async def workspace(request: Request):
+        client = ui.context.client
         token = request.cookies.get('ds_session', '')
         try:
             identity = await auth.identity(token)
@@ -95,12 +133,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 raise PermissionError('Session expired') from None
 
         async def protect(action):
-            try:
-                await action()
-            except PermissionError:
-                ui.notify('Access denied or session expired.', type='negative')
-            except Exception:
-                ui.notify('The operation failed. Check the configuration and server audit log.', type='negative')
+            # Callbacks outlive rebuilt detail cards; use the stable page slot for dialogs and notifications.
+            with client:
+                try:
+                    await action()
+                except Exception as exc:
+                    error = diagnose(exc, agent_id=state['agent'])
+                    ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
         state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False}
         agents = {row['id']: row for row in data.get('agents', [])}
@@ -108,47 +147,106 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             ui.icon('account_tree').classes('text-teal-900 text-2xl')
             ui.label('Dirigentenstab').classes('font-semibold text-xl')
             ui.space()
-            ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm')
+            ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
             ui.html('<form method="post" action="/auth/logout"><input type="hidden" name="csrf" value="'
                     + html.escape(identity['csrf'], quote=True)
                     + '"><button type="submit" class="border rounded px-3 py-1">Sign out</button></form>',
                     sanitize=False)
 
-        with ui.row().classes('w-full items-start gap-5 p-3 md:p-5 flex-wrap'):
-            with ui.card().classes('w-full md:w-80 shrink-0 gap-4'):
-                with ui.row().classes('w-full items-center'):
-                    ui.label('Domains & agents').classes('font-semibold')
+        ui.add_css("""
+            html,body{overscroll-behavior:none;overflow:hidden}
+            .nicegui-content{padding:0;height:calc(100dvh - 65px);min-height:0}
+            .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
+            .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
+            .messages{flex:1;min-height:0;width:100%;overflow:hidden}
+            .composer{width:100%;flex-shrink:0;align-items:end;flex-wrap:nowrap}
+            .composer textarea{max-height:120px;overflow:auto!important}
+            .markdown{max-width:100%;overflow-wrap:anywhere;min-width:0}
+            .markdown table,.markdown pre{display:block;max-width:100%;overflow-x:auto}
+            .markdown h1,.markdown h2{font-size:1.4rem;line-height:1.3;margin:.6rem 0}
+            .markdown h3{font-size:1.15rem}
+            .markdown pre{padding:12px;background:#f5f5f4;border-radius:6px}
+            .q-message-text{background:#f5f5f4!important;color:#292524!important;max-width:100%}
+            .q-message-container,.q-message-text-content{min-width:0;max-width:100%}
+            .q-dialog__inner>.q-card{max-height:85dvh;overflow-y:auto}
+            .q-tree__node{padding-left:8px}
+            .q-tree__children{padding-left:6px}
+            .q-tree__node-header{min-height:44px;overflow-wrap:anywhere}
+            .q-tree__node-header-content{min-width:0}
+            button,.q-btn{min-height:44px}
+            @media(max-width:600px) and (max-height:600px){
+                .workspace:has(.composer textarea:focus) .agent-details{display:none}}
+            @media(max-width:600px){.workspace{padding:6px;gap:6px}.agent-details{padding:10px}
+            .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(100dvh - 61px)}
+            .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
+        """)
+        # Resize the bounded workspace with the mobile visual viewport (including the virtual keyboard).
+        ui.add_body_html("""<script>
+            (() => { const fit = () => { const el=document.querySelector('.workspace');
+                const header=document.querySelector('.q-header');
+                if(el) el.style.height=Math.max(100,(window.visualViewport?.height || innerHeight)
+                    -(header?.getBoundingClientRect().height || 65))+'px'; };
+                window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
+                setTimeout(fit,500); })();
+        </script>""")
+        with ui.left_drawer(value=False).props('breakpoint=900 bordered width=300 :behavior="$q.screen.lt.md ? \'mobile\' : \'desktop\'"').classes('bg-stone-50') as drawer:
+            with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
+                with ui.row().classes('w-full items-center no-wrap'):
+                    ui.label('Agents').classes('text-lg font-semibold')
                     ui.space()
+                    ui.button(icon='close', on_click=drawer.hide).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
-                tree = ui.tree(hierarchy_nodes(data)).classes('w-full')
-                tree.expand()
-                agent_choice = ui.select({key: row['name'] for key, row in agents.items()},
-                                         label='Chat directly with an agent', with_input=True).classes('w-full').mark('agent_selector')
-                ui.separator()
-                ui.label('Infrastructure').classes('font-semibold')
-                status = ui.label(str(data.get('status', 'CloudStack connected'))).classes(
-                    'text-sm text-stone-600 whitespace-pre-wrap break-all')
-                if identity.get('type') == 1:
-                    providers_button = ui.button('Model providers', icon='settings').props('outline').classes('w-full')
-                else:
-                    providers_button = None
-            with ui.column().classes('flex-1 min-w-0 w-full gap-4'):
-                details = ui.card().classes('w-full')
-                with details:
-                    ui.label('Select an agent to begin').classes('text-2xl font-semibold')
-                    ui.label('The tree comes from CloudStack. Each agent uses its own administrative identity.').classes(
-                        'text-stone-600')
-                with ui.card().classes('w-full gap-3'):
-                    with ui.row().classes('w-full items-center'):
-                        history_select = ui.select({}, label='Conversation', with_input=True).classes('flex-1 min-w-48')
-                        new_button = ui.button('New conversation', icon='add').props('flat')
-                    with ui.scroll_area().classes('w-full h-[52vh] min-h-64'):
-                        transcript = ui.column().classes('w-full gap-4 p-2')
-                    with ui.row().classes('w-full items-end no-wrap'):
-                        prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
-                            'outlined autogrow maxlength=16000').classes('flex-1')
-                        send_button = ui.button('Send', icon='send')
-                    progress = ui.label('').classes('text-sm text-stone-500')
+                search = ui.input('Search agents and domains').props('clearable').classes('w-full')
+                with ui.scroll_area().classes('w-full flex-1 min-h-0'):
+                    tree = ui.tree(hierarchy_nodes(data)).classes('w-full').mark('hierarchy')
+                status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
+                providers_button = ui.button('Model providers', icon='settings').props('outline').classes('w-full') \
+                    if identity.get('type') == 1 else None
+        with ui.column().classes('workspace'):
+            with ui.row().classes('w-full items-center no-wrap gap-2'):
+                ui.button('Agents', icon='account_tree', on_click=drawer.toggle).props(
+                    'outline aria-label="Open agent hierarchy"')
+                agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
+                                         label='Chat directly with an agent', with_input=True).classes(
+                                             'flex-1 min-w-0').mark('agent_selector')
+            details = ui.card().classes('w-full shrink-0 agent-details')
+            with details:
+                ui.label('Select an agent to begin').classes('text-xl font-semibold')
+            with ui.card().classes('conversation'):
+                with ui.row().classes('w-full items-center no-wrap gap-2'):
+                    history_select = ui.select({}, label='Conversation', with_input=True).classes('flex-1 min-w-0')
+                    new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
+                with ui.scroll_area().classes('messages'):
+                    transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
+                progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
+                with ui.row().classes('composer gap-2'):
+                    prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
+                        'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
+                    send_button = ui.button('Send', icon='send').props('aria-label="Send"')
+                    send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
+                                                  bool(value and value.strip()) and not state['busy'])
+
+        tool_cards = {}
+
+        def activity(event):
+            key = (event.get('operation_id'), event.get('call_id', event.get('name')))
+            card = tool_cards.get(key)
+            if card is None:
+                with transcript:
+                    card = ui.expansion(tool_label(event), icon='terminal').classes(
+                        'w-full min-w-0 bg-stone-50 rounded')
+                tool_cards[key] = card
+            else:
+                previous = card._props.get('call_content')
+                if previous and event['type'] == 'tool_result':
+                    event = event | {'content': {'request': previous, 'result': event.get('content')}}
+                card.set_text(tool_label(event))
+                card.clear()
+            if event['type'] == 'tool_call':
+                card._props['call_content'] = event.get('content')
+            with card:
+                ui.label(json.dumps(event.get('content'), ensure_ascii=False, default=str)[:16384]).classes(
+                    'whitespace-pre-wrap font-mono text-xs break-all')
 
         def message(kind, content):
             with transcript:
@@ -158,7 +256,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 else:
                     with ui.chat_message(name='You' if kind == 'human' else 'Agent', sent=kind == 'human').classes(
                             'w-full max-w-full'):
-                        ui.label(content).classes('whitespace-pre-wrap break-words')
+                        if kind == 'agent':
+                            ui.markdown(content, extras=['tables', 'fenced-code-blocks'], sanitize=True).classes(
+                                'markdown w-full')
+                        else:
+                            ui.label(content).classes('whitespace-pre-wrap break-words')
 
         async def histories():
             current = await actor()
@@ -174,23 +276,40 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent = await service.authorize(current, agent_id)
             state.update(agent=agent_id, conversation=None, imported=False)
             transcript.clear()
-            progress.set_text('')
+            tool_cards.clear()
+            progress.set_text('Ready')
             agent_choice.set_value(agent_id)
+            tree.props['selected'] = 'agent:' + agent_id
+            tree.update()
+            drawer.hide()
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
                 with ui.row().classes('w-full items-center gap-3'):
-                    ui.label(agent['name']).classes('text-2xl font-semibold')
+                    ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold')
                     ui.badge('Domain administrator', color='primary')
                     ui.space()
                     ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
                     if agent.get('can_provision'):
                         ui.button('Create subgroup', icon='create_new_folder',
                                   on_click=lambda: protect(subgroup_dialog)).props('outline')
-                ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('text-stone-600')
-                ui.label('CloudStack domain: ' + agent['domain_id']).classes('text-xs text-stone-500 break-all')
-                ui.label('Administrator account: ' + agent['account_id']).classes('text-xs text-stone-500 break-all')
-                ui.label('Model: ' + (agent.get('model') or 'not configured')).classes('text-sm')
+                provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
+                ui.label('Model: ' + provider.get('name', 'No provider') + ' / ' +
+                         (agent.get('model') or provider.get('default_model') or 'not configured')).classes('text-sm')
+                with ui.expansion('Domain details', icon='info').classes('w-full text-sm'):
+                    ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('break-all')
+                    ui.label('CloudStack domain: ' + agent['domain_id']).classes('break-all')
+                    ui.label('Administrator account: ' + agent['account_id']).classes('break-all')
+                    ui.label('Original agent name: ' + agent['name'])
+                    for user in state['data'].get('users', []):
+                        if user.get('domainid') == agent['domain_id'] and user['id'] != agent.get('user_id'):
+                            ui.label('Administrator: ' + user.get('username', user['id']))
+                for operation in state['data'].get('pending_provisioning', []):
+                    if operation['parent_id'] == agent_id:
+                        ui.label(f"Requires reconciliation: {operation['name']} · {operation['phase']} · "
+                                 f"Reference: {operation['id']}").classes('text-amber-900 break-all')
+                        ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
+                                 'to use scripts/admin.py repair-provisioning.').classes('text-sm')
             await histories()
 
         async def refresh():
@@ -201,7 +320,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agents.update({row['id']: row for row in updated.get('agents', [])})
             tree.props['nodes'] = hierarchy_nodes(updated)
             tree.update()
-            agent_choice.set_options({key: row['name'] for key, row in agents.items()})
+            agent_choice.set_options({key: agent_label(row) for key, row in agents.items()})
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
         async def select_node(event):
@@ -209,7 +328,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
-                await show_agent(identifier)
+                if identifier != state['agent']:
+                    await show_agent(identifier)
+                else:
+                    drawer.hide()
             elif kind == 'domain':
                 current = await actor()
                 updated = await service.hierarchy(current)
@@ -221,6 +343,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.label(domain['name']).classes('text-2xl font-semibold')
                     ui.label(domain.get('path', '')).classes('text-stone-600')
                     ui.label('CloudStack domain: ' + identifier).classes('text-xs text-stone-500 break-all')
+                    drawer.hide()
                     for agent in updated.get('agents', []):
                         if agent['domain_id'] == identifier:
                             ui.button('Chat with ' + agent['name'],
@@ -241,8 +364,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             progress.set_text('Imported history is read-only. Sending starts a new conversation without '
                               'forwarding this history to the model.' if state['imported'] else '')
             transcript.clear()
+            tool_cards.clear()
+            if restored.get('runs'):
+                run = restored['runs'][-1]
+                progress.set_text(f"{run['status'].capitalize()} · Reference: {run['id']}")
             for kind, content in history_parts(restored):
-                message(kind, content)
+                activity(content) if kind == 'activity' else message(kind, content)
 
         async def new_conversation():
             await actor()
@@ -256,9 +383,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         async def send():
             if state['busy'] or not state['agent'] or not (text := prompt.value.strip()):
                 return
-            current = await actor()
-            agent_id = state['agent']
-            await service.authorize(current, agent_id)
+            # Claim the submission before the first await; rapid clicks cannot start two mutations.
+            state['busy'] = True
+            try:
+                current = await actor()
+                agent_id = state['agent']
+                await service.authorize(current, agent_id)
+            except BaseException:
+                state['busy'] = False
+                raise
             if state['imported']:
                 transcript.clear()
             state['busy'] = True
@@ -271,32 +404,40 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             prompt.set_value('')
             with transcript:
                 with ui.chat_message(name='Agent').classes('w-full max-w-full'):
-                    answer = ui.label('').classes('whitespace-pre-wrap break-words')
+                    answer = ui.markdown('', extras=['tables', 'fenced-code-blocks'], sanitize=True).classes('markdown w-full')
             progress.set_text('Agent is working…')
             chunks = []
 
             async def event_received(event):
-                if event.get('type') == 'text':
+                if event.get('type') == 'run_started':
+                    state['conversation'] = event['conversation_id']
+                    progress.set_text('Running · Reference: ' + event['operation_id'])
+                elif event.get('type') == 'text':
                     chunks.append(event.get('text', ''))
-                    answer.set_text(''.join(chunks))
+                    answer.set_content(''.join(chunks))
                 elif event.get('type') in {'tool_call', 'tool_result'}:
-                    message('tool', event.get('name', 'Tool') + '\n' + json.dumps(
-                        event.get('content'), ensure_ascii=False, default=str))
+                    activity(event)
 
             try:
                 result = await runtime.chat(current, agent_id, state['conversation'], text, event_received)
                 state['conversation'] = result['conversation_id']
                 state['imported'] = False
-                answer.set_text(result['output'])
+                answer.set_content(result['output'])
+                progress.set_text('Requires reconciliation' if result.get('status') == 'reconciliation' else 'Completed')
                 await histories()
+                await refresh()
+            except Exception as exc:
+                error = diagnose(exc, agent_id=agent_id)
+                progress.set_text(('Requires reconciliation · ' if error.reconciliation else 'Failed · ') + str(error))
+                await histories()
+                raise error from None
             finally:
                 state['busy'] = False
-                send_button.enable()
+                send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
                 prompt.enable()
                 new_button.enable()
                 history_select.enable()
                 agent_choice.enable()
-                progress.set_text('')
 
         async def configure_agent():
             current = await actor()
@@ -305,7 +446,36 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-4'):
                 ui.label('Configure ' + agent['name']).classes('text-xl font-semibold')
                 provider = ui.select(options, label='Model provider', value=agent.get('provider_id')).classes('w-full')
-                model = ui.input('Model ID', value=agent.get('model', '')).classes('w-full')
+                original_model = agent.get('model', '')
+                model = ui.select([original_model] if original_model else [], label='Model ID', value=original_model or None,
+                                  with_input=True, new_value_mode='add-unique').classes('w-full')
+                model_status = ui.label('').classes('text-sm').props('role=status')
+
+                async def load_models():
+                    selected_provider = provider.value
+                    model.props('loading')
+                    model_status.set_text('Loading models…')
+                    try:
+                        choices = await runtime.models(await actor(), selected_provider) if selected_provider else []
+                        if provider.value != selected_provider:
+                            return
+                        selected_model = model.value
+                        model.set_options(list(dict.fromkeys(([selected_model] if selected_model else []) + choices)),
+                                          value=selected_model)
+                        model_status.set_text(f'{len(choices)} models available. Custom IDs can be entered.' if choices
+                                              else 'No models discovered. Enter a custom Model ID and press Enter.')
+                    except Exception as exc:
+                        if provider.value == selected_provider:
+                            error = diagnose(exc, agent_id=agent['id'], tool='discover_models')
+                            unsupported = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {404, 405, 501}
+                            model_status.set_text(('This provider does not support model discovery.' if unsupported else str(error))
+                                                  + ' Enter a custom Model ID and press Enter.')
+                    finally:
+                        if provider.value == selected_provider:
+                            model.props(remove='loading')
+
+                provider.on_value_change(lambda: protect(load_models))
+                ui.timer(0.01, load_models, once=True)
                 instructions = ui.textarea('System instructions', value=agent.get('instructions', '')).classes('w-full')
                 can_provision = ui.checkbox('Allow subordinate agent creation', value=bool(agent.get('can_provision'))) \
                     if current.get('type') == 1 else None
@@ -313,7 +483,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 async def save():
                     options = {'can_provision': can_provision.value} if can_provision is not None else {}
                     await service.update_agent(await actor(), agent['id'], provider.value,
-                                               model.value.strip(), instructions.value, **options)
+                                               (model.value or '').strip(), instructions.value, **options)
                     dialog.close()
                     await refresh()
                     await show_agent(agent['id'])
@@ -442,6 +612,21 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.button('Test tool calling', on_click=lambda: protect(test)).props('outline')
                     ui.button('Close', on_click=dialog.close).props('flat')
             dialog.open()
+
+        def filter_tree():
+            tree.props['filter'] = search.value or ''
+            if search.value:
+                tree.expand()
+            else:
+                tree.collapse()
+            tree.update()
+
+        search.on_value_change(filter_tree)
+        main = next((a for a in agents.values() if a.get('is_main')), None)
+        if main:
+            await show_agent(main['id'])
+
+        drawer.props('show-if-above')
 
         tree.on_select(lambda e: protect(lambda: select_node(e)))
         agent_choice.on_value_change(lambda e: protect(lambda: choose_agent(e)))
