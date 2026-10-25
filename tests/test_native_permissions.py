@@ -425,3 +425,49 @@ async def test_real_cloudmonkey_signed_unknown_api_works_when_discovery_is_denie
         await asyncio.to_thread(server.shutdown)
         server.server_close()
         thread.join(timeout=2)
+
+
+async def test_agent_context_discovery_is_informational_for_native_execution():
+    from dirigentenstab.service import Service
+
+    record = {'id': 'agent', 'name': 'Agent', 'domain_id': 'owned-domain'}
+    cloud = Native({'createServiceOffering'}, discovery_error=CloudError('Discovery denied', rejected=True))
+    service = Service(SimpleNamespace(all=lambda *args: [], audit=lambda *args, **kwargs: None),
+                      SimpleNamespace(max_output=65536))
+
+    async def agent(agent_id):
+        assert agent_id == record['id']
+        return record
+
+    async def cloud_client(selected):
+        assert selected is record
+        return cloud
+
+    async def assets(agent_id):
+        return []
+
+    service.agent, service.cloud_client, service.guest_assets = agent, cloud_client, assets
+    context = await service.context(record)
+    assert context['available_api_names'] == []
+    assert context['cloudstack']['domain_id'] == record['domain_id']
+    assert await service.execute('agent', 'createServiceOffering', {'name': 'Allowed offering'}) == {'success': True}
+    assert all(identity == cloud.credentials for identity in cloud.identities)
+
+
+async def test_native_poll_denial_cannot_turn_a_submitted_job_into_a_safe_retry():
+    class Pending(Native):
+        async def raw(self, command, params=None):
+            if command in {'deployVirtualMachine', 'queryAsyncJobResult'}:
+                self.calls.append((command, params))
+                self.identities.append(dict(self.credentials))
+                if command == 'deployVirtualMachine':
+                    return {'jobid': 'submitted-job'}
+                raise CloudError('CloudStack error 403: polling denied', rejected=True)
+            return await super().raw(command, params)
+
+    cloud = Pending({'deployVirtualMachine'})
+    with pytest.raises(CloudError, match='submitted-job') as failure:
+        await cloud.execute('deployVirtualMachine', {'id': 'owned-vm'})
+    assert not failure.value.rejected
+    assert sum(name == 'deployVirtualMachine' for name, _ in cloud.calls) == 1
+    assert all(identity == cloud.credentials for identity in cloud.identities)

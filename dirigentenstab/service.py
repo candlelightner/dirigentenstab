@@ -498,14 +498,14 @@ class Service:
         if not account or not account.get('name') or enabled and account.get('state') != 'enabled':
             raise PermissionError('Cannot verify the managed CloudStack account; previous credentials retained')
         response = await call('listUsers', {'account': account['name'], 'domainid': agent['domain_id'],
-                                          'listall': True, 'pagesize': 500})
+                                          'listall': True, 'page': 1, 'pagesize': 500})
         users = response.get('user', [])
         if (len(users) != 1 or int(response.get('count', len(users))) != 1
                 or users[0].get('id') != agent['user_id'] or users[0].get('accountid') != agent['account_id']
                 or users[0].get('domainid') != agent['domain_id']
                 or enabled and users[0].get('state') != 'enabled'):
             raise PermissionError('Managed account must contain exactly its recorded user; review it in CloudStack before retrying')
-        response = await call('listUserKeys', {'userid': agent['user_id'], 'pagesize': 500})
+        response = await call('listUserKeys', {'userid': agent['user_id'], 'page': 1, 'pagesize': 500})
         keys = response.get('userapikey', [])
         if int(response.get('count', len(keys))) != len(keys):
             raise PermissionError('Native key catalogue is incomplete; previous credentials retained')

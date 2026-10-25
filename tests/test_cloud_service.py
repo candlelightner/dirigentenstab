@@ -320,6 +320,16 @@ def rotation_service(store, cloud):
     return service
 
 
+async def test_key_inventory_pairs_pagesize_with_page_required_by_cloudstack(store):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    await service._owned_keys(cloud.raw, await service.agent('parent'))
+    paginated = [(command, params) for command, params in cloud.calls if 'pagesize' in params]
+    assert {command for command, _ in paginated} == {'listUsers', 'listUserKeys'}
+    assert all(params['page'] == 1 for _, params in paginated)
+
+
 @pytest.mark.parametrize('version', ['', '4.22.1.1', '4.24.0.0'])
 async def test_existing_unsupported_cloudstack_is_rejected_before_any_provisioning(store, version):
     service = Service(store, SimpleNamespace())
