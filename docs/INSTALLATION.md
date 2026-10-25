@@ -49,6 +49,14 @@ sudo ./setup.sh --verify --existing
 
 This path prepares only application prerequisites, credentials, SQLite and the first agent. It neither installs CloudStack nor modifies its zone, storage or hypervisor. The remote API and approved guest networks must be reachable from the application container. Register trusted Linux cloud-init templates through the platform administrator configuration before managed guest creation.
 
+## Stopped VM capacity reservations
+
+CloudStack 4.23 defaults `capacity.skipcounting.hours` to **3600 seconds**, despite its name. Stopped VMs retain CPU/RAM reservations during that interval. A deployment with frequent start/stop operations can therefore report `No destination found` while the host has free physical resources. Inspect actual allocated/reserved capacity and the unchanged admission thresholds first; wait for reservation expiry when appropriate.
+
+A platform administrator may explicitly choose a shorter interval, such as 60 seconds, for an owned deployment. This is a **global CloudStack policy**, affecting the entire connected installation. The 4.23 capacity manager reads it at management-server configuration time, so applying or rolling back the change requires restarting only `cloudstack-management`. Record the previous value and obtain the deployment administrator's authorization before changing it through CloudStack Global Settings or its supported `updateConfiguration` API. Do not increase CPU/RAM overcommit ratios or disable capacity thresholds to work around stopped reservations. Neither the installer nor `--existing` changes this policy automatically.
+
+The implementation is visible in Apache's [capacity manager](https://github.com/apache/cloudstack/blob/463f8d0294702a920e8020b62ae3b67f52ae1473/server/src/main/java/com/cloud/capacity/CapacityManagerImpl.java) and [configuration definition](https://github.com/apache/cloudstack/blob/463f8d0294702a920e8020b62ae3b67f52ae1473/server/src/main/java/com/cloud/configuration/Config.java). Recheck these semantics when upgrading CloudStack.
+
 ## HTTPS, Cloudflare Tunnel, Tailscale and consoles
 
 The local application serves HTTPS and NiceGUI WebSockets on the same port. Accept the generated development certificate locally or replace the certificate/key secret with a certificate trusted by your clients. `PUBLIC_ORIGIN` must match your actual HTTPS origin, including any non-default port. Secure cookies deliberately do not work over plain HTTP.

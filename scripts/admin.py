@@ -39,7 +39,7 @@ async def perform(options, app, login=None):
     if options.command == 'resolve-rejection':
         if not options.confirmed_rejection:
             raise SystemExit('Requires --confirmed-rejection after verifying a definitive server rejection in private logs.')
-        op = app.store.one("SELECT * FROM vm_deployments WHERE id=? AND phase IN ('prepared','dispatched')",
+        op = app.store.one("SELECT * FROM vm_deployments WHERE id=? AND phase IN ('prepared','dispatched','failed')",
                            (options.identifier,))
         if not op:
             raise SystemExit('No unresolved deployment with that ID.')
@@ -50,9 +50,9 @@ async def perform(options, app, login=None):
         jobs = (await cloud.raw('listAsyncJobs', {'listall': True})).get('asyncjobs', [])
         if any(job.get('jobstatus') == 0 for job in jobs):
             raise SystemExit('An asynchronous job is pending; no state changed.')
-        app.store.execute("UPDATE vm_deployments SET phase='failed' WHERE id=?", (op['id'],))
+        app.store.execute("UPDATE vm_deployments SET phase='rejected' WHERE id=?", (op['id'],))
         app.store.audit('local-platform-admin', 'resolve-confirmed-deployment-rejection', op['id'])
-        print('Confirmed rejected deployment marked failed. No VM was created or deleted.')
+        print('Confirmed rejected deployment marked rejected. No VM was created or deleted.')
         return
     auth = Auth(app)
     token, _ = await auth.login(login['username'], login['password'], login.get('domain', '/'), 'local-admin')

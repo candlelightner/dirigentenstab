@@ -175,7 +175,7 @@ class Service:
     async def _deploy_managed(self, agent, cloud, params, *, workspace_disk=False):
         from .guest import Guest
 
-        pending = self.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched')",
+        pending = self.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')",
                                  (agent['id'],))
         if pending:
             raise CloudError(f"Deployment {pending['id']} needs recovery before another managed VM is created")
@@ -211,7 +211,8 @@ class Service:
             result = await cloud.raw('deployVirtualMachine', request)
         except CloudError as exc:
             if exc.rejected:
-                self.store.execute("UPDATE vm_deployments SET phase='failed' WHERE id=?", (op_id,))
+                self.store.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=?",
+                                   (time.time(), op_id))
                 raise
             raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying') from None
         except (TimeoutError, OSError):
@@ -223,8 +224,10 @@ class Service:
             while time.monotonic() < deadline:
                 status = await cloud.raw('queryAsyncJobResult', {'jobid': result['jobid']})
                 if status.get('jobstatus') == 2:
-                    self.store.execute("UPDATE vm_deployments SET phase='failed' WHERE id=?", (op_id,))
-                    raise CloudError('Managed VM deployment failed; access record retained for administrator review')
+                    # Failed deployment jobs can retain a Stopped VM and its already-injected SSH identity.
+                    self.store.execute("UPDATE vm_deployments SET phase='failed',updated=? WHERE id=?",
+                                       (time.time(), op_id))
+                    raise CloudError(f'Managed deployment {op_id} failed; recover before retrying')
                 if status.get('jobstatus') == 1:
                     result = status['jobresult']
                     break
@@ -253,18 +256,38 @@ class Service:
         return group['id']
 
     def _bind_vm(self, op_id, vm_id):
+        if not isinstance(vm_id, str) or not vm_id:
+            raise CloudError('Recovered VM has no valid identity')
         with self.store.connect() as conn:
-            conn.execute('UPDATE vm_access SET vm_id=? WHERE vm_id=?', (vm_id, 'pending-' + op_id))
+            conn.execute('BEGIN IMMEDIATE')
+            op = conn.execute('SELECT agent_id,vm_id FROM vm_deployments WHERE id=?', (op_id,)).fetchone()
+            if not op or op['vm_id'] not in {None, vm_id}:
+                raise CloudError('Deployment is missing or already bound to another VM')
+            pending = conn.execute('SELECT owner_agent FROM vm_access WHERE vm_id=?',
+                                   ('pending-' + op_id,)).fetchone()
+            existing = conn.execute('SELECT owner_agent FROM vm_access WHERE vm_id=?', (vm_id,)).fetchone()
+            if pending:
+                if pending['owner_agent'] != op['agent_id'] or existing:
+                    raise CloudError('Prepared SSH identity ownership conflicts with VM recovery')
+                conn.execute('UPDATE vm_access SET vm_id=? WHERE vm_id=?', (vm_id, 'pending-' + op_id))
+            elif op['vm_id'] != vm_id or not existing or existing['owner_agent'] != op['agent_id']:
+                raise CloudError('Prepared SSH identity is missing; deployment needs administrator review')
             conn.execute("UPDATE vm_deployments SET vm_id=?,phase='complete',updated=? WHERE id=?",
                          (vm_id, time.time(), op_id))
 
     async def recover_deployments(self):
-        for op in self.store.all("SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched')"):
+        for op in self.store.all("SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"):
             agent = await self.agent(op['agent_id'])
             cloud = await self.cloud_client(agent)
+            accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
+            account = next((value for value in accounts if value.get('id') == agent['account_id']
+                            and value.get('domainid') == agent['domain_id'] and value.get('name')), None)
+            if not account:
+                raise CloudError(f"Cannot verify the owning CloudStack account for deployment {op['id']}")
             response = await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})
-            matches = [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']]
-            if len(matches) == 1:
+            matches = [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
+                       and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
+            if len(matches) == 1 and matches[0].get('state') in {'Running', 'Stopped'}:
                 self._bind_vm(op['id'], matches[0]['id'])
             else:
                 self.store.audit(op['agent_id'], 'deployment-recovery-needs-review', op['id'], 'pending')

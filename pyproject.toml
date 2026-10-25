@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirigentenstab"
-version = "0.1.0"
+version = "0.1.1"
 description = "Small CloudStack-backed hierarchical AI agent manager"
 requires-python = ">=3.12"
 license = "MIT"
@@ -32,6 +32,7 @@ dirigentenstab = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
 testpaths = ["tests"]
 markers = ["browser: real Chromium tests (install playwright and chromium)",
            "live: real private CloudStack/KVM acceptance tests (explicit opt-in)"]
