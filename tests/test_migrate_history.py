@@ -1,5 +1,7 @@
 import json
 import base64
+import importlib.util
+from pathlib import Path
 import hashlib
 import os
 import sqlite3
@@ -11,7 +13,9 @@ from cryptography.fernet import Fernet
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from dirigentenstab.store import Store
-from scripts import migrate_history as migration
+spec = importlib.util.spec_from_file_location('migrate_history', Path(__file__).parents[1] / 'scripts/migrate_history.py')
+migration = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(migration)
 
 
 @pytest.fixture
