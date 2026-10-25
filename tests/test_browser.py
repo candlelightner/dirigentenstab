@@ -296,7 +296,7 @@ async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.set_viewport_size({'width': 390, 'height': 844})
-        await page.wait_for_timeout(400)
+        await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await page.get_by_role('button', name='GPU policies', exact=True).click()
         await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')

@@ -7,13 +7,18 @@ on:
         type: boolean
         required: true
         default: false
+      gpu_lifecycle:
+        description: Also run the prepared private web-UI 3x8Q to 1x24Q allocation test and clean its four disposable VMs
+        type: boolean
+        required: true
+        default: false
 permissions:
   contents: read
 jobs:
   acceptance:
     if: inputs.confirm && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, x64, dirigentenstab-acceptance]
-    timeout-minutes: 30
+    timeout-minutes: ${{ inputs.gpu_lifecycle && 90 || 30 }}
     environment: private-cloud-acceptance
     steps:
       - name: Test the explicitly deployed installation
@@ -24,3 +29,10 @@ jobs:
           cd "$DIRIGENTENSTAB_INSTALL"
           sudo -n .venv/bin/python scripts/live_acceptance.py --run
           sudo -n .venv/bin/python scripts/gpu_acceptance.py --run
+      - name: Real policy-authorized dynamic mdev lifecycle through the web UI
+        if: inputs.gpu_lifecycle
+        env:
+          DIRIGENTENSTAB_INSTALL: ${{ vars.DIRIGENTENSTAB_INSTALL }}
+        run: |
+          cd "$DIRIGENTENSTAB_INSTALL"
+          sudo -n .venv/bin/python scripts/gpu_lifecycle_acceptance.py --run --cleanup

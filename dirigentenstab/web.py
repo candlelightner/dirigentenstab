@@ -202,7 +202,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
                 setTimeout(fit,500); })();
         </script>""")
-        with ui.left_drawer(value=False).props('breakpoint=900 bordered width=300 :behavior="$q.screen.lt.md ? \'mobile\' : \'desktop\'"').classes('bg-stone-50') as drawer:
+        with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
                     ui.label('Agents').classes('text-lg font-semibold')
@@ -292,7 +292,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 rows = await runtime.conversations(current, state['agent'])
                 history_select.set_options({row['id']: row['title'] for row in rows}, value=state['conversation'])
 
-        async def show_agent(agent_id):
+        async def show_agent(agent_id, *, close_navigation=True):
             if state['busy']:
                 ui.notify('Wait for the current reply to finish.')
                 return
@@ -308,7 +308,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent_choice.set_value(agent_id)
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
-            drawer.hide()
+            if close_navigation:
+                drawer.hide()
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
@@ -811,9 +812,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         search.on_value_change(filter_tree)
         main = next((a for a in agents.values() if a.get('is_main')), None)
         if main:
-            await show_agent(main['id'])
-
-        drawer.props('show-if-above')
+            await show_agent(main['id'], close_navigation=False)
 
         tree.on_select(lambda e: protect(lambda: select_node(e)))
         agent_choice.on_value_change(lambda e: protect(lambda: choose_agent(e)))
