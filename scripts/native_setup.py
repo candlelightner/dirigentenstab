@@ -217,7 +217,7 @@ def network():
 
 
 def guest_ssh():
-    """Install only scoped application-to-guest SSH forwarding, without restarting native services."""
+    """Install scoped SSH and native-SG routed guest forwarding without restarting native services."""
     save('/usr/local/libexec/dirigentenstab-guest-ssh.py',
          (ROOT / 'scripts/guest_ssh_forwarding.py').read_text(), 0o755)
     for kind in ('service', 'timer'):

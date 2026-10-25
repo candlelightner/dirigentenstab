@@ -1,5 +1,5 @@
 [Unit]
-Description=Dirigentenstab application guest SSH forwarding
+Description=Dirigentenstab scoped SSH and native-SG guest routing
 After=docker.service cloudstack-agent.service
 
 [Service]
