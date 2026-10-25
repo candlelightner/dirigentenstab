@@ -109,7 +109,7 @@ def configure(args):
     if zone_file.exists():
         zone = json.loads(zone_file.read_text())
         if zone.get('template_id'):
-            store.execute('INSERT OR IGNORE INTO managed_templates VALUES(?,?)',
+            store.execute('INSERT OR IGNORE INTO managed_templates(id,name) VALUES(?,?)',
                           (zone['template_id'], 'Managed Ubuntu cloud-init template'))
     for path in [data, *data.iterdir()]:
         os.chown(path, 10001, 10001)

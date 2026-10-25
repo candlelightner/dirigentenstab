@@ -1,0 +1,15 @@
+# Dirigentenstab 0.1.5
+
+Prepare an agent-driven GPU build without giving agents host or GPU-administrator access. Add private template creation from an owned stopped managed root volume, durable intent/recovery, and managed deployment of the resulting private image. Only explicitly approved build templates grant sudo inside newly created guests; the managed SSH identity remains non-root. Existing templates keep their previous permissions.
+
+Stream operator-approved, SHA-256-verified large guest assets over existing pinned-key SFTP while retaining the 8 MiB limit for normal workspace transfers. Proprietary payloads stay in private deployment storage and never enter GitHub, image layers, provider context or public HTTP routes.
+
+Add an optional socket-activated GPU controller with root-owned policies and durable operation receipts. Only authenticated human platform administrators grant profiles, native quotas, release-on-stop, unused owned-pool reconfiguration and subgroup capacity. Every ancestor restricts the effective permission; missing permission denies. Agents can change only their own group's or descendant groups' devices. Native VM authorization/quotas and actual host attachments are independently checked; foreign, unknown, allocated or reserved devices are protected. The controller serializes persistent mdev creation, native rediscovery, stop/release and GPU-to-CPU offering changes, including safe unused 3×8Q → 1×24Q transitions. Ambiguous dispatches require reconciliation; completed VM mutations are never silently repeated.
+
+With `ENABLE_GPU_CONTROL=true`, the standard installer supplies `mdevctl`, `xmlstarlet`, the private socket/service and Compose wiring without imports or subsequent package installation. NVIDIA's licensed manager/bundle remain operator prerequisites. Native discovery's missing `xmlstarlet` dependency is fixed and covered by an independent stale-inventory/attachment regression check.
+
+Add an optional administrator-only **CloudStack Dashboard** quicklink in the desktop header and mobile hierarchy menu. `CLOUDSTACK_UI_URL` is independent of the API endpoint; platform settings can override or hide it. The link opens a separate tab with normal native authentication, without API keys/session tokens in its URL. The reference host uses a separate tailnet-only HTTPS endpoint and retains its existing Serve routes and private management bind.
+
+Migration 009 adds template-creation records, one explicit template capability and platform settings. Back up SQLite consistently with its matching encryption key, TLS secrets and environment before deployment. Keep the previous versioned image/digest for rollback. Existing guest disks, NVIDIA configuration, legacy archives, SSH and Tailscale routes are retained.
+
+See [GPU preparation](GPU_PREPARATION.md) for actual profile/offering/build-template identifiers, driver delivery, licensing prerequisites and the remaining human-initiated GPU acceptance gate. No final GPU image or GPU workload is created by this update.

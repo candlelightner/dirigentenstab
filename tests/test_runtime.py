@@ -567,3 +567,91 @@ async def test_three_turn_conversation_preserves_65_tool_chain_across_restart(se
     assert len(long_run['events']) == 130
     assert sum(command == 'deployVirtualMachine' for _, command, _ in service.executions) == 1
     assert sum(p['part_kind'] == 'user-prompt' for m in saved['messages'] for p in m['parts']) == 3
+
+
+async def test_restart_keeps_uncertain_template_dispatch_in_reconciliation(service, monkeypatch):
+    from dirigentenstab.cloud import CloudError
+    async def dispatch(*args):
+        raise CloudError('Template accepted, response lost')
+    service.execute = dispatch
+    async def model(messages, info):
+        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
+            {'command': 'createTemplate', 'params': {'name': 'private', 'volumeid': 'root'}}))}
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    with pytest.raises(ValueError):
+        await manager.chat({'userid': 'human'}, 'parent', None, 'Create a private image')
+    run = service.store.one('SELECT * FROM chat_runs')
+    service.store.execute("UPDATE chat_runs SET status='running' WHERE id=?", (run['id'],))
+    restarted = runtime.Runtime(service)
+    current = service.store.one('SELECT * FROM chat_runs WHERE id=?', (run['id'],))
+    assert current['status'] == 'reconciliation'
+    with pytest.raises(ValueError):
+        await restarted.resume({'userid': 'human'}, run['id'])
+
+
+async def test_recovered_private_template_continues_the_same_owned_task(service, monkeypatch):
+    from dirigentenstab.cloud import CloudError
+    values = {'name': 'image', 'volumeid': 'root', 'ostypeid': 'linux'}
+    dispatched = []
+    async def execute(agent, command, params):
+        dispatched.append(command)
+        service.store.execute('INSERT INTO template_creations VALUES(?,?,?,?,?,NULL,?,?,?)',
+                              ('image-op', agent, 'root', 'managed-image',
+                               service.store.seal({'request': {**params, 'name': 'managed-image'}}),
+                               'dispatched', 0, 1))
+        raise CloudError('Accepted but connection lost', operation_id='image-op')
+    async def bind(op):
+        assert op['agent_id'] == 'parent' and op['template_id'] == 'private-image'
+        return {'id': 'private-image', 'ispublic': False}
+    service.execute, service._bind_private_template = execute, bind
+    async def model(messages, info):
+        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
+            {'command': 'createTemplate', 'params': values}), tool_call_id='one-image')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    with pytest.raises(ValueError):
+        await manager.chat({'userid': 'human'}, 'parent', None, 'Create one private image')
+    run = service.store.one('SELECT * FROM chat_runs')
+    with pytest.raises(ValueError):
+        await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'image-op')
+    service.store.execute("UPDATE template_creations SET phase='complete',template_id='private-image'")
+    await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'image-op')
+    async def finish(messages, info):
+        yield 'Reused the recovered private image'
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=finish))
+    result = await manager.resume({'userid': 'human'}, run['id'])
+    assert result['operation_id'] == run['id'] and result['status'] == 'completed'
+    assert dispatched == ['createTemplate']
+
+
+async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_replay(service, monkeypatch):
+    from dirigentenstab.diagnostics import OperationError
+    from dirigentenstab.gpu import operation_id
+    args = {'command': 'deployVirtualMachine', 'params': {'templateid': 'base', 'serviceofferingid': 'gpu'}}
+    calls = []
+    async def execute(*values):
+        calls.append(values)
+        raise OperationError('gpu', 'Saved host operation requires reconciliation', 'reference', reconciliation=True)
+    service.execute = execute
+    async def model(messages, info):
+        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(args), tool_call_id='gpu-call')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    with pytest.raises(ValueError):
+        await manager.chat({'userid': 'human'}, 'parent', None, 'Create a GPU VM')
+    run = service.store.one('SELECT * FROM chat_runs')
+    async def confirmed(settings, action, **payload):
+        assert action == 'result' and payload['session'] == 'private-session-hash'
+        assert payload['operation_id'] == operation_id({'run_id': run['id'], 'call_id': 'gpu-call'})
+        return {'phase': 'completed', **args, 'result': {'virtualmachine': {'id': 'already-created'}}}
+    monkeypatch.setattr(runtime, 'helper_call', confirmed)
+    with pytest.raises(PermissionError):
+        await manager.reconcile_gpu(service, {'userid': 'other-human', '_session': 'forged'}, run['id'])
+    await manager.reconcile_gpu(service, {'userid': 'human', '_session': 'private-session-hash'}, run['id'])
+    async def finish(messages, info):
+        assert 'already-created' in str(messages)
+        yield 'Reused the verified GPU VM'
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=finish))
+    completed = await manager.resume({'userid': 'human'}, run['id'])
+    assert completed['status'] == 'completed' and completed['operation_id'] == run['id'] and len(calls) == 1

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirigentenstab"
-version = "0.1.4"
+version = "0.1.5"
 description = "Small CloudStack-backed hierarchical AI agent manager"
 requires-python = ">=3.12"
 license = "MIT"

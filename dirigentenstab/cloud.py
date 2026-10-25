@@ -41,6 +41,7 @@ associateIpAddress disassociateIpAddress createSecurityGroup deleteSecurityGroup
 authorizeSecurityGroupIngress revokeSecurityGroupIngress authorizeSecurityGroupEgress revokeSecurityGroupEgress
 addNicToVirtualMachine removeNicFromVirtualMachine updateDefaultNicForVirtualMachine
 createTags deleteTags
+createTemplate changeServiceForVirtualMachine
 '''.split())
 PROVISION_APIS = frozenset('''
 listApis listDomains listAccounts listUsers listRoles createDomain createAccount

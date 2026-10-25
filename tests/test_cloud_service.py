@@ -515,7 +515,7 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
     template = '00000000-0000-0000-0000-000000000001'
     params = {'templateid': template, 'zoneid': '00000000-0000-0000-0000-000000000002',
               'serviceofferingid': '00000000-0000-0000-0000-000000000003'}
-    store.execute('INSERT INTO managed_templates VALUES(?,?)', (template, 'Managed Linux'))
+    store.execute('INSERT INTO managed_templates(id,name) VALUES(?,?)', (template, 'Managed Linux'))
 
     class DeploymentCloud:
         deployments = 0
@@ -770,3 +770,82 @@ async def test_concurrent_catalogue_requests_share_one_fetch():
     cloud.raw = raw
     results = await asyncio.gather(*(cloud.catalogue() for _ in range(8)))
     assert calls == ['listApis'] and all('listDomains' in result for result in results)
+
+
+async def test_dashboard_is_optional_platform_admin_only_and_never_carries_credentials(store):
+    service = Service(store, SimpleNamespace(cloudstack_ui_url='https://cloud.tailnet.invalid/client'))
+    root, domain = {'userid': 'root-human', 'type': 1}, {'userid': 'domain-human', 'type': 2}
+    assert service.dashboard_url(root) == service.settings.cloudstack_ui_url + '/'
+    assert service.dashboard_url(domain) == ''
+    with pytest.raises(PermissionError):
+        service.save_dashboard_url(domain, 'https://elsewhere.invalid')
+    for value in ('http://cloud.invalid/client', 'javascript:alert(1)', 'https://user:secret@cloud.invalid',
+                  'https://cloud.invalid/client?sessionkey=private', 'https://cloud.invalid/#secret'):
+        with pytest.raises(ValueError):
+            service.save_dashboard_url(root, value)
+    service.save_dashboard_url(root, 'https://new.tailnet.invalid/client/')
+    assert service.dashboard_url(root) == 'https://new.tailnet.invalid/client/'
+    service.save_dashboard_url(root, '')
+    assert service.dashboard_url(root) == ''
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+async def test_private_template_ownership_recovery_and_managed_clone_approval(store, interrupted):
+    add_parent(store)
+    store.execute('INSERT INTO managed_templates VALUES(?,?,?)', ('base', 'Approved build base', 1))
+    store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key) VALUES(?,?,?,?)',
+                  ('vm', 'parent', 'dirigent', store.seal('synthetic-key')))
+    class TemplateCloud:
+        calls = 0
+        template = None
+        async def catalogue(self):
+            return {'createTemplate': {'params': [{'name': n, 'type': 'string', 'required': True}
+                    for n in ('name', 'volumeid', 'ostypeid')] + [
+                        {'name': 'ispublic', 'type': 'boolean'}, {'name': 'account', 'type': 'string'}]}}
+        async def raw(self, command, params):
+            if command == 'listVolumes':
+                return {'volume': [{'id': 'root', 'type': 'ROOT', 'virtualmachineid': 'vm'}]}
+            if command == 'listVirtualMachines':
+                return {'virtualmachine': [{'id': 'vm', 'state': 'Stopped', 'templateid': 'base'}]}
+            if command == 'listTemplates':
+                return {'template': [self.template] if self.template else []}
+            if command == 'listAccounts':
+                return {'account': [{'id': 'parent-account', 'domainid': 'parent-domain', 'name': 'owner'}]}
+            assert command == 'createTemplate' and params['ispublic'] is False and params['isfeatured'] is False
+            self.calls += 1
+            self.template = {'id': 'private-image', 'name': params['name'], 'accountid': 'parent-account',
+                             'domainid': 'parent-domain', 'account': 'owner', 'ispublic': False, 'isready': True}
+            if interrupted:
+                raise CloudError('Response lost after creation')
+            return {'template': self.template}
+    cloud = TemplateCloud()
+    service = Service(store, SimpleNamespace(max_output=65536))
+    async def client(*args):
+        return cloud
+    service.cloud_client = client
+    for params in ({'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux', 'ispublic': True},
+                   {'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux', 'account': 'unrelated'}):
+        with pytest.raises(PermissionError):
+            await service.execute('parent', 'createTemplate', params)
+    args = {'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux'}
+    if interrupted:
+        with pytest.raises(CloudError):
+            await service.execute('parent', 'createTemplate', args)
+        with pytest.raises(CloudError, match='recovery'):
+            await service.execute('parent', 'createTemplate', args)
+        await service.recover_templates()
+    result = await service.execute('parent', 'createTemplate', args)
+    assert result['template']['id'] == 'private-image' and cloud.calls == 1
+    assert store.one('SELECT guest_admin FROM managed_templates WHERE id=?', ('private-image',))['guest_admin'] == 1
+    store.execute('DELETE FROM vm_access')
+    with pytest.raises(PermissionError, match='managed root volume'):
+        await service.execute('parent', 'createTemplate', {**args, 'name': 'unauthorized-copy'})
+    assert not {'createServiceOffering', 'createGpuDevice', 'discoverGpuDevices', 'updateResourceLimit'} & RUNTIME_APIS
+
+
+async def test_only_platform_admin_can_extend_a_runtime_policy(store):
+    add_parent(store)
+    service = Service(store, SimpleNamespace())
+    for identity, additions in [({'type': 2}, ['createTemplate']), ({'type': 1}, ['createServiceOffering'])]:
+        with pytest.raises(PermissionError, match='platform administrators'):
+            await service.rotate_credentials(identity, 'parent', additions)

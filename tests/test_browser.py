@@ -246,3 +246,63 @@ async def test_browser_budget_pause_reload_and_continue(browser_app):
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         assert await page.get_by_text('Inspect resources in a second turn', exact=True).count() == 1
         await browser.close()
+
+
+async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        link = page.get_by_role('link', name='CloudStack Dashboard', exact=True).filter(visible=True)
+        await link.wait_for()
+        assert await link.get_attribute('href') == 'https://cloudstack.tailnet.invalid/client/'
+        assert await link.get_attribute('target') == '_blank'
+        assert 'noopener' in await link.get_attribute('rel')
+        await page.set_viewport_size({'width': 390, 'height': 844})
+        await page.wait_for_timeout(400)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await link.wait_for()
+        await page.get_by_role('button', name='Platform settings', exact=True).click()
+        await page.get_by_label('CloudStack Dashboard URL', exact=True).fill('https://another.tailnet.invalid/client')
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        assert await link.get_attribute('href') == 'https://another.tailnet.invalid/client/'
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await link.wait_for()
+        assert await link.get_attribute('href') == 'https://another.tailnet.invalid/client/'
+        await browser.close()
+
+
+async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await page.get_by_role('button', name='GPU policies', exact=True).click()
+        await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
+        await page.get_by_role('option', name='ROOT', exact=True).click()
+        await page.get_by_label('Allowed vGPU profiles', exact=True).fill('GRID P40-8Q')
+        await page.get_by_role('option', name='GRID P40-8Q', exact=True).click()
+        await page.keyboard.press('Escape')
+        await page.get_by_label('Maximum GPU allocations', exact=True).fill('-1')
+        await page.get_by_label('Maximum GPU allocations', exact=True).press('Tab')
+        await page.get_by_role('button', name='Save GPU policy', exact=True).click()
+        await page.get_by_text('Policy saved; native CloudStack quota verified.', exact=True).wait_for()
+        await page.get_by_role('button', name='Close', exact=True).click()
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.set_viewport_size({'width': 390, 'height': 844})
+        await page.wait_for_timeout(400)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='GPU policies', exact=True).click()
+        await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
+        await page.get_by_role('option', name='ROOT', exact=True).click()
+        await page.get_by_text('GRID P40-8Q', exact=True).wait_for()
+        assert await page.get_by_label('Maximum GPU allocations', exact=True).input_value() == '-1'
+        assert await page.get_by_role('checkbox', name='Allow reconfiguration of owned unused GPU pools', exact=True).get_attribute('aria-checked') == 'false'
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await browser.close()

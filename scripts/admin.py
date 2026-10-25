@@ -23,6 +23,8 @@ def service():
     return Service(Store(volume['Mountpoint'] + '/dirigentenstab.db',
                          str(root / env.get('MASTER_KEY_PATH', 'secrets/master_key'))),
                    Settings(env['CLOUDSTACK_URL'], env['PUBLIC_ORIGIN'], cmk='/usr/local/bin/cmk',
+                            cloudstack_ui_url=env.get('CLOUDSTACK_UI_URL', ''),
+                            guest_assets=volume['Mountpoint'] + '/guest-assets',
                             max_hierarchy_depth=int(env.get('MAX_HIERARCHY_DEPTH', '10'))))
 
 
@@ -30,11 +32,16 @@ async def perform(options, app, login=None):
     if options.command == 'status':
         print(json.dumps({'provisioning': app.store.all('SELECT id,parent_id,name,phase,error FROM provisioning'),
                           'deployments': app.store.all('SELECT id,agent_id,name,vm_id,phase FROM vm_deployments'),
+                          'templates': app.store.all('SELECT id,agent_id,name,template_id,phase FROM template_creations'),
                           'rotations': app.store.all('SELECT agent_id,operation_id,phase FROM credential_rotations')}, indent=2))
         return
     if options.command == 'recover-deployments':
         await app.recover_deployments()
         print('Recovery queried CloudStack and bound discovered VMs; unresolved operations remain pending.')
+        return
+    if options.command == 'recover-templates':
+        await app.recover_templates()
+        print('Existing templates inspected; unresolved operations retained without repeating creation.')
         return
     if options.command == 'resolve-rejection':
         if not options.confirmed_rejection:
@@ -59,7 +66,21 @@ async def perform(options, app, login=None):
     try:
         identity = await auth.identity(token)
         if options.command == 'rotate':
-            await app.rotate_credentials(identity, options.identifier)
+            await app.rotate_credentials(identity, options.identifier, options.allow_api)
+        elif options.command == 'approve-template':
+            if identity['type'] != 1:
+                raise PermissionError('Template approval requires platform administrator')
+            values = (await app.human_call(identity, 'listTemplates',
+                      {'id': options.identifier, 'templatefilter': 'all', 'listall': 'true'})).get('template', [])
+            value = next((v for v in values if v['id'] == options.identifier and v.get('isready') and
+                          v.get('hypervisor') == 'KVM'), None)
+            if not value:
+                raise ValueError('Only a verified ready KVM template may be approved')
+            app.store.execute('INSERT INTO managed_templates(id,name,guest_admin) VALUES(?,?,?) '
+                              'ON CONFLICT(id) DO UPDATE SET guest_admin=excluded.guest_admin',
+                              (value['id'], value['name'], int(options.guest_admin)))
+            app.store.audit(identity['userid'], 'approve-template-guest-admin' if options.guest_admin else
+                            'approve-template', value['id'])
         elif options.command == 'revoke':
             await app.revoke_agent(identity, options.identifier)
         elif options.command == 'repair-execution':
@@ -82,18 +103,21 @@ async def perform(options, app, login=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
-                                            'rotate', 'revoke', 'repair-provisioning', 'repair-execution'])
+                                            'rotate', 'revoke', 'repair-provisioning', 'repair-execution',
+                                            'recover-templates', 'approve-template'])
     parser.add_argument('identifier', nargs='?')
     parser.add_argument('--login-file')
     parser.add_argument('--deployment-id')
     parser.add_argument('--confirmed-rejection', action='store_true')
+    parser.add_argument('--allow-api', action='append', default=[], help='Explicit platform-admin runtime policy extension during rotation')
+    parser.add_argument('--guest-admin', action='store_true', help='Approve sudo inside newly deployed guests of this template only')
     options = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root; this command reads the private application master key.')
-    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection'} and not options.identifier:
+    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection', 'approve-template'} and not options.identifier:
         parser.error('This command requires an identifier from status output.')
     login = None
-    if options.command not in {'status', 'recover-deployments', 'resolve-rejection'}:
+    if options.command not in {'status', 'recover-deployments', 'recover-templates', 'resolve-rejection'}:
         if options.login_file:
             path = Path(options.login_file)
             if path.stat().st_mode & 0o077:

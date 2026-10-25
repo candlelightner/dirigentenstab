@@ -1,0 +1,12 @@
+# Explicit opt-in after installing the local controller; no host credential or shell mount.
+services:
+  app:
+    environment:
+      GPU_HELPER_SOCKET: /run/dirigentenstab-gpu/control.sock
+    volumes:
+      - type: bind
+        source: /run/dirigentenstab-gpu/control.sock
+        target: /run/dirigentenstab-gpu/control.sock
+        read_only: true
+        bind:
+          create_host_path: false

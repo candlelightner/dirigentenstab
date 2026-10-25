@@ -10,9 +10,10 @@ import uuid
 import httpx
 
 from .cloud import Cloud, CloudError, PROVISION_APIS, RUNTIME_APIS, redact, validate
-from .settings import endpoint
+from .settings import endpoint, dashboard_endpoint
 from .hierarchy import validate_child
-from .limits import VM_POLICY_COMMANDS, check_vm_policy
+from .limits import APP_ROOT_AGENT, VM_POLICY_COMMANDS, check_vm_policy
+from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 
 
 def first(response, key):
@@ -31,6 +32,8 @@ class Service:
         self._provision_lock = asyncio.Lock()
         self._deploy_lock = asyncio.Lock()
         self._secrets = set()
+        self.gpu_local = False
+        self.gpu_deployment_id = None
         for row in store.all('SELECT runtime,provisioning FROM agents'):
             for field in ('runtime', 'provisioning'):
                 self._remember(store.open(row[field]))
@@ -129,9 +132,34 @@ class Service:
                               'children': [{'id': d['id'], 'path': d.get('path', d['name'])}
                                            for d in domains if d.get('parentdomainid') == domain['id']]},
                 'available_api_names': sorted(set(await cloud.catalogue()) & RUNTIME_APIS),
+                'approved_guest_assets': await self.guest_assets(agent['id']),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'delegate'],
                 'boundaries': 'Host filesystems, hypervisor configuration and host mounts are platform-admin only.'}
+
+    async def guest_assets(self, agent_id):
+        from .guest import Guest
+        return await Guest(self).approved_assets(agent_id)
+
+    def dashboard_url(self, identity):
+        if identity.get('type') != 1:
+            return ''
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='cloudstack_ui_url'")
+        value = row['value'] if row else self.settings.cloudstack_ui_url
+        return dashboard_endpoint(value) if value else ''
+
+    def save_dashboard_url(self, identity, url):
+        if identity.get('type') != 1:
+            raise PermissionError('Platform settings require platform administrator')
+        value = dashboard_endpoint(url.strip()) if url.strip() else ''
+        self.store.execute("INSERT INTO platform_settings VALUES('cloudstack_ui_url',?) "
+                           'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (value,))
+        self.store.audit(identity['userid'], 'configure-cloudstack-dashboard')
+
+    async def gpu_admin(self, identity, action='status', **payload):
+        if identity.get('type') != 1:
+            raise PermissionError('GPU policy administration requires a human platform administrator')
+        return await helper_call(self.settings, action, session=identity['_session'], **payload)
 
     async def search_api(self, agent_id, query):
         agent = await self.agent(agent_id)
@@ -164,7 +192,39 @@ class Service:
                     raise PermissionError('VM operation unavailable to this CloudStack identity')
                 validate(metadata, params)
                 await check_vm_policy(self, agent, params, command=command)
-            if command == 'deployVirtualMachine' and isinstance(params, dict) and self.store.one(
+            if command in GPU_COMMANDS and not self.gpu_local:
+                vm = None
+                if command != 'deployVirtualMachine':
+                    vm = next((v for v in (await cloud.raw('listVirtualMachines', {'id': params.get('id')})).get(
+                        'virtualmachine', []) if v['id'] == params.get('id')), None)
+                offering_ids = {value for value in (params.get('serviceofferingid'), (vm or {}).get('serviceofferingid')) if value}
+                from .limits import gpu_count
+                gpu = False
+                for offering_id in offering_ids:
+                    values = (await cloud.raw('listServiceOfferings', {'id': offering_id})).get('serviceoffering', [])
+                    offering = next((o for o in values if o['id'] == offering_id), None)
+                    if not offering:
+                        raise PermissionError('Compute offering unavailable')
+                    gpu |= gpu_count(offering) > 0
+                if gpu:
+                    context = GPU_CONTEXT.get()
+                    if not context:
+                        raise PermissionError('GPU operations must originate in an authenticated durable agent execution')
+                    preflight = await helper_call(self.settings, 'authorize', agent_id=agent_id, command=command,
+                                                  params=params, context=context)
+                    from .gpu import effective_policy
+                    effective = effective_policy(preflight['chain'], preflight['policies'])
+                    if (preflight['domain_id'] != agent['domain_id'] or preflight['profile'] not in effective['profiles']
+                            or agent['domain_id'] not in {d['id'] for d in preflight['chain']}
+                            or preflight['chain'][-1]['id'] != (vm or {}).get('domainid', agent['domain_id'])
+                            or effective['max_allocations'] == 0 or agent['id'] != APP_ROOT_AGENT
+                            and not effective['subgroup_requests']):
+                        raise PermissionError('Server-side effective GPU policy denied this agent operation')
+                    return await helper_call(self.settings, 'execute', agent_id=agent_id, command=command,
+                                             params=params, context=context)
+            if command == 'createTemplate':
+                result = await self._create_private_template(agent, cloud, params)
+            elif command == 'deployVirtualMachine' and isinstance(params, dict) and self.store.one(
                     'SELECT id FROM managed_templates WHERE id=?', (params.get('templateid'),)):
                 async with self._deploy_lock:
                     result = await self._deploy_managed(agent, cloud, params)
@@ -200,9 +260,11 @@ class Service:
         if params.get('securitygroupnames'):
             raise ValueError('Use securitygroupids for additional managed VM security groups')
         group_id = await self._ssh_security_group(cloud)
-        op_id = uuid.uuid4().hex
+        op_id = self.gpu_deployment_id or uuid.uuid4().hex
         guest = Guest(self)
-        cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk)
+        template = self.store.one('SELECT * FROM managed_templates WHERE id=?', (params['templateid'],))
+        cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk,
+                                                          guest_admin=bool(template['guest_admin']))
         name = 'ds-vm-' + op_id[:20]
         groups = [group_id, *str(params.get('securitygroupids', '')).split(',')]
         request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode(),
@@ -247,6 +309,93 @@ class Service:
         self._bind_vm(op_id, vm['id'])
         return result
 
+    async def _create_private_template(self, agent, cloud, params):
+        metadata = (await cloud.catalogue()).get('createTemplate')
+        if not metadata:
+            raise PermissionError('Private template creation is not enabled for this agent')
+        validate(metadata, params)
+        allowed = {'name', 'displaytext', 'ostypeid', 'volumeid', 'bits', 'isdynamicallyscalable', 'ispublic', 'isfeatured'}
+        if set(params) - allowed or params.get('ispublic') or params.get('isfeatured') or not params.get('volumeid'):
+            raise PermissionError('Only private templates from an owned managed root volume are permitted')
+        volume = next((v for v in (await cloud.raw('listVolumes', {'id': params.get('volumeid')})).get('volume', [])
+                       if v['id'] == params.get('volumeid') and v.get('type') == 'ROOT'), None)
+        access = self.store.one('SELECT owner_agent FROM vm_access WHERE vm_id=?',
+                                ((volume or {}).get('virtualmachineid'),))
+        if not volume or not access or access['owner_agent'] != agent['id']:
+            raise PermissionError('Template source must be this agent’s managed root volume')
+        vm = next((v for v in (await cloud.raw('listVirtualMachines', {'id': volume['virtualmachineid']})).get(
+            'virtualmachine', []) if v['id'] == volume['virtualmachineid']), None)
+        source = self.store.one('SELECT * FROM managed_templates WHERE id=?', ((vm or {}).get('templateid'),))
+        if not vm or vm.get('state') != 'Stopped' or not source:
+            raise PermissionError('Stop an approved managed VM and prepare its cloud-init identity before creating a template')
+        op_id = hashlib.sha256(json.dumps([agent['id'], params], sort_keys=True).encode()).hexdigest()[:32]
+        name = 'ds-template-' + op_id[:20]
+        request = {**params, 'name': name, 'displaytext': params.get('displaytext', params['name']),
+                   'ispublic': False, 'isfeatured': False}
+        op = self.store.one('SELECT * FROM template_creations WHERE id=?', (op_id,))
+        if op and op['phase'] == 'complete':
+            return {'template': await self._bind_private_template(op)}
+        if op:
+            raise CloudError('Private template operation needs recovery; do not repeat creation', operation_id=op_id)
+        self.store.execute('INSERT INTO template_creations VALUES(?,?,?,?,?,NULL,?,?,?)',
+                           (op_id, agent['id'], volume['id'], name, self.store.seal({'request': request}),
+                            'dispatched', source['guest_admin'], time.time()))
+        deadline = time.monotonic() + 600
+        try:
+            result = await cloud.raw('createTemplate', request)
+            self.store.execute('UPDATE template_creations SET params=? WHERE id=?',
+                               (self.store.seal({'request': request, 'result': result}), op_id))
+            if result.get('jobid'):
+                while time.monotonic() < deadline:
+                    job = await cloud.raw('queryAsyncJobResult', {'jobid': result['jobid']})
+                    if job.get('jobstatus') == 1:
+                        break
+                    if job.get('jobstatus') == 2:
+                        raise CloudError('Private template job failed; inspect the saved operation', operation_id=op_id)
+                    await asyncio.sleep(2)
+                else:
+                    raise CloudError('Private template job pending; recover before continuing', operation_id=op_id)
+            op = self.store.one('SELECT * FROM template_creations WHERE id=?', (op_id,))
+            while time.monotonic() < deadline:
+                try:
+                    return {'template': await self._bind_private_template(op)}
+                except CloudError:
+                    await asyncio.sleep(2)
+            raise CloudError('Private template is still preparing; recover before continuing', operation_id=op_id)
+        except CloudError as exc:
+            if exc.rejected:
+                self.store.execute("UPDATE template_creations SET phase='rejected' WHERE id=?", (op_id,))
+            raise CloudError(str(exc), rejected=exc.rejected, operation_id=op_id) from None
+
+    async def _bind_private_template(self, op):
+        agent = await self.agent(op['agent_id'])
+        cloud = await self.cloud_client(agent)
+        accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
+        owner = next((a for a in accounts if a['id'] == agent['account_id'] and
+                      a.get('domainid') == agent['domain_id']), None)
+        if not owner:
+            raise CloudError('Private template account ownership could not be verified', operation_id=op['id'])
+        values = (await cloud.raw('listTemplates', {'templatefilter': 'self', 'name': op['name'],
+                                                  'listall': True})).get('template', [])
+        template = next((v for v in values if v.get('name') == op['name'] and v.get('account') == owner['name']
+                         and v.get('accountid') in {None, agent['account_id']}
+                         and v.get('domainid') == agent['domain_id'] and not v.get('ispublic') and v.get('isready')), None)
+        if not template:
+            raise CloudError('Private template not ready or ownership not verified; recover before continuing', operation_id=op['id'])
+        with self.store.connect() as conn:
+            conn.execute('INSERT INTO managed_templates(id,name,guest_admin) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING',
+                         (template['id'], template.get('displaytext', template['name']), op['guest_admin']))
+            conn.execute("UPDATE template_creations SET template_id=?,phase='complete',updated=? WHERE id=?",
+                         (template['id'], time.time(), op['id']))
+        return template
+
+    async def recover_templates(self):
+        for op in self.store.all("SELECT * FROM template_creations WHERE phase='dispatched'"):
+            try:
+                await self._bind_private_template(op)
+            except CloudError:
+                self.store.audit(op['agent_id'], 'template-recovery-needs-review', op['id'], 'pending')
+
     async def _ssh_security_group(self, cloud):
         source = ipaddress.ip_network(self.settings.ssh_source_cidr)
         if source.prefixlen != source.max_prefixlen or not source.is_private or source.is_loopback:
@@ -284,8 +433,9 @@ class Service:
             conn.execute("UPDATE vm_deployments SET vm_id=?,phase='complete',updated=? WHERE id=?",
                          (vm_id, time.time(), op_id))
 
-    async def recover_deployments(self):
-        for op in self.store.all("SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"):
+    async def recover_deployments(self, operation_id=None):
+        query = "SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"
+        for op in self.store.all(query + (' AND id=?' if operation_id else ''), (operation_id,) if operation_id else ()):
             agent = await self.agent(op['agent_id'])
             cloud = await self.cloud_client(agent)
             accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
@@ -488,7 +638,9 @@ class Service:
         op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
         return await self._provision(op, cloud, root['id'])
 
-    async def rotate_credentials(self, identity, agent_id):
+    async def rotate_credentials(self, identity, agent_id, additional_apis=()):
+        if additional_apis and (identity.get('type') != 1 or not set(additional_apis) <= RUNTIME_APIS):
+            raise PermissionError('Only platform administrators can explicitly extend runtime API policy')
         agent = await self.authorize(identity, agent_id)
         async with self._provision_lock:
             service = self
@@ -517,7 +669,8 @@ class Service:
                     current_policy = set(json.loads(agent['runtime_policy']))
                     if not current_policy:
                         raise PermissionError('Previous runtime policy unknown; restore or review it before rotation') from None
-                keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'], current_policy)
+                keys = await self._credentials(cloud, agent['user_id'], rotation['operation_id'],
+                                               current_policy | set(additional_apis))
                 self.store.execute("UPDATE credential_rotations SET replacement=?,phase='validating',updated=? WHERE agent_id=?",
                                    (self.store.seal(keys), time.time(), agent_id))
             for purpose in ('runtime', 'provisioning'):

@@ -59,6 +59,11 @@ The implementation is visible in Apache's [capacity manager](https://github.com/
 
 ## HTTPS, Cloudflare Tunnel, Tailscale and consoles
 
+For the reference host's scoped persistent CPVM route, installation and Windows
+reboot checks, see [CONSOLE_ACCESS.md](CONSOLE_ACCESS.md). The optional
+[Ubuntu XFCE template procedure](DESKTOP_TEMPLATE.md) is future work for new,
+explicitly authorized builder VMs; it does not modify running guests.
+
 The local application serves HTTPS and NiceGUI WebSockets on the same port. Accept the generated development certificate locally or replace the certificate/key secret with a certificate trusted by your clients. `PUBLIC_ORIGIN` must match your actual HTTPS origin, including any non-default port. Secure cookies deliberately do not work over plain HTTP.
 
 For Cloudflare Tunnel, configure a route only when you choose to publish it, targeting the local HTTPS application listener; configure origin certificate trust or an explicit origin TLS policy for that tunnel. Forward WebSocket upgrades and preserve the browser Host/Origin. For Tailscale Serve, target the local HTTPS listener and configure the corresponding tailnet HTTPS origin. Do not overwrite existing tunnel/Serve routes; the installer leaves Cloudflare Tunnel, Tailscale and SSH untouched.
@@ -66,3 +71,11 @@ For Cloudflare Tunnel, configure a route only when you choose to publish it, tar
 The CloudStack interface and its API remain private. Access the management interface using an SSH local forward or an explicitly configured private HTTPS proxy. CloudStack's console proxy is a separate endpoint: browser console use requires routing to the CPVM's private address and the console ports configured in CloudStack, plus a console-proxy HTTPS certificate/domain that browsers trust. Configure that private route deliberately; forwarding only the Dirigentenstab port does not forward CloudStack consoles. Do not publish management APIs, console VNC ports, NFS, libvirt or guest SSH to the Internet.
 
 Versioned images are published to GHCR when a version change in `pyproject.toml` reaches main, or through an explicit matching version tag. The release workflow creates its tag and release notes using the repository-scoped GitHub Actions token and refuses to repoint an existing version tag. Production deployment is manual: review the image/version, back up the database and independent master key, set `IMAGE`, pull, and run `docker compose up -d`. There is no push-triggered host deployment.
+
+## Native CloudStack dashboard quicklink
+
+Set optional `CLOUDSTACK_UI_URL` to the native dashboard URL reachable from the **browser**, for example a separately configured private Tailscale HTTPS endpoint ending in `/client`. Do not derive it from the internal `CLOUDSTACK_URL` API address. Blank disables the link. Human platform administrators can override or hide it through **Platform settings**; domain administrators and agents do not receive this setting. Both desktop header and mobile navigation expose the same external link, using ordinary CloudStack login in a separate tab. URLs containing embedded credentials, queries or fragments are rejected.
+
+Creating the private reverse proxy is an operator action. On the reference host only, the added tailnet-only route is `tailscale serve --bg --https=3002 http://10.253.80.1:8080`, with browser URL `https://homeserver.tail3e59e6.ts.net:3002/client`. Existing 3000/3001/9443 routes were preserved. Do not enable Funnel or bind CloudStack's management API publicly. A fresh installation leaves the URL blank until its operator supplies a suitable private endpoint.
+
+GPU build preparation is optional; see [GPU_PREPARATION.md](GPU_PREPARATION.md). Set `ENABLE_GPU_CONTROL=true` before standard setup to install its dependencies and persistent private controller automatically. The standard installer requires no imported hierarchy/workspaces and does not automatically install NVIDIA drivers, partition GPUs or grant policies/change quotas. NVIDIA's licensed host manager and any private guest bundle remain operator-supplied prerequisites.

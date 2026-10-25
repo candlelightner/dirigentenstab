@@ -126,6 +126,28 @@ class FixtureService(Service):
         self._remember(credentials)
         return FixtureCloud(self.settings, credentials)
 
+    async def gpu_admin(self, identity, action='status', **payload):
+        from dirigentenstab.gpu import effective_policy, narrows, validate_policy
+        from dirigentenstab.gpu_control import Controller
+        if identity.get('type') != 1:
+            raise PermissionError('Human platform administrator required')
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='fixture_gpu_policies'")
+        policies = json.loads(row['value']) if row else {}
+        profiles = [{'id': 'nvidia-51', 'name': 'GRID P40-8Q'}, {'id': 'nvidia-53', 'name': 'GRID P40-24Q'}]
+        if action == 'set_policy':
+            policy = validate_policy(payload['policy'], [p['id'] for p in profiles])
+            chain = Controller.chain(DOMAINS, payload['domain_id'])
+            if len(chain) > 1 and not narrows(policy, effective_policy(chain[:-1], policies)):
+                raise PermissionError('Child policy cannot expand ancestor permissions')
+            policies[payload['domain_id']] = policy
+            self.store.execute("INSERT INTO platform_settings VALUES('fixture_gpu_policies',?) "
+                               'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (json.dumps(policies),))
+            return {'saved': True}
+        if action != 'status':
+            raise PermissionError('Fixture GPU operation unavailable')
+        return {'domains': DOMAINS, 'profiles': profiles, 'policies': policies,
+                'pools': [], 'devices': [], 'operations': []}
+
 
 async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
@@ -203,7 +225,8 @@ def main():
     store.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
                   ('main', 'Agents', 'fixture-model', '', 'complete', 0))
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
-                        database=str(store.path), key_file=str(master))
+                        database=str(store.path), key_file=str(master),
+                        cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
     service = FixtureService(store, settings)
     auth = Auth(service)
     runtime_module.REQUESTS_PER_WINDOW = 2
