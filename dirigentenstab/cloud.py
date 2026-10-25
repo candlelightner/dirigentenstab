@@ -20,28 +20,6 @@ class CloudError(RuntimeError):
         self.operation_id = operation_id
 
 
-# This is an authorization policy, not an API specification. Signatures come from listApis.
-RUNTIME_APIS = frozenset('''
-listApis listDomains listAccounts listUsers listVirtualMachines listVirtualMachinesMetrics
-listServiceOfferings listDiskOfferings listTemplates listIsos listOsTypes listZones
-listNetworks listNetworkOfferings listNetworkACLs listNetworkACLLists listNics listVolumes
-listSnapshots listVMSnapshots listPublicIpAddresses listFirewallRules listEgressFirewallRules
-listPortForwardingRules listStaticNatRules listSecurityGroups listTags listResourceLimits
-listResourceCounts listAsyncJobs queryAsyncJobResult listCapabilities listEvents listAlerts
-deployVirtualMachine startVirtualMachine stopVirtualMachine rebootVirtualMachine
-destroyVirtualMachine recoverVirtualMachine restoreVirtualMachine scaleVirtualMachine
-updateVirtualMachine resetUserDataForVirtualMachine
-createVolume attachVolume detachVolume resizeVolume deleteVolume
-createSnapshot deleteSnapshot revertSnapshot createVMSnapshot deleteVMSnapshot revertToVMSnapshot
-createNetwork updateNetwork deleteNetwork restartNetwork
-createNetworkACL deleteNetworkACL createNetworkACLList deleteNetworkACLList
-createFirewallRule deleteFirewallRule createEgressFirewallRule deleteEgressFirewallRule
-createPortForwardingRule deletePortForwardingRule enableStaticNat disableStaticNat
-associateIpAddress disassociateIpAddress createSecurityGroup deleteSecurityGroup
-authorizeSecurityGroupIngress revokeSecurityGroupIngress authorizeSecurityGroupEgress revokeSecurityGroupEgress
-addNicToVirtualMachine removeNicFromVirtualMachine updateDefaultNicForVirtualMachine
-createTags deleteTags
-'''.split())
 PROVISION_APIS = frozenset('''
 listApis listDomains listAccounts listUsers listRoles createDomain createAccount
 registerUserKeys listUserKeys listUserKeyRules deleteUserKeys listCapabilities
@@ -55,6 +33,30 @@ SENSITIVE_FIELD = re.compile(r'(?i)(password|secret|private.?key|api.?key|sessio
 TOKEN_COUNT = re.compile(r'^(?:input|output|cache_write|cache_read|input_audio|cache_audio_read|output_audio|prompt_cache_hit|prompt_cache_miss|reasoning)_tokens$')
 NAME = re.compile(r'^[a-z][a-zA-Z0-9]{1,80}$')
 PARAM_NAME = re.compile(r'^[a-z][a-z0-9]*(?:\[\d{1,3}\]\.[a-z][a-z0-9]*)?$')
+
+# These expose credentials or bypass the scoped host helper; infrastructure grants come only from CloudStack.
+PRIVATE_CONTROL_APIS = frozenset('''
+login logout getUserKeys registerUserKeys listUserKeys listUserKeyRules deleteUserKeys
+createRole updateRole deleteRole enableRole disableRole importRole
+createRolePermission updateRolePermission deleteRolePermission
+createProjectRole updateProjectRole deleteProjectRole
+createProjectRolePermission updateProjectRolePermission deleteProjectRolePermission
+getVMPassword getKubernetesClusterConfig getVirtualMachineUserData createConsoleEndpoint listConsoleSessions
+addHost addBaremetalHost updateHost updateHostPassword deleteHost reconnectHost
+prepareHostForMaintenance cancelHostMaintenance declareHostAsDegraded cancelHostAsDegraded
+configureHAForHost enableHAForHost disableHAForHost releaseHostReservation
+enableOutOfBandManagementForHost disableOutOfBandManagementForHost changeOutOfBandManagementPassword
+createStoragePool updateStoragePool deleteStoragePool changeStoragePoolScope syncStoragePool
+addImageStore addImageStoreS3 updateImageStore deleteImageStore addSecondaryStorage
+updateConfiguration resetConfiguration addLdapConfiguration deleteLdapConfiguration ldapConfig
+issueCertificate provisionCertificate revokeCertificate uploadCustomCertificate
+provisionTemplateDirectDownloadCertificate revokeTemplateDirectDownloadCertificate uploadTemplateDirectDownloadCertificate
+discoverGpuDevices createGpuDevice deleteGpuDevice manageGpuDevice unmanageGpuDevice
+'''.split())
+
+
+def runtime_api(command):
+    return isinstance(command, str) and bool(NAME.fullmatch(command)) and command not in PRIVATE_CONTROL_APIS
 
 
 def redact(value, secrets=()):
@@ -166,13 +168,13 @@ class Cloud:
                     detail = str(error.get('errortext', ''))
                     detail = str(redact(detail, hidden))[:400]
                     message = f'CloudStack error {code}: {detail}'
-                    rejected = code in {400, 401, 403, 431, 435, 436, 535}
+                    rejected = code in {400, 401, 403, 431, 435, 436, 531, 535}
                 except (ValueError, KeyError, TypeError, UnicodeError, StopIteration):
                     match = re.search(r'\(HTTP (\d{3}), error code \d+\)\s*(.*)', text, re.S)
                     if match:
                         status = int(match[1])
                         message = f'CloudStack HTTP {status}: ' + str(redact(match[2], hidden))[:400]
-                        rejected = status in {400, 401, 403, 431, 435, 436, 535}
+                        rejected = status in {400, 401, 403, 431, 435, 436, 531, 535}
                 raise CloudError(message, rejected=rejected)
             return stdout
         finally:
@@ -183,7 +185,9 @@ class Cloud:
                 with suppress(ProcessLookupError):
                     proc.kill()
             # Drain pipes after killing: a full, paused stdout pipe otherwise prevents wait() completing.
-            await proc.communicate()
+            with suppress(TimeoutError):
+                async with asyncio.timeout(5):
+                    await proc.communicate()
 
     async def raw(self, command, params=None):
         if not NAME.fullmatch(command):
@@ -228,22 +232,30 @@ class Cloud:
             raise CloudError('Unexpected CloudStack response')
         return result
 
-    async def catalogue(self):
+    async def catalogue(self, *, refresh=False):
         async with self._catalogue_lock:
-            if self._metadata is None or time.monotonic() - self._metadata_time > 300:
+            if refresh or self._metadata is None or time.monotonic() - self._metadata_time > 300:
                 response = await self.raw('listApis')
                 self._metadata = {api['name']: api for api in response.get('api', [])}
                 self._metadata_time = time.monotonic()
         return self._metadata
 
     async def execute(self, command, params, *, runtime=True):
-        if command not in (RUNTIME_APIS if runtime else PROVISION_APIS):
-            raise PermissionError('This API is reserved for the platform administrator or trusted provisioning')
+        if runtime and not runtime_api(command) or not runtime and command not in PROVISION_APIS:
+            raise PermissionError('Credential and host controls require the trusted server-side workflow')
+        cached = self._metadata is not None and time.monotonic() - self._metadata_time <= 300
         metadata = (await self.catalogue()).get(command)
+        if not metadata and cached:
+            metadata = (await self.catalogue(refresh=True)).get(command)
         if not metadata:
-            raise PermissionError('API unavailable to this CloudStack identity')
+            raise PermissionError('API unavailable to this CloudStack identity and API key')
         validate(metadata, params, runtime=runtime)
-        result = await self.raw(command, params)
+        try:
+            result = await self.raw(command, params)
+        except CloudError as exc:
+            if exc.rejected:
+                self._metadata = None
+            raise
         if result.get('jobid'):
             job_id = result['jobid']
             deadline = time.monotonic() + 600
@@ -252,7 +264,14 @@ class Cloud:
                 if job.get('jobstatus') == 1:
                     return job.get('jobresult', {})
                 if job.get('jobstatus') == 2:
-                    raise CloudError(f'CloudStack asynchronous operation failed; job ID {job_id}')
+                    failure = job.get('jobresult')
+                    if not isinstance(failure, dict):
+                        failure = {}
+                    hidden = [*self.credentials.values(), *(str(value) for key, value in params.items()
+                               if SENSITIVE_FIELD.search(key) or len(str(value)) > 64)]
+                    detail = str(redact(str(failure.get('errortext', 'Native operation rejected')), hidden))[:400]
+                    raise CloudError(f"CloudStack asynchronous operation failed ({failure.get('errorcode', 'unknown')}): "
+                                     f'{detail}; job ID {job_id}')
                 await asyncio.sleep(2)
             raise CloudError(f'CloudStack job remains pending; job ID {job_id}. Check status before retrying')
         return result

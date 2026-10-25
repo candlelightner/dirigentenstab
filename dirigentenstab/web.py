@@ -143,10 +143,21 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'resume_operation': None}
         agents = {row['id']: row for row in data.get('agents', [])}
+        dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
+        dashboard_links = []
+
+        def dashboard_link(classes):
+            link = ui.link('CloudStack Dashboard', dashboard_url or '#', new_tab=True).props(
+                'rel="noopener noreferrer"').classes(classes)
+            link.set_visibility(bool(dashboard_url))
+            dashboard_links.append(link)
+
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
             ui.icon('account_tree').classes('text-teal-900 text-2xl')
             ui.label('Dirigentenstab').classes('font-semibold text-xl')
             ui.space()
+            if identity.get('type') == 1:
+                dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
             ui.html('<form method="post" action="/auth/logout"><input type="hidden" name="csrf" value="'
                     + html.escape(identity['csrf'], quote=True)
@@ -155,7 +166,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
-            .nicegui-content{padding:0;height:calc(100dvh - 65px);min-height:0}
+            .nicegui-content{padding:0;height:calc(var(--viewport-height,100dvh) - 65px);min-height:0}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -168,33 +179,39 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .markdown pre{padding:12px;background:#f5f5f4;border-radius:6px}
             .q-message-text{background:#f5f5f4!important;color:#292524!important;max-width:100%}
             .q-message-container,.q-message-text-content{min-width:0;max-width:100%}
-            .q-dialog__inner>.q-card{max-height:85dvh;overflow-y:auto}
+            .q-dialog__inner{height:var(--viewport-height,100dvh);bottom:auto}
+            .q-dialog__inner>.q-card{max-height:calc(var(--viewport-height,100dvh)*.85);overflow-y:auto}
             .q-tree__node{padding-left:8px}
             .q-tree__children{padding-left:6px}
             .q-tree__node-header{min-height:44px;overflow-wrap:anywhere}
             .q-tree__node-header-content{min-width:0}
             button,.q-btn{min-height:44px}
-            @media(max-width:600px) and (max-height:600px){
-                .workspace:has(.composer textarea:focus) .agent-details{display:none}}
+            .dashboard-mobile{display:none;min-height:44px}
+            @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}
+            .workspace.compact .agent-details{display:none}
             @media(max-width:600px){.workspace{padding:6px;gap:6px}.agent-details{padding:10px}
-            .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(100dvh - 61px)}
+            .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
         """)
         # Resize the bounded workspace with the mobile visual viewport (including the virtual keyboard).
         ui.add_body_html("""<script>
             (() => { const fit = () => { const el=document.querySelector('.workspace');
                 const header=document.querySelector('.q-header');
-                if(el) el.style.height=Math.max(100,(window.visualViewport?.height || innerHeight)
-                    -(header?.getBoundingClientRect().height || 65))+'px'; };
+                const height=window.visualViewport?.height || innerHeight;
+                document.documentElement.style.setProperty('--viewport-height',height+'px');
+                if(el) { el.classList.toggle('compact',innerWidth<=600 && height<=600);
+                    el.style.height=Math.max(100,height-(header?.getBoundingClientRect().height || 65))+'px'; } };
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
-                setTimeout(fit,500); })();
+                fit(); setTimeout(fit,500); })();
         </script>""")
-        with ui.left_drawer(value=False).props('breakpoint=900 bordered width=300 :behavior="$q.screen.lt.md ? \'mobile\' : \'desktop\'"').classes('bg-stone-50') as drawer:
+        # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
+        with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300 '
+                ':model-value="null"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
                     ui.label('Agents').classes('text-lg font-semibold')
                     ui.space()
-                    ui.button(icon='close', on_click=drawer.hide).props('flat round aria-label="Close agent hierarchy"')
+                    ui.button(icon='close', on_click=lambda: drawer.run_method('hide')).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
@@ -202,9 +219,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
                 providers_button = ui.button('Model providers', icon='settings').props('outline').classes('w-full') \
                     if identity.get('type') == 1 else None
+                platform_button = None
+                gpu_button = None
+                if identity.get('type') == 1:
+                    dashboard_link('dashboard-mobile w-full text-teal-900')
+                    platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('outline').classes('w-full')
+                    gpu_button = ui.button('GPU policies', icon='memory').props('outline').classes('w-full')
         with ui.column().classes('workspace'):
             with ui.row().classes('w-full items-center no-wrap gap-2'):
-                ui.button('Agents', icon='account_tree', on_click=drawer.toggle).props(
+                ui.button('Agents', icon='account_tree', on_click=lambda: drawer.run_method('toggle')).props(
                     'outline aria-label="Open agent hierarchy"')
                 agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
                                          label='Chat directly with an agent', with_input=True).classes(
@@ -220,6 +243,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
                 continue_button = ui.button('Continue saved task', icon='play_arrow').props('outline')
                 continue_button.set_visibility(False)
+                gpu_recover_button = ui.button('Check GPU recovery', icon='restore').props('outline')
+                gpu_recover_button.set_visibility(False)
                 budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
                 with ui.row().classes('composer gap-2'):
@@ -271,7 +296,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 rows = await runtime.conversations(current, state['agent'])
                 history_select.set_options({row['id']: row['title'] for row in rows}, value=state['conversation'])
 
-        async def show_agent(agent_id):
+        async def show_agent(agent_id, *, close_navigation=True):
             if state['busy']:
                 ui.notify('Wait for the current reply to finish.')
                 return
@@ -279,6 +304,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent = await service.authorize(current, agent_id)
             state.update(agent=agent_id, conversation=None, imported=False, resume_operation=None)
             continue_button.set_visibility(False)
+            gpu_recover_button.set_visibility(False)
             budget_label.set_text('')
             transcript.clear()
             tool_cards.clear()
@@ -286,7 +312,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent_choice.set_value(agent_id)
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
-            drawer.hide()
+            if close_navigation:
+                drawer.run_method('hide')
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
@@ -336,7 +363,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if identifier != state['agent']:
                     await show_agent(identifier)
                 else:
-                    drawer.hide()
+                    drawer.run_method('hide')
             elif kind == 'domain':
                 current = await actor()
                 updated = await service.hierarchy(current)
@@ -348,7 +375,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.label(domain['name']).classes('text-2xl font-semibold')
                     ui.label(domain.get('path', '')).classes('text-stone-600')
                     ui.label('CloudStack domain: ' + identifier).classes('text-xs text-stone-500 break-all')
-                    drawer.hide()
+                    drawer.run_method('hide')
                     for agent in updated.get('agents', []):
                         if agent['domain_id'] == identifier:
                             ui.button('Chat with ' + agent['name'],
@@ -379,6 +406,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 budget = run.get('budget')
                 state['resume_operation'] = run['id'] if budget and budget.get('resumable') else None
                 continue_button.set_visibility(bool(state['resume_operation']))
+                gpu_recover_button.set_visibility(run['status'] == 'reconciliation')
                 if budget:
                     show_budget(budget)
                     if budget.get('resumable'):
@@ -393,6 +421,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 state['imported'] = False
                 state['resume_operation'] = None
                 continue_button.set_visibility(False)
+                gpu_recover_button.set_visibility(False)
                 budget_label.set_text('')
                 progress.set_text('')
                 history_select.set_value(None)
@@ -403,6 +432,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                   f"Windows: {budget.get('windows', 0)} · Reused: {budget.get('cache_hits', 0)} · "
                                   f"Window limits: {budget.get('requests_per_window', 20)} requests / "
                                   f"{budget.get('tools_per_window', 30)} tools")
+
+        async def check_gpu_recovery():
+            if state['busy'] or not state['conversation']:
+                return
+            current = await actor()
+            restored = await runtime.restore(current, state['conversation'])
+            run = restored['runs'][-1]
+            await runtime.reconcile_gpu(service, current, run['id'])
+            state['resume_operation'] = run['id']
+            continue_button.set_visibility(True)
+            gpu_recover_button.set_visibility(False)
+            progress.set_text('GPU result verified. Continue saved task without repeating its completed action.')
 
         async def send(resume=False):
             text = prompt.value.strip() if prompt.value else ''
@@ -427,6 +468,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent_choice.disable()
             continue_button.set_visibility(False)
             continue_button.disable()
+            gpu_recover_button.set_visibility(False)
             if not resume:
                 message('human', text)
                 prompt.set_value('')
@@ -473,6 +515,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     if latest and (latest[0].get('budget') or {}).get('resumable'):
                         state['resume_operation'] = latest[0]['id']
                         continue_button.set_visibility(True)
+                    gpu_recover_button.set_visibility(bool(latest and latest[0]['status'] == 'reconciliation'))
                 raise error from None
             finally:
                 state['busy'] = False
@@ -589,6 +632,111 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     create_button = ui.button('Create subgroup', on_click=lambda: protect(create))
             dialog.open()
 
+        async def gpu_dialog():
+            current = await actor()
+            if current.get('type') != 1:
+                raise PermissionError('Human platform administrator required')
+            data = await service.gpu_admin(current)
+            domains = {d['id']: d for d in data['domains']}
+            profiles = {p['id']: p['name'] for p in data['profiles']}
+            with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl gap-3'):
+                ui.label('GPU policies and device ownership').classes('text-xl font-semibold')
+                ui.label('Missing policies deny GPU operations. Every ancestor restricts its descendants. '
+                         'Only devices owned by the group or its subgroups may change.').classes('text-sm')
+                domain = ui.select({k: d.get('path', d['name']) for k, d in domains.items()},
+                                   label='GPU policy domain', with_input=True).classes('w-full')
+                allowed = ui.select(profiles, multiple=True, with_input=True, label='Allowed vGPU profiles').props('use-chips').classes('w-full')
+                maximum = ui.number('Maximum GPU allocations', value=0, min=-1, precision=0).classes('w-full')
+                release = ui.checkbox('Release GPU automatically when its VM stops')
+                reconfigure = ui.checkbox('Allow reconfiguration of owned unused GPU pools')
+                subgroup = ui.checkbox('Allow subgroup agents to request GPU capacity')
+                feedback = ui.label('').classes('text-sm whitespace-pre-wrap')
+
+                async def load():
+                    if not domain.value:
+                        return
+                    policy = data['policies'].get(domain.value, {})
+                    allowed.set_value(policy.get('profiles', []))
+                    maximum.set_value(policy.get('max_allocations', -1 if int(domains[domain.value].get('level', -1)) == 0 else 0))
+                    release.set_value(policy.get('release_on_stop', False))
+                    reconfigure.set_value(policy.get('reconfigure_unused', False))
+                    subgroup.set_value(policy.get('subgroup_requests', False))
+                    feedback.set_text('Native ROOT quota is unlimited (-1). Put real quota caps on managed child domains.'
+                                      if int(domains[domain.value].get('level', -1)) == 0 else '')
+
+                async def save():
+                    current_actor = await actor()
+                    if not domain.value:
+                        raise ValueError('Select a GPU policy domain')
+                    policy = {'profiles': allowed.value or [], 'max_allocations': int(maximum.value),
+                              'release_on_stop': release.value, 'reconfigure_unused': reconfigure.value,
+                              'subgroup_requests': subgroup.value}
+                    await service.gpu_admin(current_actor, 'set_policy', domain_id=domain.value, policy=policy)
+                    data['policies'][domain.value] = policy
+                    feedback.set_text('Policy saved; native CloudStack quota verified.')
+
+                domain.on_value_change(lambda: protect(load))
+                ui.button('Save GPU policy', on_click=lambda: protect(save))
+                with ui.expansion('Platform capacity preparation', icon='memory').classes('w-full'):
+                    ui.table(columns=[{'name': field, 'label': label, 'field': field} for field, label in
+                             [('uuid', 'Owned device'), ('domain_id', 'Owner domain'), ('profile', 'Profile')]],
+                             rows=data['pools']).classes('w-full')
+                    profile = ui.select(profiles, label='GPU offering profile').classes('w-full')
+                    cpus = ui.number('Offering vCPUs', value=1, min=1, precision=0)
+                    memory = ui.number('Offering RAM MiB', value=1024, min=512, precision=0)
+                    disk = ui.number('Offering root disk GiB', value=20, min=8, precision=0)
+                    async def offering():
+                        if not domain.value or not profile.value:
+                            raise ValueError('Select a domain and profile first')
+                        result = await service.gpu_admin(await actor(), 'offering', domain_id=domain.value, profile=profile.value,
+                                                         cpus=int(cpus.value), memory=int(memory.value), root_disk=int(disk.value))
+                        feedback.set_text('Authorized native GPU offering: ' + result['offering_id'])
+                    ui.button('Prepare authorized GPU offering', on_click=lambda: protect(offering))
+                    owned = {p['uuid'] for p in data['pools']}
+                    devices = {d['busaddress']: d.get('vgpuprofilename', '') + ' · ' + d['busaddress']
+                               for d in data['devices'] if d.get('state') == 'Free' and d['busaddress'] not in owned}
+                    device = ui.select(devices, label='Unclaimed free GPU device').classes('w-full')
+                    async def claim():
+                        if not domain.value or not device.value:
+                            raise ValueError('Select an owner domain and free device')
+                        await service.gpu_admin(await actor(), 'claim', domain_id=domain.value, uuid=device.value)
+                        feedback.set_text('Free device pool owner assigned. Existing ownership cannot be overwritten.')
+                    ui.button('Assign unclaimed pool to selected domain', on_click=lambda: protect(claim))
+                with ui.expansion('GPU operation recovery', icon='restore').classes('w-full'):
+                    operations = {o['id']: o['id'] + ' · ' + o['phase'] for o in data['operations']}
+                    operation = ui.select(operations, label='GPU operation reference').classes('w-full')
+                    async def recover(action):
+                        if not operation.value:
+                            raise ValueError('Select a saved GPU operation')
+                        result = await service.gpu_admin(await actor(), action, operation_id=operation.value)
+                        feedback.set_text('GPU operation verified: ' + json.dumps(result)[:1024])
+                    ui.button('Reconcile GPU operation', on_click=lambda: protect(lambda: recover('reconcile')))
+                    ui.button('Resume saved pre-dispatch GPU plan', on_click=lambda: protect(lambda: recover('resume')))
+                ui.button('Close', on_click=dialog.close).props('flat')
+            dialog.open()
+
+        async def platform_dialog():
+            current = await actor()
+            if current.get('type') != 1:
+                raise PermissionError('Platform administrator required')
+            with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl'):
+                ui.label('Platform settings').classes('text-xl font-semibold')
+                url = ui.input('CloudStack Dashboard URL', value=service.dashboard_url(current)).classes('w-full')
+                ui.label('Browser-accessible private URL. CloudStack uses its own login; blank hides the link.').classes('text-sm')
+                async def save():
+                    actor_identity = await actor()
+                    service.save_dashboard_url(actor_identity, url.value or '')
+                    value = service.dashboard_url(actor_identity)
+                    for link in dashboard_links:
+                        link.props['href'] = value or '#'
+                        link.set_visibility(bool(value))
+                        link.update()
+                    dialog.close()
+                with ui.row():
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Save', on_click=lambda: protect(save))
+            dialog.open()
+
         async def provider_dialog():
             current = await actor()
             if current.get('type') != 1:
@@ -668,9 +816,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         search.on_value_change(filter_tree)
         main = next((a for a in agents.values() if a.get('is_main')), None)
         if main:
-            await show_agent(main['id'])
-
-        drawer.props('show-if-above')
+            await show_agent(main['id'], close_navigation=False)
 
         tree.on_select(lambda e: protect(lambda: select_node(e)))
         agent_choice.on_value_change(lambda e: protect(lambda: choose_agent(e)))
@@ -679,8 +825,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
         continue_button.on_click(lambda: protect(lambda: send(resume=True)))
+        gpu_recover_button.on_click(lambda: protect(check_gpu_recovery))
         if providers_button is not None:
             providers_button.on_click(lambda: protect(provider_dialog))
+        if platform_button is not None:
+            platform_button.on_click(lambda: protect(platform_dialog))
+        if gpu_button is not None:
+            gpu_button.on_click(lambda: protect(gpu_dialog))
 
 
 def main():

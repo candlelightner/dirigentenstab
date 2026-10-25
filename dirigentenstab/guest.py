@@ -1,6 +1,7 @@
 """Guest-only SSH; neither commands nor model paths reach a host shell."""
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -13,6 +14,7 @@ import asyncssh
 
 
 MAX_FILE = 8 * 1024 * 1024
+MAX_ASSET = 512 * 1024 * 1024
 
 
 class OutputLimit(Exception):
@@ -23,6 +25,38 @@ class Guest:
     def __init__(self, service):
         self.service = service
         self.slots = asyncio.Semaphore(4)
+
+    async def approved_assets(self, agent_id):
+        """Operator-staged metadata only; binary contents and host paths never enter model context."""
+        def read():
+            directory = Path(getattr(self.service.settings, 'guest_assets', '/data/guest-assets'))
+            try:
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return []
+            try:
+                try:
+                    descriptor = os.open('manifest.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    return []
+                with os.fdopen(descriptor, 'r') as file:
+                    data = file.read(65537)
+                if len(data) > 65536:
+                    raise ValueError('Approved asset catalogue exceeds its size limit')
+                entries = json.loads(data)
+                result = []
+                for asset_id, item in entries.items():
+                    if (not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', asset_id)
+                            or not re.fullmatch('[0-9a-f]{64}', item['sha256'])
+                            or type(item['bytes']) is not int or not 0 < item['bytes'] <= MAX_ASSET
+                            or not isinstance(item['name'], str) or len(item['name']) > 128):
+                        raise ValueError('Invalid approved asset catalogue')
+                    if agent_id in item['agent_ids']:
+                        result.append({k: item[k] for k in ('name', 'bytes', 'sha256')} | {'id': asset_id})
+                return result
+            finally:
+                os.close(fd)
+        return await asyncio.to_thread(read)
 
     async def _target(self, agent_id, vm_id):
         response = await self.service.execute(agent_id, 'listVirtualMachines', {'id': vm_id})
@@ -139,8 +173,17 @@ class Guest:
         for value in (source, destination):
             if not isinstance(value, str) or not value or '\0' in value or len(value) > 4096:
                 raise ValueError('Invalid file path')
-        local_name = self._filename(source if direction == 'upload' else destination)
-        workspace = self._workspace(agent_id)
+        asset = None
+        if direction == 'upload' and source.startswith('asset:'):
+            asset = next((a for a in await self.approved_assets(agent_id) if a['id'] == source[6:]), None)
+            if not asset:
+                raise PermissionError('Guest asset is not approved for this agent')
+            local_name = asset['sha256'] + '.bin'
+            workspace = Path(self.service.settings.guest_assets)
+        else:
+            local_name = self._filename(source if direction == 'upload' else destination)
+            workspace = self._workspace(agent_id)
+        maximum = MAX_ASSET if asset else MAX_FILE
         transferred = 0
         temporary = '.download-' + secrets.token_hex(16)
         directory = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -155,12 +198,19 @@ class Guest:
                             with os.fdopen(descriptor, 'rb') as local:
                                 if not stat.S_ISREG(os.fstat(local.fileno()).st_mode):
                                     raise ValueError('Upload source must be a regular file')
-                                if os.fstat(local.fileno()).st_size > MAX_FILE:
+                                if os.fstat(local.fileno()).st_size > maximum:
                                     raise ValueError('File exceeds the 8 MiB transfer limit')
+                                if asset:
+                                    def verify():
+                                        digest = hashlib.file_digest(local, 'sha256').hexdigest()
+                                        if digest != asset['sha256'] or local.tell() != asset['bytes']:
+                                            raise PermissionError('Approved guest asset failed integrity verification')
+                                        local.seek(0)
+                                    await asyncio.to_thread(verify)
                                 async with sftp.open(destination, 'wb') as remote:
                                     while data := local.read(65536):
                                         transferred += len(data)
-                                        if transferred > MAX_FILE:
+                                        if transferred > maximum:
                                             raise ValueError('File exceeds the 8 MiB transfer limit')
                                         await remote.write(data)
                         else:
@@ -177,15 +227,20 @@ class Guest:
                                 os.fsync(local.fileno())
                             os.replace(temporary, local_name, src_dir_fd=directory, dst_dir_fd=directory)
             self.service.store.audit(agent_id, 'transfer_vm_file', vm_id)
-            return {'direction': direction, 'bytes': transferred, 'file': local_name}
+            return {'direction': direction, 'bytes': transferred, 'file': asset['name'] if asset else local_name,
+                    **({'sha256': asset['sha256']} if asset else {})}
+        except PermissionError:
+            self.service.store.audit(agent_id, 'transfer_vm_file', vm_id, 'denied')
+            raise
         except (asyncssh.Error, OSError, TimeoutError):
             self.service.store.audit(agent_id, 'transfer_vm_file', vm_id, 'error')
             raise ValueError('Guest transfer failed; verify access, paths and host key') from None
         finally:
-            try:
-                os.unlink(temporary, dir_fd=directory)
-            except FileNotFoundError:
-                pass
+            if direction == 'download':
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
             os.close(directory)
 
     async def prepare_vm_access(self, agent_id: str, vm_id: str):
@@ -203,7 +258,7 @@ class Guest:
             'ssh_pwauth': False, 'disable_root': True,
         })
 
-    async def prepare_vm_config(self, agent_id: str, *, workspace_disk=False):
+    async def prepare_vm_config(self, agent_id: str, *, workspace_disk=False, guest_admin=False):
         """Backend-only: user-data contains the generated guest host private key, never expose it."""
         await self.service.agent(agent_id)
         client_key = asyncssh.generate_private_key('ssh-ed25519')
@@ -219,6 +274,8 @@ class Guest:
             'ssh_keys': {'ed25519_private': host_key.export_private_key('openssh').decode(),
                          'ed25519_public': record['host_key']},
         }
+        if guest_admin:
+            config['users'][0]['sudo'] = ['ALL=(ALL) NOPASSWD:ALL']
         if workspace_disk:
             config.update({
                 'disk_setup': {'/dev/vdb': {'table_type': 'gpt', 'layout': True, 'overwrite': False}},

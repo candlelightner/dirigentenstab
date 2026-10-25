@@ -170,7 +170,7 @@ def packages():
     run('apt-get', 'install', '-y', '--no-install-recommends',
         f'cloudstack-management={VERSION}', f'cloudstack-agent={VERSION}',
         f'cloudstack-common={VERSION}', 'mysql-community-server', 'nfs-kernel-server',
-        'python3.12-venv', 'curl', 'ca-certificates', 'nftables', 'jq', 'bridge-utils')
+        'python3.12-venv', 'curl', 'ca-certificates', 'nftables', 'jq', 'xmlstarlet', 'bridge-utils')
     mysql = run('mysql', '--version')
     if '8.4.' not in mysql:
         raise RuntimeError('MySQL 8.4 is required by the pinned CloudStack compatibility matrix.')
@@ -226,6 +226,12 @@ def guest_ssh():
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', '--now', 'dirigentenstab-guest-ssh.timer')
     run('systemctl', 'start', 'dirigentenstab-guest-ssh.service')
+
+
+def gpu_control():
+    result = subprocess.run([str(ROOT / '.venv/bin/python'), str(ROOT / 'scripts/install_gpu_helper.py'), '--auto'], check=False)
+    if result.returncode:
+        raise RuntimeError('GPU controller setup incomplete; no policy was granted. Resolve the reported prerequisite and retry.')
 
 
 def database():
@@ -374,6 +380,7 @@ def main():
     elif args.existing:
         print('Existing mode: CloudStack services and networking are not modified.')
         prepare_application()
+        gpu_control()
     else:
         preflight()
         for name, action in [('repositories', repositories), ('packages', packages), ('network', network),
@@ -385,6 +392,7 @@ def main():
         verify()
         prepare_application()
         guest_ssh()
+        gpu_control()
 
 
 if __name__ == '__main__':

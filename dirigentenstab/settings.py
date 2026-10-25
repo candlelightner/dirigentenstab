@@ -14,6 +14,14 @@ def endpoint(url: str) -> str:
     return url.rstrip('/')
 
 
+def dashboard_endpoint(url: str) -> str:
+    value = endpoint(url)
+    if urlsplit(value).scheme != 'https':
+        raise ValueError('CloudStack Dashboard URL must use HTTPS')
+    # Tomcat's slashless directory redirect can infer HTTP behind a private reverse proxy.
+    return value + '/' if urlsplit(value).path.endswith('/client') else value
+
+
 @dataclass
 class Settings:
     cloudstack_url: str
@@ -27,8 +35,13 @@ class Settings:
     ssh_networks: str = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
     ssh_source_cidr: str = '10.253.80.1/32'
     max_hierarchy_depth: int = 10
+    cloudstack_ui_url: str = ''
+    guest_assets: str = '/data/guest-assets'
+    gpu_helper_socket: str = ''
 
     def __post_init__(self):
+        if self.cloudstack_ui_url:
+            self.cloudstack_ui_url = dashboard_endpoint(self.cloudstack_ui_url)
         if type(self.max_hierarchy_depth) is not int or self.max_hierarchy_depth < 1:
             raise ValueError('MAX_HIERARCHY_DEPTH must be a positive integer')
 
@@ -45,4 +58,7 @@ class Settings:
                    workspace=os.getenv('TRANSFER_WORKSPACE', '/data/transfers'),
                    ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'),
                    ssh_source_cidr=os.getenv('SSH_SOURCE_CIDR', '10.253.80.1/32'),
+                   cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
+                   guest_assets=os.getenv('GUEST_ASSETS', '/data/guest-assets'),
+                   gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''),
                    max_hierarchy_depth=int(os.getenv('MAX_HIERARCHY_DEPTH', '10')))

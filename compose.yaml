@@ -1,7 +1,7 @@
 name: dirigentenstab
 services:
   app:
-    image: ${IMAGE:-ghcr.io/candlelightner/dirigentenstab:0.1.4}
+    image: ${IMAGE:-ghcr.io/candlelightner/dirigentenstab:0.1.5}
     build: .
     restart: unless-stopped
     init: true
@@ -10,6 +10,7 @@ services:
       - '${BIND_ADDRESS:-127.0.0.1}:${BIND_PORT:-3000}:8088'
     environment:
       CLOUDSTACK_URL: ${CLOUDSTACK_URL:?Configure CLOUDSTACK_URL}
+      CLOUDSTACK_UI_URL: ${CLOUDSTACK_UI_URL:-}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Configure HTTPS PUBLIC_ORIGIN}
       DATABASE: /data/dirigentenstab.db
       MASTER_KEY_FILE: /run/secrets/master_key

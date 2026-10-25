@@ -177,3 +177,52 @@ async def test_real_sftp_roundtrip_rejects_symlinks_and_preserves_file_on_oversi
             await guest.transfer_vm_file('agent', 'vm', '/example.py', 'retrieved.py', 'download')
         assert (workspace / 'retrieved.py').read_text() == 'print(6 * 7)\n'
         assert not list(workspace.glob('.download-*'))
+
+
+async def test_approved_large_asset_uses_pinned_sftp_without_raising_workspace_limit(guest, tmp_path, monkeypatch):
+    import hashlib
+    from scripts.stage_guest_asset import stage
+    assets = tmp_path / 'approved'
+    source = tmp_path / 'operator-bundle'
+    source.write_bytes(b'synthetic-driver-fixture\n' * 400000)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    stage(assets, source, 'driver', 'Guest driver', 'agent', digest)
+    guest.service.settings.guest_assets = str(assets)
+    assert await guest.approved_assets('unrelated-agent') == []
+    host = asyncssh.generate_private_key('ssh-ed25519')
+    root = tmp_path / 'remote'
+    root.mkdir()
+    class Server(asyncssh.SSHServer):
+        def begin_auth(self, username):
+            return False
+    async with asyncssh.create_server(Server, '127.0.0.1', 0, server_host_keys=[host],
+            sftp_factory=lambda channel: asyncssh.SFTPServer(channel, chroot=str(root))) as server:
+        _, record = await guest.prepare_vm_config('agent')
+        record.update(host_key=host.export_public_key().decode(), port=server.get_port())
+        async def target(*args):
+            return '127.0.0.1', record
+        monkeypatch.setattr(guest, '_target', target)
+        (guest._workspace('agent') / 'too-large').write_bytes(source.read_bytes())
+        with pytest.raises(ValueError, match='8 MiB'):
+            await guest.transfer_vm_file('agent', 'vm', 'too-large', '/ordinary', 'upload')
+        result = await guest.transfer_vm_file('agent', 'vm', 'asset:driver', '/approved.run', 'upload')
+        assert result['bytes'] > 8 * 1024 * 1024 and result['sha256'] == digest
+        assert hashlib.sha256((root / 'approved.run').read_bytes()).hexdigest() == digest
+        with pytest.raises(PermissionError, match='not approved'):
+            await guest.transfer_vm_file('unrelated-agent', 'vm', 'asset:driver', '/denied', 'upload')
+        asset_file = assets / (digest + '.bin')
+        asset_file.chmod(0o644)
+        asset_file.write_bytes(b'tampered')
+        with pytest.raises(PermissionError, match='integrity'):
+            await guest.transfer_vm_file('agent', 'vm', 'asset:driver', '/tampered', 'upload')
+        assert not (root / 'tampered').exists()
+        assets.chmod(0o755)
+
+
+async def test_guest_admin_is_explicit_template_capability(guest):
+    plain, _ = await guest.prepare_vm_config('agent')
+    approved, _ = await guest.prepare_vm_config('agent', guest_admin=True)
+    assert 'sudo' not in json.loads(plain.split('\n', 1)[1])['users'][0]
+    configured = json.loads(approved.split('\n', 1)[1])
+    assert configured['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
+    assert configured['users'][0]['name'] != 'root' and configured['disable_root']

@@ -93,10 +93,73 @@ def test_fresh_native_install_includes_guest_ssh_without_imports(tmp_path, monke
     monkeypatch.setattr(native.os, 'umask', lambda value: None)
     monkeypatch.setattr(native.sys, 'argv', ['setup.sh', '--install'])
     for name in ('preflight', 'repositories', 'packages', 'network', 'database', 'services',
-                 'verify', 'prepare_application', 'guest_ssh'):
+                 'verify', 'prepare_application', 'guest_ssh', 'gpu_control'):
         monkeypatch.setattr(native, name, lambda name=name: calls.append(name))
     monkeypatch.setattr(native, 'step', lambda name, action: action())
     monkeypatch.setattr(native.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=0))
     native.main()
-    assert calls[-3:] == ['verify', 'prepare_application', 'guest_ssh']
+    assert calls[-4:] == ['verify', 'prepare_application', 'guest_ssh', 'gpu_control']
     assert calls[:3] == ['preflight', 'repositories', 'packages']
+
+
+def test_gpu_helper_installer_creates_only_its_backend_group_socket_and_service(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / 'scripts'))
+    import install_gpu_helper as installer
+    import dirigentenstab.gpu_control as control
+    commands, writes, created = [], {}, []
+    (tmp_path / '.env').write_text('IMAGE=example:0.1.5\nCOMPOSE_FILE=compose.yaml:compose.private.yaml\n')
+    def run(*args):
+        commands.append(args)
+        if args[0] == 'groupadd':
+            created.append(True)
+    def group(gid):
+        assert gid == 10001
+        if not created:
+            raise KeyError(gid)
+        return SimpleNamespace(gr_name='dirigentenstab-gpu')
+    monkeypatch.setattr(installer, 'ROOT', tmp_path)
+    monkeypatch.setattr(installer, 'STATE', tmp_path / 'setup')
+    monkeypatch.setattr(installer.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(installer, 'run', run)
+    monkeypatch.setattr(installer.grp, 'getgrgid', group)
+    monkeypatch.setattr(installer.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(installer, 'save', lambda path, value, *args: writes.update({str(path): value}))
+    monkeypatch.setattr(installer.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=1))
+    monkeypatch.setattr(control, 'NativeHost', lambda parent: SimpleNamespace(profiles=lambda: {'nvidia-51': {}}))
+    installer.install('0000:07:00.0', '1bda91f5-3a27-43a4-8e52-4d955e8eed10')
+    assert ('apt-get', 'install', '-y', '--no-install-recommends', 'mdevctl', 'xmlstarlet') in commands
+    assert 'SocketGroup=dirigentenstab-gpu' in writes['/etc/systemd/system/dirigentenstab-gpu.socket']
+    assert ('systemctl', 'is-active', 'dirigentenstab-gpu.socket') in commands
+    assert all('cloudstack' not in ' '.join(c) and 'libvirtd' not in c and 'nvidia' not in ' '.join(c) for c in commands)
+    assert 'COMPOSE_FILE=compose.yaml:compose.private.yaml:compose.gpu.yaml' in writes[str(tmp_path / '.env')]
+    assert 'ENABLE_GPU_CONTROL=true' in writes[str(tmp_path / '.env')]
+
+
+def test_gpu_automatic_setup_checks_opt_in_and_detects_local_hardware(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / 'scripts'))
+    import install_gpu_helper as installer
+    import admin
+    gpu = tmp_path / 'hardware' / '0000:07:00.0' / 'mdev_supported_types' / 'nvidia-51'
+    gpu.mkdir(parents=True)
+    (tmp_path / '.env').write_text('ENABLE_GPU_CONTROL=false\n')
+    monkeypatch.setattr(installer, 'ROOT', tmp_path)
+    monkeypatch.setattr(installer, 'STATE', tmp_path)
+    monkeypatch.setattr(installer, 'Path', lambda value: tmp_path / 'hardware' if str(value) == '/sys/bus/pci/devices' else Path(value))
+    installed = []
+    monkeypatch.setattr(installer, 'install', lambda *args: installed.append(args))
+    installer.automatic()
+    assert installed == []
+    (tmp_path / '.env').write_text('ENABLE_GPU_CONTROL=true\n')
+    (tmp_path / 'cloudstack-admin.json').write_text(json.dumps({'apikey': 'synthetic', 'secretkey': 'synthetic'}))
+    async def raw(command, params):
+        assert (command, params) == ('listHosts', {'type': 'Routing'})
+        return {'host': [{'id': 'local-host', 'name': 'test-host', 'state': 'Up'},
+                         {'id': 'remote-host', 'name': 'another-host', 'state': 'Up'}]}
+    monkeypatch.setattr(admin, 'service', lambda: SimpleNamespace(client=lambda keys: SimpleNamespace(raw=raw)))
+    monkeypatch.setattr(installer.socket, 'gethostname', lambda: 'test-host')
+    monkeypatch.setattr(installer.socket, 'getfqdn', lambda: 'test-host.local')
+    installer.automatic()
+    assert installed == [('0000:07:00.0', 'local-host')]

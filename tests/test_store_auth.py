@@ -22,8 +22,24 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 8
+    assert reopened.one('PRAGMA user_version')['user_version'] == 10
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
+
+
+def test_permission_column_migration_preserves_agent_keys_and_owned_conversation(store):
+    # Recreate the removed schema-9 column around real encrypted records before upgrading.
+    store.execute("ALTER TABLE agents ADD COLUMN runtime_policy TEXT NOT NULL DEFAULT '[]'")
+    store.execute('PRAGMA user_version=9')
+    runtime, provisioning, messages = store.seal({'apikey': 'runtime'}), store.seal({'apikey': 'provision'}), store.seal([])
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,runtime_policy) '
+                  'VALUES(?,?,?,?,?,?,?,?)', ('agent', 'Agent', 'domain', 'account', 'user', runtime, provisioning, '["old"]'))
+    store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                  ('conversation', 'agent', 'human', 'Preserved', 1, messages))
+    reopened = Store(str(store.path), str(store.path.parent / 'master'))
+    agent = reopened.one('SELECT * FROM agents')
+    assert 'runtime_policy' not in agent and agent['runtime'] == runtime and agent['provisioning'] == provisioning
+    conversation = reopened.one('SELECT * FROM conversations')
+    assert conversation['agent_id'] == 'agent' and conversation['human_id'] == 'human' and conversation['messages'] == messages
 
 
 async def test_revoked_cloudstack_account_invalidates_session(store):

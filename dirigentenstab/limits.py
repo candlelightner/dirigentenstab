@@ -2,7 +2,7 @@
 
 APP_ROOT_AGENT = '00000000000000000000000000000001'
 VM_POLICY_COMMANDS = frozenset({'deployVirtualMachine', 'startVirtualMachine', 'rebootVirtualMachine', 'scaleVirtualMachine',
-                                'restoreVirtualMachine', 'recoverVirtualMachine'})
+                                'restoreVirtualMachine', 'recoverVirtualMachine', 'changeServiceForVirtualMachine'})
 
 
 def gpu_count(offering):
@@ -87,7 +87,7 @@ async def check_vm_policy(service, agent, params, *, command='deployVirtualMachi
     if not units:
         return
     delta = units
-    if vm and command in {'startVirtualMachine', 'rebootVirtualMachine', 'restoreVirtualMachine', 'scaleVirtualMachine'}:
+    if vm and command in {'startVirtualMachine', 'rebootVirtualMachine', 'restoreVirtualMachine', 'scaleVirtualMachine', 'changeServiceForVirtualMachine'}:
         previous_id = vm.get('serviceofferingid')
         previous = offering if previous_id == offering_id else _one(
             await cloud.raw('listServiceOfferings', {'id': previous_id}), 'serviceoffering', previous_id)

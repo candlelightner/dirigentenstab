@@ -11,7 +11,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 from admin import service
-from dirigentenstab.cloud import CloudError, RUNTIME_APIS
+from dirigentenstab.cloud import CloudError, runtime_api
 
 
 async def perform(options):
@@ -122,10 +122,10 @@ async def perform(options):
         runtime_key = app.store.open(child['runtime'])
         rules = (await parent_cloud.raw('listUserKeyRules', {'keypairid': runtime_key['id']})).get('keypermission', [])
         allowed = {rule['rule'] for rule in rules if rule['permission'] == 'allow'}
-        assert allowed and allowed == set(json.loads(child['runtime_policy'])) and allowed <= RUNTIME_APIS
+        assert allowed and allowed == set(await child_cloud.catalogue())
+        assert all(runtime_api(name) for name in allowed)
         assert all(rule['permission'] == 'allow' for rule in rules)
-        assert 'createDomain' not in allowed and 'createAccount' not in allowed
-        assert 'createDomain' not in set(await child_cloud.catalogue())
+        assert not {'registerUserKeys', 'listUserKeys', 'deleteUserKeys'} & allowed
         receipt.update(unrelated_admin_denied=True, runtime_key_rules=len(rules),
                        isolation_evidence='CloudStack domain-access rejection plus authoritative restricted key rules')
         await page.get_by_label('Chat directly with an agent', exact=True).fill('Sandbox')

@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import fnmatch
 import json
 import os
 from types import SimpleNamespace
@@ -8,9 +9,14 @@ import pytest
 from cryptography.fernet import Fernet
 
 from dirigentenstab import cloud as cloud_module
-from dirigentenstab.cloud import Cloud, CloudError, PROVISION_APIS, RUNTIME_APIS, redact, validate
+from dirigentenstab.cloud import Cloud, CloudError, PROVISION_APIS, redact, runtime_api, validate
 from dirigentenstab.service import Service
 from dirigentenstab.store import Store
+
+
+NATIVE_APIS = frozenset('listApis listDomains listAccounts listUsers listVirtualMachines listServiceOfferings '
+                        'listVolumes listOsTypes deployVirtualMachine destroyVirtualMachine createTemplate '
+                        'changeServiceForVirtualMachine futureNativeOperation'.split())
 
 
 @pytest.fixture
@@ -29,10 +35,10 @@ def add_parent(store):
         for purpose in ('runtime', 'provisioning')
     }
     store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,'
-                  'model,instructions,can_provision,runtime_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                  'model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                   ('parent', 'Parent', 'parent-domain', 'parent-account', 'parent-user',
                    store.seal(credentials['runtime']), store.seal(credentials['provisioning']),
-                   'provider', 'parent-model', 'Parent instructions', 1, json.dumps(sorted(RUNTIME_APIS))))
+                   'provider', 'parent-model', 'Parent instructions', 1))
     return credentials
 
 
@@ -144,15 +150,14 @@ def test_discovered_metadata_is_a_real_validation_boundary(params):
         validate(metadata, params)
 
 
-async def test_runtime_cannot_execute_provisioning_or_host_apis_even_if_discovered(monkeypatch):
+async def test_runtime_technical_controls_reject_host_and_credential_apis(monkeypatch):
     cloud = Cloud(SimpleNamespace(), {'apikey': 'runtime-api', 'secretkey': 'runtime-secret'})
 
-    async def should_not_discover():
-        raise AssertionError('Reserved commands must be rejected before discovery or execution')
+    async def should_not_discover(**kwargs):
+        raise AssertionError('Technical controls must reject before discovery or execution')
 
     monkeypatch.setattr(cloud, 'catalogue', should_not_discover)
-    for command in ('createDomain', 'createAccount', 'registerUserKeys', 'createStoragePool', 'addHost', 'set',
-                    'listVirtualMachines;id'):
+    for command in ('registerUserKeys', 'createStoragePool', 'addHost', 'listVirtualMachines;id'):
         with pytest.raises(PermissionError):
             await cloud.execute(command, {})
 
@@ -166,14 +171,15 @@ class ProvisioningCloud:
         self.accounts = []
         self.keys = {}
         self.key_rules = {}
+        self.rule_documents = {}
         self.key_number = 0
         self.validation_failed = False
         self.invalid_replacement = False
         self.parent_domain = {'id': 'parent-domain', 'name': 'Parent', 'path': 'ROOT/Parent', 'level': 1}
-        self.available = RUNTIME_APIS | PROVISION_APIS
-        self.runtime_available = RUNTIME_APIS
+        self.available = NATIVE_APIS | PROVISION_APIS
+        self.runtime_available = NATIVE_APIS
 
-    async def catalogue(self):
+    async def catalogue(self, *, refresh=False):
         return {name: {'name': name} for name in self.available}
 
     async def raw(self, command, params=None):
@@ -195,17 +201,26 @@ class ProvisioningCloud:
             self.accounts.append(result)
             response = {'account': result}
         elif command == 'listUserKeys':
-            return {'userapikey': list(self.keys.values())}
+            return {'userapikey': [key for key in self.keys.values() if key.get('userid') == params['userid']]}
+        elif command == 'listUserKeyRules':
+            if params['keypairid'] not in self.keys:
+                raise CloudError('Native key does not exist', rejected=True)
+            rules = self.rule_documents.get(params['keypairid'], [])
+            return {'count': len(rules), 'keypermission': rules}
         elif command == 'registerUserKeys':
             requested = {value for key, value in params.items() if key.endswith('.rule')}
-            if not requested <= self.available:
+            if not {name for name in requested if '*' not in name} <= self.available:
                 raise PermissionError('New key permissions exceed the calling key')
             self.key_number += 1
             key_id = 'key-' + str(self.key_number)
             result = {'id': key_id, 'name': params['name'], 'apikey': key_id + '-api',
-                      'secretkey': key_id + '-secret'}
+                      'secretkey': key_id + '-secret', 'userid': params['id'], 'state': 'Enabled',
+                      'accountid': 'parent-account' if params['id'] == 'parent-user' else 'child-account',
+                      'domainid': 'parent-domain' if params['id'] == 'parent-user' else 'child-domain'}
             self.keys[key_id] = result
             self.key_rules[key_id] = requested
+            self.rule_documents[key_id] = [{'rule': params[f'rules[{i}].rule'],
+                    'permission': params[f'rules[{i}].permission']} for i in range(len(requested))]
             response = {'userkeys': result}
         elif command == 'deleteUserKeys':
             del self.keys[params['keypairid']]
@@ -225,7 +240,7 @@ def provisioning_service(store, cloud):
     service = Service(store, SimpleNamespace(max_output=65536))
 
     class RuntimeCloud:
-        async def catalogue(self):
+        async def catalogue(self, *, refresh=False):
             return {name: {'name': name} for name in cloud.runtime_available}
 
         async def raw(self, command, params):
@@ -238,8 +253,10 @@ def provisioning_service(store, cloud):
         def __init__(self, credentials):
             self.credentials = credentials
 
-        async def catalogue(self):
-            allowed = cloud.key_rules.get(self.credentials.get('id'), cloud.available)
+        async def catalogue(self, *, refresh=False):
+            rules = cloud.rule_documents.get(self.credentials.get('id'))
+            allowed = cloud.available if rules is None else {name for name in cloud.available
+                if next((r['permission'] == 'allow' for r in rules if fnmatch.fnmatchcase(name, r['rule'])), False)}
             return {name: {'name': name} for name in allowed}
 
         async def raw(self, command, params):
@@ -252,6 +269,26 @@ def provisioning_service(store, cloud):
 
     service.cloud_client = cloud_client
     service.client = CredentialClient
+    return service
+
+
+def rotation_service(store, cloud):
+    service = provisioning_service(store, cloud)
+    row = store.one('SELECT * FROM agents WHERE id=?', ('parent',))
+    for purpose in ('runtime', 'provisioning'):
+        pair = store.open(row[purpose])
+        cloud.keys[pair['id']] = {**pair, 'name': 'prior-'+purpose, 'userid': 'parent-user',
+                                  'accountid': 'parent-account', 'domainid': 'parent-domain', 'state': 'Enabled'}
+        allowed = NATIVE_APIS if purpose == 'runtime' else NATIVE_APIS | PROVISION_APIS
+        cloud.key_rules[pair['id']] = set(allowed)
+        cloud.rule_documents[pair['id']] = [{'rule': name, 'permission': 'allow'} for name in sorted(allowed)]
+    async def authorized(identity, agent_id, **kwargs):
+        return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
+    async def human_call(identity, command, params=None):
+        if command == 'listApis':
+            return {'api': list((await cloud.catalogue()).values())}
+        return await cloud.raw(command, params)
+    service.authorize, service.human_call = authorized, human_call
     return service
 
 
@@ -315,7 +352,7 @@ async def test_provisioning_survives_lost_responses_and_restart_without_duplicat
     row = store.one('SELECT * FROM agents WHERE id=?', (child['id'],))
     assert row['provider_id'] == 'provider' and row['instructions'] == 'Parent instructions'
     assert row['domain_id'] == 'child-domain' and row['can_provision'] == 1
-    assert set(json.loads(row['runtime_policy'])) == RUNTIME_APIS
+    assert 'runtime_policy' not in row
     assert store.open(row['runtime'])['id'] in cloud.keys
     assert store.open(row['provisioning'])['id'] in cloud.keys
     counts = collections.Counter(command for command, _ in cloud.calls)
@@ -328,12 +365,12 @@ async def test_provisioning_survives_lost_responses_and_restart_without_duplicat
     key_requests = [params for command, params in cloud.calls if command == 'registerUserKeys']
     runtime_request = next(params for params in key_requests if params['name'].endswith('-runtime'))
     provisioning_request = next(params for params in key_requests if params['name'].endswith('-provision'))
-    for request, expected in ((runtime_request, RUNTIME_APIS),
-                              (provisioning_request, RUNTIME_APIS | PROVISION_APIS)):
+    for request, expected in ((runtime_request, NATIVE_APIS),
+                              (provisioning_request, NATIVE_APIS | PROVISION_APIS)):
         assert {value for key, value in request.items() if key.endswith('.rule')} == expected
         assert {value for key, value in request.items() if key.endswith('.permission')} == {'allow'}
         assert 'enddate' in request
-    assert 'createDomain' not in RUNTIME_APIS and 'registerUserKeys' not in RUNTIME_APIS
+    assert 'createDomain' not in NATIVE_APIS and 'registerUserKeys' not in NATIVE_APIS
 
 
 async def test_child_permissions_are_limited_by_parent_runtime_even_with_broader_provisioning_key(store):
@@ -357,20 +394,20 @@ async def test_credential_permissions_also_intersect_the_issuing_keys_live_catal
     cloud.available = {'listApis', 'listDomains', 'listVirtualMachines', 'createDomain', 'createAccount',
                        'registerUserKeys', 'listUserKeys', 'deleteUserKeys'}
     service = provisioning_service(store, cloud)
-    credentials = await service._credentials(cloud, 'child-user', 'operation', runtime_allowed=RUNTIME_APIS)
+    credentials = await service._credentials(cloud, 'child-user', 'operation', runtime_allowed=NATIVE_APIS)
     runtime_rules = cloud.key_rules[credentials['runtime']['id']]
     provisioning_rules = cloud.key_rules[credentials['provisioning']['id']]
-    assert runtime_rules == RUNTIME_APIS & cloud.available
-    assert provisioning_rules == (RUNTIME_APIS | PROVISION_APIS) & cloud.available
+    assert runtime_rules == NATIVE_APIS & cloud.available
+    assert provisioning_rules == (NATIVE_APIS | PROVISION_APIS) & cloud.available
     assert all(rules <= cloud.available for rules in cloud.key_rules.values())
-    assert set(credentials['runtime_policy']) == runtime_rules
+    assert 'runtime_policy' not in credentials
 
 
 async def test_failed_replacement_domain_validation_preserves_active_credentials(store):
     original = add_parent(store)
     cloud = ProvisioningCloud()
     cloud.invalid_replacement = True
-    service = provisioning_service(store, cloud)
+    service = rotation_service(store, cloud)
 
     async def authorized(identity, agent_id, **kwargs):
         return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
@@ -390,37 +427,125 @@ async def test_failed_replacement_domain_validation_preserves_active_credentials
     assert store.one('SELECT * FROM credential_rotations WHERE agent_id=?', ('parent',))
 
 
-@pytest.mark.parametrize('policy', [[], ['listApis', 'listDomains', 'listVirtualMachines']])
-async def test_expired_runtime_credentials_preserve_stored_restrictions_or_fail_closed(store, policy):
+@pytest.mark.parametrize('native_available', [True, False])
+async def test_expired_runtime_uses_native_rules_or_fails_closed_without_local_fallback(store, native_available):
     add_parent(store)
-    store.execute('UPDATE agents SET runtime_policy=? WHERE id=?', (json.dumps(policy), 'parent'))
     cloud = ProvisioningCloud()
-    service = provisioning_service(store, cloud)
-
-    async def authorized(identity, agent_id, **kwargs):
-        return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
-
-    async def expired_runtime(agent, purpose='runtime'):
-        raise CloudError('Runtime key has expired')
-
-    async def human_call(identity, command, params=None):
-        if command == 'listApis':
-            return {'api': list((await cloud.catalogue()).values())}
-        return await cloud.raw(command, params)
-
-    service.authorize, service.cloud_client, service.human_call = authorized, expired_runtime, human_call
-    if not policy:
-        with pytest.raises(PermissionError, match='policy unknown'):
+    service = rotation_service(store, cloud)
+    if not native_available:
+        del cloud.keys['old-runtime']
+        with pytest.raises(PermissionError, match='exact native key'):
             await service.rotate_credentials({'userid': 'human'}, 'parent')
         assert not any(command == 'registerUserKeys' for command, _ in cloud.calls)
         return
+    cloud.runtime_available = set()  # The old key cannot authenticate; human native inspection remains authoritative.
+    cloud.key_rules['old-runtime'] = {'listApis', 'listDomains', 'listVirtualMachines'}
+    cloud.rule_documents['old-runtime'] = [{'rule': name, 'permission': 'allow'}
+                                          for name in sorted(cloud.key_rules['old-runtime'])]
     await service.rotate_credentials({'userid': 'human'}, 'parent')
-    row = store.one('SELECT runtime,provisioning,runtime_policy FROM agents WHERE id=?', ('parent',))
-    runtime_rules = cloud.key_rules[store.open(row['runtime'])['id']]
-    provisioning_rules = cloud.key_rules[store.open(row['provisioning'])['id']]
-    assert runtime_rules == set(policy) == set(json.loads(row['runtime_policy']))
-    assert provisioning_rules == set(policy) | PROVISION_APIS
-    assert 'deployVirtualMachine' not in runtime_rules | provisioning_rules
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
+    assert cloud.key_rules[store.open(row['runtime'])['id']] == {'listApis', 'listDomains', 'listVirtualMachines'}
+    assert cloud.key_rules[store.open(row['provisioning'])['id']] == NATIVE_APIS | PROVISION_APIS
+    assert not store.one('SELECT * FROM credential_rotations')
+
+
+async def test_rotation_clones_authoritative_rule_order_denies_and_wildcards(store):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    rules = [{'rule': 'destroyVirtualMachine', 'permission': 'deny'}, {'rule': '*', 'permission': 'allow'}]
+    cloud.rule_documents['old-runtime'] = rules
+    await service.rotate_credentials({'userid': 'human'}, 'parent')
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
+    assert cloud.rule_documents[store.open(row['runtime'])['id']] == rules
+    assert store.open(row['runtime'])['id'] != store.open(row['provisioning'])['id']
+    assert set(row) == {'runtime', 'provisioning'}
+
+
+@pytest.mark.parametrize('foreign', ['userid', 'accountid', 'domainid', 'shared'])
+async def test_adoption_rejects_foreign_native_key_and_shared_credential_identity(store, foreign):
+    original = add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    key = {**cloud.keys['old-runtime'], 'id': 'selected', 'apikey': 'selected-api', 'secretkey': 'selected-secret'}
+    if foreign != 'shared':
+        key[foreign] = 'unrelated'
+    cloud.keys['selected'] = key
+    selected = 'old-provisioning' if foreign == 'shared' else 'selected'
+    with pytest.raises(PermissionError, match='exact agent|exact native key|separate native'):
+        await service.rotate_credentials({'type': 1, 'userid': 'human'}, 'parent', native_key_ids={'runtime': selected})
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
+    assert {purpose: store.open(row[purpose]) for purpose in original} == original
+    assert not any(command in {'registerUserKeys', 'deleteUserKeys'} for command, _ in cloud.calls)
+
+
+@pytest.mark.parametrize('expired', [False, True])
+async def test_explicit_native_adoption_uses_cloudstack_grant_without_python_permission_list(store, expired):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    key = {**cloud.keys['old-runtime'], 'id': 'selected', 'apikey': 'selected-api', 'secretkey': 'selected-secret'}
+    cloud.keys['selected'] = key
+    cloud.available |= {'expungeVirtualMachine'}
+    cloud.rule_documents['selected'] = [{'rule': name, 'permission': 'allow'}
+                                        for name in sorted(NATIVE_APIS | {'expungeVirtualMachine'})]
+    if expired:
+        del cloud.keys['old-runtime']
+    await service.rotate_credentials({'type': 1, 'userid': 'human'}, 'parent', native_key_ids={'runtime': 'selected'})
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
+    assert store.open(row['runtime'])['id'] == 'selected'
+    assert store.open(row['provisioning'])['id'] == 'old-provisioning'
+    assert 'old-provisioning' in cloud.keys and 'old-runtime' not in cloud.keys
+    assert not any(command == 'registerUserKeys' for command, _ in cloud.calls)
+    async def native_client(agent, purpose='runtime'):
+        return service.client(store.open(agent[purpose]))
+    service.cloud_client = native_client
+    assert await service.search_api('parent', 'expunge') == [{'name': 'expungeVirtualMachine', 'description': ''}]
+    assert (await service.describe_api('parent', 'expungeVirtualMachine'))['name'] == 'expungeVirtualMachine'
+
+
+async def test_native_permission_change_during_rotation_preserves_previous_pair(store, monkeypatch):
+    original = add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    raw = cloud.raw
+    reads = 0
+    async def changed(command, params=None):
+        nonlocal reads
+        if command == 'listUserKeyRules' and params['keypairid'] == 'old-runtime':
+            reads += 1
+            if reads == 2:
+                cloud.rule_documents['old-runtime'] = [{'rule': 'listDomains', 'permission': 'allow'}]
+        return await raw(command, params)
+    monkeypatch.setattr(cloud, 'raw', changed)
+    with pytest.raises(PermissionError, match='permissions changed'):
+        await service.rotate_credentials({'userid': 'human'}, 'parent')
+    row = store.one('SELECT runtime,provisioning FROM agents WHERE id=?', ('parent',))
+    assert {purpose: store.open(row[purpose]) for purpose in original} == original
+    assert 'old-runtime' in cloud.keys and 'old-provisioning' in cloud.keys
+
+
+async def test_rotation_recovers_lost_revocation_reply_without_issuing_keys_again(store, monkeypatch):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    service = rotation_service(store, cloud)
+    raw = cloud.raw
+    lost = False
+    async def interrupted(command, params=None):
+        nonlocal lost
+        result = await raw(command, params)
+        if command == 'deleteUserKeys' and params['keypairid'] == 'old-runtime' and not lost:
+            lost = True
+            raise CloudError('Deletion committed before reply was lost')
+        return result
+    monkeypatch.setattr(cloud, 'raw', interrupted)
+    with pytest.raises(CloudError):
+        await service.rotate_credentials({'userid': 'human'}, 'parent')
+    assert store.one('SELECT phase FROM credential_rotations')['phase'] == 'revoking'
+    await service.rotate_credentials({'userid': 'human'}, 'parent')
+    assert not store.one('SELECT * FROM credential_rotations')
+    assert 'old-runtime' not in cloud.keys and 'old-provisioning' not in cloud.keys
+    assert sum(command == 'registerUserKeys' for command, _ in cloud.calls) == 2
 
 
 async def test_revoke_retry_keeps_agent_disabled_and_finishes_remote_deletion(store, monkeypatch):
@@ -515,13 +640,13 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
     template = '00000000-0000-0000-0000-000000000001'
     params = {'templateid': template, 'zoneid': '00000000-0000-0000-0000-000000000002',
               'serviceofferingid': '00000000-0000-0000-0000-000000000003'}
-    store.execute('INSERT INTO managed_templates VALUES(?,?)', (template, 'Managed Linux'))
+    store.execute('INSERT INTO managed_templates(id,name) VALUES(?,?)', (template, 'Managed Linux'))
 
     class DeploymentCloud:
         deployments = 0
         vm = None
 
-        async def catalogue(self):
+        async def catalogue(self, *, refresh=False):
             return {'deployVirtualMachine': {'name': 'deployVirtualMachine', 'params': [
                 *({'name': name, 'type': 'uuid', 'required': True}
                   for name in ('templateid', 'zoneid', 'serviceofferingid')),
@@ -770,3 +895,104 @@ async def test_concurrent_catalogue_requests_share_one_fetch():
     cloud.raw = raw
     results = await asyncio.gather(*(cloud.catalogue() for _ in range(8)))
     assert calls == ['listApis'] and all('listDomains' in result for result in results)
+
+
+async def test_dashboard_is_optional_platform_admin_only_and_never_carries_credentials(store):
+    service = Service(store, SimpleNamespace(cloudstack_ui_url='https://cloud.tailnet.invalid/client'))
+    root, domain = {'userid': 'root-human', 'type': 1}, {'userid': 'domain-human', 'type': 2}
+    assert service.dashboard_url(root) == service.settings.cloudstack_ui_url + '/'
+    assert service.dashboard_url(domain) == ''
+    with pytest.raises(PermissionError):
+        service.save_dashboard_url(domain, 'https://elsewhere.invalid')
+    for value in ('http://cloud.invalid/client', 'javascript:alert(1)', 'https://user:secret@cloud.invalid',
+                  'https://cloud.invalid/client?sessionkey=private', 'https://cloud.invalid/#secret'):
+        with pytest.raises(ValueError):
+            service.save_dashboard_url(root, value)
+    service.save_dashboard_url(root, 'https://new.tailnet.invalid/client/')
+    assert service.dashboard_url(root) == 'https://new.tailnet.invalid/client/'
+    service.save_dashboard_url(root, '')
+    assert service.dashboard_url(root) == ''
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+async def test_private_template_ownership_recovery_and_managed_clone_approval(store, interrupted):
+    add_parent(store)
+    store.execute('INSERT INTO managed_templates VALUES(?,?,?)', ('base', 'Approved build base', 1))
+    store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key) VALUES(?,?,?,?)',
+                  ('vm', 'parent', 'dirigent', store.seal('synthetic-key')))
+    class TemplateCloud:
+        calls = 0
+        template = None
+        async def catalogue(self, *, refresh=False):
+            return {'createTemplate': {'params': [{'name': n, 'type': 'string', 'required': True}
+                    for n in ('name', 'volumeid', 'ostypeid')] + [
+                        {'name': 'ispublic', 'type': 'boolean'}, {'name': 'account', 'type': 'string'}]}}
+        async def raw(self, command, params):
+            if command == 'listVolumes':
+                return {'volume': [{'id': 'root', 'type': 'ROOT', 'virtualmachineid': 'vm'}]}
+            if command == 'listVirtualMachines':
+                return {'virtualmachine': [{'id': 'vm', 'state': 'Stopped', 'templateid': 'base'}]}
+            if command == 'listTemplates':
+                return {'template': [self.template] if self.template else []}
+            if command == 'listAccounts':
+                return {'account': [{'id': 'parent-account', 'domainid': 'parent-domain', 'name': 'owner'}]}
+            assert command == 'createTemplate' and params['ispublic'] is False and params['isfeatured'] is False
+            self.calls += 1
+            self.template = {'id': 'private-image', 'name': params['name'], 'accountid': 'parent-account',
+                             'domainid': 'parent-domain', 'account': 'owner', 'ispublic': False, 'isready': True}
+            if interrupted:
+                raise CloudError('Response lost after creation')
+            return {'template': self.template}
+    cloud = TemplateCloud()
+    service = Service(store, SimpleNamespace(max_output=65536))
+    async def client(*args):
+        return cloud
+    service.cloud_client = client
+    for params in ({'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux', 'ispublic': True},
+                   {'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux', 'account': 'unrelated'}):
+        with pytest.raises(PermissionError):
+            await service.execute('parent', 'createTemplate', params)
+    args = {'name': 'private', 'volumeid': 'root', 'ostypeid': 'linux'}
+    if interrupted:
+        with pytest.raises(CloudError):
+            await service.execute('parent', 'createTemplate', args)
+        with pytest.raises(CloudError, match='recovery'):
+            await service.execute('parent', 'createTemplate', args)
+        await service.recover_templates()
+    result = await service.execute('parent', 'createTemplate', args)
+    assert result['template']['id'] == 'private-image' and cloud.calls == 1
+    assert store.one('SELECT guest_admin FROM managed_templates WHERE id=?', ('private-image',))['guest_admin'] == 1
+    store.execute('DELETE FROM vm_access')
+    with pytest.raises(PermissionError, match='managed root volume'):
+        await service.execute('parent', 'createTemplate', {**args, 'name': 'unauthorized-copy'})
+    assert not any(runtime_api(name) for name in ('createGpuDevice', 'discoverGpuDevices', 'registerUserKeys'))
+
+
+async def test_only_platform_admin_can_adopt_an_explicit_native_key(store):
+    add_parent(store)
+    service = Service(store, SimpleNamespace())
+    for identity, selected in [({'type': 2}, {'runtime': 'native-key'}),
+                               ({'type': 1}, {'unknown-purpose': 'native-key'})]:
+        with pytest.raises(PermissionError, match='human platform administrator'):
+            await service.rotate_credentials(identity, 'parent', native_key_ids=selected)
+
+
+async def test_managed_agent_feature_gate_does_not_override_native_infrastructure_grants(store):
+    add_parent(store)
+    store.execute('UPDATE agents SET can_provision=0 WHERE id=?', ('parent',))
+    service = Service(store, SimpleNamespace(max_output=65536))
+    class NativeGrant:
+        async def catalogue(self, *, refresh=False):
+            return {'createDomain': {'name': 'createDomain', 'params': [{'name': 'name', 'type': 'string'}]}}
+        async def execute(self, command, params):
+            assert (command, params) == ('createDomain', {'name': 'Native domain'})
+            return {'domain': {'id': 'native-domain', 'name': params['name']}}
+    async def client(agent, purpose='runtime'):
+        return NativeGrant()
+    service.cloud_client = client
+    assert (await service.search_api('parent', 'createDomain'))[0]['name'] == 'createDomain'
+    assert (await service.describe_api('parent', 'createDomain'))['name'] == 'createDomain'
+    result = await service.execute('parent', 'createDomain', {'name': 'Native domain'})
+    assert result['domain']['id'] == 'native-domain'
+    with pytest.raises(PermissionError, match='Subgroup creation disabled'):
+        await service.create_subgroup('parent', 'Managed agent')

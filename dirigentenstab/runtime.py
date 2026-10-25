@@ -33,6 +33,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .guest import Guest
 from .diagnostics import diagnose, OperationError
+from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_operation_id
 
 
 REQUESTS_PER_WINDOW = 20
@@ -151,11 +152,13 @@ class Runtime:
         self.running = set()
         for run in self.service.store.all("SELECT id,checkpoint FROM chat_runs WHERE status='running'"):
             saved = self.service.store.open(run['checkpoint']) if run['checkpoint'] else None
+            uncertain = bool(saved and any(item['status'] in {'running', 'uncertain'}
+                                          for item in saved['mutations'].values()))
             if saved:
-                saved.update(reason='restart', resumable=not any(
-                    item['status'] in {'running', 'uncertain'} for item in saved['mutations'].values()))
-            self.service.store.execute("UPDATE chat_runs SET status='interrupted',updated=?,checkpoint=? WHERE id=?",
-                                       (time.time(), self.service.store.seal(saved) if saved else None, run['id']))
+                saved.update(reason='restart', resumable=not uncertain)
+            self.service.store.execute('UPDATE chat_runs SET status=?,updated=?,checkpoint=? WHERE id=?',
+                                       ('reconciliation' if uncertain else 'interrupted', time.time(),
+                                        self.service.store.seal(saved) if saved else None, run['id']))
         self.model_cache = {}
 
     async def models(self, identity, provider_id):
@@ -215,6 +218,56 @@ class Runtime:
                                _resume=run)
 
     @staticmethod
+    async def reconcile_gpu(service, identity, operation_id):
+        run = service.store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
+                                'WHERE r.id=? AND c.human_id=?', (operation_id, identity['userid']))
+        if not run or run['status'] != 'reconciliation' or not run['checkpoint']:
+            raise PermissionError('No owned GPU execution requiring reconciliation')
+        await service.authorize(identity, run['agent_id'])
+        state = service.store.open(run['checkpoint'])
+        pending = [(key, item) for key, item in state['mutations'].items() if item['status'] in {'running', 'uncertain'}]
+        if len(pending) != 1 or pending[0][1]['tool'] != 'execute':
+            raise ValueError('Execution requires administrator review of its uncertain actions')
+        key, entry = pending[0]
+        def matching(event):
+            if (event['type'] != 'tool_call' or event.get('name') != 'execute_api'
+                    or not isinstance(event.get('content'), dict) or event['content'].get('command') not in GPU_COMMANDS):
+                return False
+            args = event['content']
+            value = [run['agent_id'], 'execute', [run['agent_id'], args['command'], args['params']], {}]
+            return key in {hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()
+                           for v in (value, [*value, event.get('call_id')])}
+        call = next((e for e in service.store.open(run['events']) if matching(e)), None)
+        if not call:
+            raise ValueError('No matching durable GPU tool dispatch')
+        confirmed = await helper_call(service.settings, 'result', session=identity['_session'], run_id=run['id'],
+                                      operation_id=gpu_operation_id({'run_id': run['id'], 'call_id': call['call_id']}))
+        if (confirmed['phase'] not in {'completed', 'failed'} or confirmed['command'] != call['content']['command']
+                or confirmed['params'] != call['content']['params']):
+            raise ValueError('GPU controller result does not match this saved execution')
+        result = service.redact(confirmed['result'])
+        entry.update(status='complete' if confirmed['phase'] == 'completed' else 'rejected', result=result)
+        state['cache'].clear()
+        state.update(resumable=True, reason='reconciled', recovery={'gpu_result': result,
+                     'instruction': ('This attempt was definitively rejected. Reuse earlier successful resources; '
+                                     'a corrected remaining allocation may use a new tool-call identity.'
+                                     if confirmed['phase'] == 'failed' else
+                                     'Reuse this verified GPU operation result; do not repeat the completed action.')})
+        conversation = service.store.one('SELECT messages FROM conversations WHERE id=?', (run['conversation_id'],))
+        messages = load_history(service.store.open(conversation['messages']))
+        for message in messages:
+            for part in message.parts:
+                if isinstance(part, ToolReturnPart) and part.tool_call_id == call['call_id']:
+                    part.content = result
+        with service.store.connect() as conn:
+            conn.execute('UPDATE conversations SET messages=? WHERE id=?',
+                         (service.store.seal(service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(messages)))),
+                          run['conversation_id']))
+            conn.execute("UPDATE chat_runs SET status='interrupted',category='reconciled',checkpoint=? WHERE id=?",
+                         (service.store.seal(state), run['id']))
+        service.store.audit(identity['userid'], 'reconcile-gpu-execution', run['id'])
+
+    @staticmethod
     async def reconcile(service, identity, operation_id, deployment_id):
         """Close an explicitly identified deployment after the existing admin recovery workflow."""
         run = service.store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
@@ -224,6 +277,11 @@ class Runtime:
         await service.authorize(identity, run['agent_id'])
         op = service.store.one('SELECT * FROM vm_deployments WHERE id=? AND agent_id=?',
                                (deployment_id, run['agent_id']))
+        template_op = None
+        if not op:
+            template_op = service.store.one('SELECT * FROM template_creations WHERE id=? AND agent_id=?',
+                                             (deployment_id, run['agent_id']))
+            op = template_op
         if not op or op['phase'] not in {'complete', 'rejected'}:
             raise ValueError('Recover or resolve the deployment through scripts/admin.py first')
         state = service.store.open(run['checkpoint'])
@@ -234,7 +292,7 @@ class Runtime:
         key, entry = pending[0]
         calls = [e for e in service.store.open(run['events']) if e['type'] == 'tool_call' and
                  e.get('name') == 'execute_api' and e.get('target') in {
-                     'deployVirtualMachine', 'destroyVirtualMachine', 'startVirtualMachine', 'stopVirtualMachine'} and
+                     'deployVirtualMachine', 'destroyVirtualMachine', 'startVirtualMachine', 'stopVirtualMachine', 'createTemplate'} and
                  isinstance(e.get('content'), dict) and 'params' in e['content']]
         def matches(event):
             value = [run['agent_id'], 'execute', [run['agent_id'], event['content']['command'],
@@ -246,7 +304,14 @@ class Runtime:
         request = stored.get('request', stored)
         if not call:
             raise ValueError('Deployment does not match the saved execution arguments')
-        if call['content']['command'] != 'deployVirtualMachine':
+        if template_op:
+            if call['content']['command'] != 'createTemplate' or any(
+                    request.get(k) != v for k, v in call['content']['params'].items() if k != 'name'):
+                raise ValueError('Template does not match the saved execution arguments')
+            if op['phase'] != 'complete':
+                raise ValueError('Recover the private template through scripts/admin.py first')
+            entry.update(status='complete', result={'template': await service._bind_private_template(op)})
+        elif call['content']['command'] != 'deployVirtualMachine':
             previous_vm = op['vm_id'] or stored.get('result', {}).get('id')
             if (op['phase'] != 'rejected' or not previous_vm or
                     call['content']['params'].get('id') != previous_vm):
@@ -269,12 +334,15 @@ class Runtime:
             entry.update(status='complete', result={'virtualmachine': vm, 'recovered': True})
         state['cache'].clear()
         state.update(resumable=True, reason='reconciled', recovery={
-            'deployment_id': deployment_id, 'phase': op['phase'], 'vm_id': op['vm_id'],
+            'deployment_id': deployment_id, 'phase': op['phase'], 'vm_id': op.get('vm_id'),
             'instruction': ('The failed deployment was definitively rejected and its empty placeholder removed. '
                             'Do not start, stop or destroy the removed VM. Correct the offering/storage selection and '
                             'complete the original task with at most one new VM.' if op['phase'] == 'rejected' else
                             'Reuse this recovered VM; do not deploy again. Continue guest SSH and verification.'),
         })
+        if template_op:
+            state['recovery'] = {'template_id': op['template_id'], 'instruction':
+                                 'Reuse the recovered private template; do not create it again.'}
         conversation = service.store.one('SELECT messages FROM conversations WHERE id=?', (run['conversation_id'],))
         raw = service.store.open(conversation['messages'])
         messages = load_history(raw)
@@ -324,7 +392,7 @@ class Runtime:
                 tool == 'execute' and args[1].startswith(('list', 'get', 'query')))
             invocation_key = [agent_id, tool, args, kwargs]
             # Creation intent is stable across model retries; other actions retain their precise tool-call identity.
-            if not read_only and tool != 'create_subgroup' and not (tool == 'execute' and args[1] == 'deployVirtualMachine'):
+            if not read_only and tool != 'create_subgroup' and not (tool == 'execute' and args[1] in {'deployVirtualMachine', 'createTemplate'}):
                 invocation_key.append(call_id)
             key = hashlib.sha256(json.dumps(invocation_key, sort_keys=True).encode()).hexdigest()
             state = budget.get('state')
@@ -389,7 +457,11 @@ class Runtime:
         @agent.tool(sequential=True)
         async def execute_api(ctx: RunContext, command: str, params: dict) -> dict:
             """Run a discovered CloudStack command using this agent's restricted runtime identity."""
-            return await invoke(self.service.execute, agent_id, command, params, call_id=ctx.tool_call_id)
+            token = GPU_CONTEXT.set({'run_id': budget['operation_id'], 'call_id': ctx.tool_call_id})
+            try:
+                return await invoke(self.service.execute, agent_id, command, params, call_id=ctx.tool_call_id)
+            finally:
+                GPU_CONTEXT.reset(token)
 
         @agent.tool_plain(sequential=True)
         async def create_subgroup(name: str, model: str | None = None, instructions: str | None = None) -> dict:
@@ -403,7 +475,7 @@ class Runtime:
 
         @agent.tool(sequential=True)
         async def transfer_vm_file(ctx: RunContext, vm_id: str, source: str, destination: str, direction: str) -> dict:
-            """Upload/download an authorized guest file; local paths are agent-workspace filenames, max 8 MiB."""
+            """Transfer guest files (8 MiB); upload source asset:ID streams an operator-approved larger bundle."""
             return await invoke(self.guest.transfer_vm_file, agent_id, vm_id, source, destination, direction, call_id=ctx.tool_call_id)
 
         @agent.tool_plain(sequential=True)
@@ -626,8 +698,9 @@ class Runtime:
                     captured = []
                 pending = self.service.store.one(
                     "SELECT id FROM provisioning WHERE parent_id=? AND phase<>'complete' UNION ALL "
-                    "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')",
-                    (agent_id, agent_id))
+                    "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed') UNION ALL "
+                    "SELECT id FROM template_creations WHERE agent_id=? AND phase='dispatched'",
+                    (agent_id, agent_id, agent_id))
                 pending = pending or any(item['status'] in {'running', 'uncertain'} for item in state['mutations'].values())
                 status = 'reconciliation' if pending else 'completed'
                 state.update(reason=None, resumable=False)
@@ -637,8 +710,9 @@ class Runtime:
         except (Exception, asyncio.CancelledError) as exc:
             pending = self.service.store.one(
                 "SELECT id FROM provisioning WHERE parent_id=? AND phase<>'complete' UNION ALL "
-                    "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')",
-                    (agent_id, agent_id))
+                    "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed') UNION ALL "
+                    "SELECT id FROM template_creations WHERE agent_id=? AND phase='dispatched'",
+                    (agent_id, agent_id, agent_id))
             pending = pending or any(item['status'] in {'running', 'uncertain'} for item in state['mutations'].values())
             status = 'reconciliation' if pending else 'interrupted' if isinstance(exc, asyncio.CancelledError) else 'failed'
             error = diagnose(exc, operation_id=operation_id, agent_id=agent_id, tool=active_tool,
