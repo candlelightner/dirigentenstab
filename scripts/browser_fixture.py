@@ -2,6 +2,7 @@
 """CI-only browser fixture: real application/auth/runtime, fake CloudStack and model."""
 
 import argparse
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -130,7 +131,15 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'markdown stress' in prompt:
+    if 'bounded lifecycle' in prompt:
+        await asyncio.sleep(0.15)
+        completed = sum(part.part_kind == 'tool-return' for message in messages for part in message.parts)
+        if completed >= 5:
+            yield 'Bounded lifecycle complete'
+        else:
+            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
+                {'command': 'listVirtualMachines', 'params': {}}), tool_call_id=f'bounded-{completed}')}
+    elif 'markdown stress' in prompt:
         yield ('## Infrastructure report\n\n**Ready** and *checked*. `inline` [CloudStack](https://cloudstack.apache.org)\n\n'
                '> Bounded details\n\n1. First\n2. Second\n\n- Safe\n- Readable\n\n'
                '```python\n' + 'print("long line") ' * 100 + '\n```\n\n'
@@ -197,6 +206,9 @@ def main():
                         database=str(store.path), key_file=str(master))
     service = FixtureService(store, settings)
     auth = Auth(service)
+    runtime_module.REQUESTS_PER_WINDOW = 2
+    runtime_module.TOOLS_PER_WINDOW = 2
+    runtime_module.AUTOMATIC_WINDOWS = 1
     runtime_module.build_model = lambda *args: FunctionModel(stream_function=fake_model)
     attach(app, auth, settings)
     build_ui(service, auth)

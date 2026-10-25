@@ -22,7 +22,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 7
+    assert reopened.one('PRAGMA user_version')['user_version'] == 8
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 

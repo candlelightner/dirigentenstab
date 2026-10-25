@@ -204,3 +204,33 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await page.locator('.q-tree').get_by_text('Research Admin', exact=True).wait_for()
         await page.screenshot(path=str(state / 'mobile-drawer.png'), full_page=True)
         await browser.close()
+
+
+async def test_browser_budget_pause_reload_and_continue(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        await page.get_by_label('Message', exact=True).fill('bounded lifecycle')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        continuation = page.get_by_role('button', name='Continue saved task', exact=True)
+        await continuation.wait_for()
+        await page.get_by_text('Window limits: 2 requests / 2 tools', exact=False).wait_for()
+        await page.screenshot(path=str(state / 'budget-paused.png'), full_page=True)
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.get_by_label('Conversation', exact=True).fill('bounded lifecycle')
+        await page.get_by_role('option', name='bounded lifecycle', exact=True).click()
+        await continuation.wait_for()
+        for _ in range(2):
+            await continuation.click()
+            await continuation.wait_for(state='hidden')
+            await page.get_by_role('status').filter(has_text='Completed').or_(continuation).first.wait_for()
+        await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
+        assert not await continuation.is_visible()
+        await page.get_by_text('Tools: 5', exact=False).wait_for()
+        box = await page.get_by_label('Message', exact=True).bounding_box()
+        assert box['y'] + box['height'] <= 844
+        await page.screenshot(path=str(state / 'budget-completed.png'), full_page=True)
+        await browser.close()

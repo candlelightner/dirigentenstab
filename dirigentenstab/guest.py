@@ -72,7 +72,7 @@ class Guest:
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 600:
             raise ValueError('Timeout must be between 1 and 600 seconds')
         output = {'stdout': bytearray(), 'stderr': bytearray()}
-        result = {'exit_code': None, 'stdout': '', 'stderr': '', 'timeout': False, 'error': None}
+        result = {'exit_code': None, 'stdout': '', 'stderr': '', 'timeout': False, 'error': None, 'executed': False}
         limit = self.service.settings.max_output
 
         async def drain(reader, name):
@@ -87,6 +87,7 @@ class Guest:
                 address, record = await self._target(agent_id, vm_id)
                 async with self._connection(address, record) as connection:
                     async with connection.create_process(command, encoding=None) as process:
+                        result['executed'] = True
                         tasks = [asyncio.create_task(drain(process.stdout, 'stdout')),
                                  asyncio.create_task(drain(process.stderr, 'stderr')),
                                  asyncio.create_task(process.wait_closed())]

@@ -14,9 +14,10 @@ from uuid import UUID
 
 
 class CloudError(RuntimeError):
-    def __init__(self, message, *, rejected=False):
+    def __init__(self, message, *, rejected=False, operation_id=None):
         super().__init__(message)
         self.rejected = rejected
+        self.operation_id = operation_id
 
 
 # This is an authorization policy, not an API specification. Signatures come from listApis.
@@ -117,6 +118,7 @@ class Cloud:
         self.settings = settings
         self.credentials = credentials
         self.profile = 'ds' + hashlib.sha256(credentials['apikey'].encode()).hexdigest()[:20]
+        self._catalogue_lock = asyncio.Lock()
         self._metadata = None
         self._metadata_time = 0
         self._limit = asyncio.Semaphore(4)
@@ -227,10 +229,11 @@ class Cloud:
         return result
 
     async def catalogue(self):
-        if self._metadata is None or time.monotonic() - self._metadata_time > 300:
-            response = await self.raw('listApis')
-            self._metadata = {api['name']: api for api in response.get('api', [])}
-            self._metadata_time = time.monotonic()
+        async with self._catalogue_lock:
+            if self._metadata is None or time.monotonic() - self._metadata_time > 300:
+                response = await self.raw('listApis')
+                self._metadata = {api['name']: api for api in response.get('api', [])}
+                self._metadata_time = time.monotonic()
         return self._metadata
 
     async def execute(self, command, params, *, runtime=True):

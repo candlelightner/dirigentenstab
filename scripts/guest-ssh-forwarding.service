@@ -1,0 +1,11 @@
+[Unit]
+Description=Dirigentenstab application guest SSH forwarding
+After=docker.service cloudstack-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/dirigentenstab-guest-ssh.py
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

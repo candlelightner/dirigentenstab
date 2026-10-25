@@ -141,7 +141,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     error = diagnose(exc, agent_id=state['agent'])
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'resume_operation': None}
         agents = {row['id']: row for row in data.get('agents', [])}
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
             ui.icon('account_tree').classes('text-teal-900 text-2xl')
@@ -218,6 +218,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
                 with ui.scroll_area().classes('messages'):
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
+                continue_button = ui.button('Continue saved task', icon='play_arrow').props('outline')
+                continue_button.set_visibility(False)
+                budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
                 with ui.row().classes('composer gap-2'):
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
@@ -274,7 +277,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             current = await actor()
             agent = await service.authorize(current, agent_id)
-            state.update(agent=agent_id, conversation=None, imported=False)
+            state.update(agent=agent_id, conversation=None, imported=False, resume_operation=None)
+            continue_button.set_visibility(False)
+            budget_label.set_text('')
             transcript.clear()
             tool_cards.clear()
             progress.set_text('Ready')
@@ -359,6 +364,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             restored = await runtime.restore(await actor(), event.value)
             if restored['agent_id'] != state['agent']:
                 raise PermissionError('Conversation belongs to another agent')
+            state['resume_operation'] = None
+            continue_button.set_visibility(False)
+            budget_label.set_text('')
             state['conversation'] = restored['id']
             state['imported'] = bool(restored.get('imported'))
             progress.set_text('Imported history is read-only. Sending starts a new conversation without '
@@ -368,6 +376,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if restored.get('runs'):
                 run = restored['runs'][-1]
                 progress.set_text(f"{run['status'].capitalize()} · Reference: {run['id']}")
+                budget = run.get('budget')
+                state['resume_operation'] = run['id'] if budget and budget.get('resumable') else None
+                continue_button.set_visibility(bool(state['resume_operation']))
+                if budget:
+                    show_budget(budget)
+                    if budget.get('resumable'):
+                        progress.set_text('Paused · ' + str(budget.get('reason')) + ' budget · Reference: ' + run['id'])
             for kind, content in history_parts(restored):
                 activity(content) if kind == 'activity' else message(kind, content)
 
@@ -376,12 +391,22 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if not state['busy']:
                 state['conversation'] = None
                 state['imported'] = False
+                state['resume_operation'] = None
+                continue_button.set_visibility(False)
+                budget_label.set_text('')
                 progress.set_text('')
                 history_select.set_value(None)
                 transcript.clear()
 
-        async def send():
-            if state['busy'] or not state['agent'] or not (text := prompt.value.strip()):
+        def show_budget(budget):
+            budget_label.set_text(f"Requests: {budget.get('requests', 0)} · Tools: {budget.get('tool_calls', 0)} · "
+                                  f"Windows: {budget.get('windows', 0)} · Reused: {budget.get('cache_hits', 0)} · "
+                                  f"Window limits: {budget.get('requests_per_window', 20)} requests / "
+                                  f"{budget.get('tools_per_window', 30)} tools")
+
+        async def send(resume=False):
+            text = prompt.value.strip() if prompt.value else ''
+            if state['busy'] or not state['agent'] or (not resume and not text):
                 return
             # Claim the submission before the first await; rapid clicks cannot start two mutations.
             state['busy'] = True
@@ -400,8 +425,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             new_button.disable()
             history_select.disable()
             agent_choice.disable()
-            message('human', text)
-            prompt.set_value('')
+            continue_button.set_visibility(False)
+            if not resume:
+                message('human', text)
+                prompt.set_value('')
             with transcript:
                 with ui.chat_message(name='Agent').classes('w-full max-w-full'):
                     answer = ui.markdown('', extras=['tables', 'fenced-code-blocks'], sanitize=True).classes('markdown w-full')
@@ -409,27 +436,42 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             chunks = []
 
             async def event_received(event):
+                if event.get('budget'):
+                    show_budget(event['budget'])
                 if event.get('type') == 'run_started':
                     state['conversation'] = event['conversation_id']
                     progress.set_text('Running · Reference: ' + event['operation_id'])
                 elif event.get('type') == 'text':
                     chunks.append(event.get('text', ''))
                     answer.set_content(''.join(chunks))
+                elif event.get('type') == 'budget_checkpoint':
+                    progress.set_text('Checkpoint saved; continuing next bounded window · Reference: ' + event['operation_id'])
                 elif event.get('type') in {'tool_call', 'tool_result'}:
                     activity(event)
 
             try:
-                result = await runtime.chat(current, agent_id, state['conversation'], text, event_received)
+                result = (await runtime.resume(current, state['resume_operation'], event_received) if resume else
+                          await runtime.chat(current, agent_id, state['conversation'], text, event_received))
                 state['conversation'] = result['conversation_id']
                 state['imported'] = False
                 answer.set_content(result['output'])
-                progress.set_text('Requires reconciliation' if result.get('status') == 'reconciliation' else 'Completed')
+                state['resume_operation'] = result['operation_id'] if result.get('status') == 'paused' and result.get('resumable', True) else None
+                continue_button.set_visibility(bool(state['resume_operation']))
+                progress.set_text('Paused · Completed activity saved · Reference: ' + result['operation_id']
+                                  if result.get('status') == 'paused' else
+                                  'Requires reconciliation' if result.get('status') == 'reconciliation' else 'Completed')
                 await histories()
                 await refresh()
             except Exception as exc:
                 error = diagnose(exc, agent_id=agent_id)
                 progress.set_text(('Requires reconciliation · ' if error.reconciliation else 'Failed · ') + str(error))
                 await histories()
+                if state['conversation']:
+                    restored = await runtime.restore(current, state['conversation'])
+                    latest = restored.get('runs', [])[-1:]
+                    if latest and (latest[0].get('budget') or {}).get('resumable'):
+                        state['resume_operation'] = latest[0]['id']
+                        continue_button.set_visibility(True)
                 raise error from None
             finally:
                 state['busy'] = False
@@ -634,6 +676,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         refresh_button.on_click(lambda: protect(refresh))
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
+        continue_button.on_click(lambda: protect(lambda: send(resume=True)))
         if providers_button is not None:
             providers_button.on_click(lambda: protect(provider_dialog))
 

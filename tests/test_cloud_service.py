@@ -758,3 +758,15 @@ async def test_managed_ssh_ingress_uses_one_private_egress_address_and_reuses_th
     assert ingress == [{'securitygroupid': 'ssh-group', 'protocol': 'tcp', 'startport': 22,
                         'endport': 22, 'cidrlist': '10.253.80.1/32'}]
     assert sum(command == 'createSecurityGroup' for command, _ in cloud.calls) == 1
+
+
+async def test_concurrent_catalogue_requests_share_one_fetch():
+    cloud = Cloud(SimpleNamespace(), {'apikey': 'fixture'})
+    calls = []
+    async def raw(command):
+        calls.append(command)
+        await asyncio.sleep(0.01)
+        return {'api': [{'name': 'listDomains'}]}
+    cloud.raw = raw
+    results = await asyncio.gather(*(cloud.catalogue() for _ in range(8)))
+    assert calls == ['listApis'] and all('listDomains' in result for result in results)

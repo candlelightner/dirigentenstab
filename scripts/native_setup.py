@@ -216,6 +216,18 @@ def network():
     run('systemctl', 'enable', '--now', 'dirigentenstab-network')
 
 
+def guest_ssh():
+    """Install only scoped application-to-guest SSH forwarding, without restarting native services."""
+    save('/usr/local/libexec/dirigentenstab-guest-ssh.py',
+         (ROOT / 'scripts/guest_ssh_forwarding.py').read_text(), 0o755)
+    for kind in ('service', 'timer'):
+        save(f'/etc/systemd/system/dirigentenstab-guest-ssh.{kind}',
+             (ROOT / f'scripts/guest-ssh-forwarding.{kind}').read_text())
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', 'dirigentenstab-guest-ssh.timer')
+    run('systemctl', 'start', 'dirigentenstab-guest-ssh.service')
+
+
 def database():
     save('/etc/mysql/mysql.conf.d/dirigentenstab.cnf',
          '[mysqld]\nbind-address=127.0.0.1\nmysqlx-bind-address=127.0.0.1\n'
@@ -343,17 +355,19 @@ print('Existing CloudStack API verified through CloudMonkey; native services wer
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
-    for name in ['preflight', 'install', 'verify']:
+    for name in ['preflight', 'install', 'verify', 'guest-ssh']:
         modes.add_argument('--' + name, action='store_true')
     parser.add_argument('--existing', action='store_true', help='Connect to an existing private CloudStack installation')
     args = parser.parse_args()
-    if not any([args.preflight, args.install, args.verify, args.existing]):
-        parser.error('Choose --preflight, --install, --verify or --existing')
+    if not any([args.preflight, args.install, args.verify, args.existing, args.guest_ssh]):
+        parser.error('Choose --preflight, --install, --verify, --guest-ssh or --existing')
     if os.geteuid() != 0:
         parser.error('Run with sudo. Preflight reads protected virtualization and network state.')
     os.umask(0o077)
     STATE.mkdir(parents=True, exist_ok=True)
-    if args.preflight:
+    if args.guest_ssh:
+        guest_ssh()
+    elif args.preflight:
         preflight(existing=args.existing)
     elif args.verify:
         verify_existing() if args.existing else verify()
@@ -370,6 +384,7 @@ def main():
             raise RuntimeError('Zone setup incomplete; safe to retry after resolving the reported prerequisite.')
         verify()
         prepare_application()
+        guest_ssh()
 
 
 if __name__ == '__main__':
