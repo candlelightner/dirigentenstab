@@ -174,8 +174,14 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await page.get_by_label('Model ID', exact=True).wait_for()
         assert await page.get_by_label('Model ID', exact=True).input_value() == 'custom-private-model'
         await page.get_by_role('button', name='Cancel', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
         await message.fill('markdown stress')
-        await page.get_by_role('button', name='Send', exact=True).click()
+        try:
+            await page.get_by_role('button', name='Send', exact=True).click()
+        except Exception:
+            await page.screenshot(path=str(state / 'submission-failure.png'), full_page=True)
+            print('Textarea at failed submission:', await message.input_value())
+            raise
         await page.get_by_role('heading', name='Infrastructure report', exact=True).wait_for()
         await page.get_by_text('Completed', exact=True).wait_for()
         assert await page.locator('.markdown table').count() == 1
