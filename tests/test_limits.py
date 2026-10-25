@@ -5,36 +5,43 @@ import pytest
 from dirigentenstab.limits import APP_ROOT_AGENT, check_vm_policy, gpu_count
 
 
-async def test_general_vm_tool_cannot_skip_the_gpu_policy_guard(monkeypatch):
+@pytest.mark.parametrize('denied', [False, True])
+async def test_general_vm_api_uses_native_agent_identity_without_gpu_helper(monkeypatch, denied):
     from dirigentenstab import service as service_module
+    from dirigentenstab import gpu
 
-    audited = []
+    audited, calls = [], []
     store = SimpleNamespace(all=lambda *args: [], audit=lambda *args, **kwargs: audited.append(args))
-    service = service_module.Service(store, SimpleNamespace())
+    service = service_module.Service(store, SimpleNamespace(max_output=65536))
     trusted = {'id': 'trusted-agent', 'domain_id': 'leaf'}
 
     class Cloud:
-        async def catalogue(self):
-            return {'startVirtualMachine': {'params': [{'name': 'id', 'type': 'uuid', 'required': True}]}}
-
-        async def execute(self, *args, **kwargs):
-            pytest.fail('The CloudStack mutation must not run after a denied GPU policy check')
+        async def execute(self, command, params):
+            calls.append((command, params))
+            if denied:
+                raise PermissionError('Native account denied the API')
+            return {'virtualmachine': {'id': params['id'], 'state': 'Running'}}
 
     async def agent(agent_id):
         assert agent_id == trusted['id']
         return trusted
 
     async def cloud_client(agent):
+        assert agent is trusted
         return Cloud()
 
-    async def guard(actual_service, actual_agent, params, *, command):
-        assert actual_service is service and actual_agent is trusted and command == 'startVirtualMachine'
-        raise PermissionError('GPU quota exceeded in ancestor')
+    async def helper(*args, **kwargs):
+        pytest.fail('Native agent APIs must not use the privileged GPU helper')
 
     service.agent, service.cloud_client = agent, cloud_client
-    monkeypatch.setattr(service_module, 'check_vm_policy', guard)
-    with pytest.raises(PermissionError, match='GPU quota exceeded'):
-        await service.execute(trusted['id'], 'startVirtualMachine', {'id': '00000000-0000-0000-0000-000000000001'})
+    monkeypatch.setattr(gpu, 'helper_call', helper)
+    params = {'id': '00000000-0000-0000-0000-000000000001'}
+    if denied:
+        with pytest.raises(PermissionError, match='Native account denied'):
+            await service.execute(trusted['id'], 'startVirtualMachine', params)
+    else:
+        assert (await service.execute(trusted['id'], 'startVirtualMachine', params))['virtualmachine']['state'] == 'Running'
+    assert calls == [('startVirtualMachine', params)]
     assert audited
 
 

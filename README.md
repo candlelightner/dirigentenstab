@@ -35,11 +35,13 @@ For **Tavily**, select the main agent, then **Configure → MCP tools → New se
 
 External tool results are untrusted data. Generic MCP calls use the existing durable execution tracking; an uncertain outcome requires administrator review before another mutation. Only assign tools and send queries to services you intend to trust with that data. See [security](docs/SECURITY.md) for the boundaries.
 
+CloudStack `execute_api` calls use native behavior by default, preserving caller-supplied names, user-data and publication settings. For application-managed SSH enrollment, explicitly set `managed=true` when deploying from an approved template. The same option on `createTemplate` selects the durable private-template workflow; it does not restrict ordinary native template creation.
+
 ## Security boundaries
 
 - Human passwords remain with CloudStack. Application sessions are server-side, expiring and revocable; cookies use HttpOnly, Secure and SameSite Strict.
-- Agents are distinct CloudStack **domain administrators**, never host administrators. Runtime and provisioning API keys are separate, restricted and encrypted.
-- Host filesystems, libvirt, host mounts, storage pools, extensions and hypervisor configuration are platform-administrator operations. Runtime tools reject them, including `extraconfig`, `details`, host-path parameters and CloudMonkey `@file` expansion.
+- Each managed agent account uses one encrypted CloudStack API key pair. Its native account, domain and role determine every available API; Dirigentenstab adds no API allow/deny list.
+- API search, description and execution use the same agent credentials, including native-authorized service-offering operations. Denials are returned without retrying as a parent or platform administrator. Local shell access and CloudMonkey `@file` expansion remain unavailable.
 - Guest SSH uses a dedicated non-root user, a unique per-VM client key and a verified host-key pin. Transfers are confined to the agent's application workspace. No Docker socket or arbitrary host directories are mounted in the application.
 - Infrastructure operations can change or delete resources within the agent's CloudStack permissions. Only configure agents and providers you intend to authorize.
 
@@ -59,4 +61,4 @@ python3 -m venv .venv
 
 CI runs unit and integration checks and builds the image. Chromium browser tests run in their own job. Merging a version change in `pyproject.toml` publishes `ghcr.io/candlelightner/dirigentenstab:<version>` and creates its release tag; an explicit version tag is also supported. Pushing or publishing an image never deploys it to your host.
 
-CloudStack 4.23 is a regular release supported until the next regular or LTS release. It is pinned for restricted API-key support; schedule upgrades using the upstream release notes rather than enabling unattended CloudStack upgrades. Third-party components retain their own licenses; see [third-party notices](docs/THIRD_PARTY.md).
+CloudStack 4.23 is a regular release supported until the next regular or LTS release. Its native API roles and domain permissions are used directly; schedule upgrades using the upstream release notes rather than enabling unattended CloudStack upgrades. Third-party components retain their own licenses; see [third-party notices](docs/THIRD_PARTY.md).

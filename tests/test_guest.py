@@ -17,9 +17,9 @@ def guest(tmp_path):
     key = tmp_path / 'master'
     key.write_bytes(Fernet.generate_key())
     store = Store(str(tmp_path / 'state.db'), str(key))
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) '
-                  'VALUES(?,?,?,?,?,?,?)', ('agent', 'Agent', 'domain', 'account', 'user',
-                                           store.seal({}), store.seal({})))
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) '
+                  'VALUES(?,?,?,?,?,?)', ('agent', 'Agent', 'domain', 'account', 'user',
+                                           store.seal({})))
 
     class Service:
         settings = SimpleNamespace(workspace=str(tmp_path / 'transfers'), max_output=64,

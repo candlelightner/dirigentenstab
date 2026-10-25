@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Socket-activated root GPU controller; no TCP listener and no arbitrary host-command endpoint."""
+"""Socket-activated human-operated GPU host controller; native VM calls keep the agent identity."""
 import asyncio
 from contextlib import suppress
 import json

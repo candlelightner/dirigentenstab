@@ -207,11 +207,11 @@ def main():
     store = Store(str(args.state_dir / 'browser.db'), str(master))
     store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
                   ('fixture', 'Local fixture', 'chat', 'http://127.0.0.1/v1', store.seal(PRIVATE_VALUES[4]), 'fixture-model'))
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,model) '
-                  'VALUES(?,?,?,?,?,?,?,?,?)',
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
+                  'VALUES(?,?,?,?,?,?,?,?)',
                   (AGENT_ID, 'Research Admin', AGENT_DOMAIN, 'research-account', 'research-user',
                    store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
-                   store.seal({'apikey': PRIVATE_VALUES[2], 'secretkey': PRIVATE_VALUES[3]}), 'fixture', 'fixture-model'))
+                   'fixture', 'fixture-model'))
     api_port = fake_api(args.state_dir)
     store.execute('UPDATE providers SET base_url=? WHERE id=?', (f'http://127.0.0.1:{api_port}/v1', 'fixture'))
     for identifier, endpoint in [('unsupported', 'unsupported'), ('empty', 'empty'), ('unauthorized', 'unauthorized')]:
@@ -220,10 +220,10 @@ def main():
                        store.seal(''), ''))
     for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'), *[
             (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
-        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning,provider_id,model) '
-                      'VALUES(?,?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
+                      'VALUES(?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',
                        store.seal({'apikey': PRIVATE_VALUES[0], 'secretkey': PRIVATE_VALUES[1]}),
-                       store.seal({'apikey': PRIVATE_VALUES[2], 'secretkey': PRIVATE_VALUES[3]}), 'fixture', 'fixture-model'))
+                       'fixture', 'fixture-model'))
     store.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
                   (APP_ROOT_AGENT, 'Agents', 'fixture-model', '', 'complete', 0))
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',

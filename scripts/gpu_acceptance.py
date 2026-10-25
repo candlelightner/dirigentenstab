@@ -10,7 +10,7 @@ import time
 import uuid
 
 from dirigentenstab.cloud import Cloud, CloudError, validate
-from dirigentenstab.limits import APP_ROOT_AGENT, check_vm_policy
+from dirigentenstab.limits import APP_ROOT_AGENT
 from dirigentenstab.settings import Settings
 from live_acceptance import prepare
 
@@ -38,7 +38,7 @@ async def acceptance(app, zone, platform, state):
                          if value['name'] == command), None)
         if not metadata:
             raise RuntimeError('Required CloudStack API unavailable: ' + command)
-        validate(metadata, params, runtime=False)
+        validate(metadata, params)
         result = await platform.raw(command, params)
         await trace(command, params, {'accepted': True})
         return result
@@ -88,15 +88,6 @@ async def acceptance(app, zone, platform, state):
                 'name': 'ds-gpu-' + label + '-' + state['operation'][:12]}
         for label, offering_id in state['offerings'].items()
     }
-    try:
-        await check_vm_policy(app, leaf, requests['visible'])
-    except PermissionError as exc:
-        message = str(exc)
-        if 'GPU quota exceeded' not in message or groups['parent']['domain_id'] not in message:
-            raise
-        await trace('backend GPU policy', {'offering': 'visible'}, {'denied': message})
-    else:
-        raise AssertionError('Backend accepted GPU allocation beneath an ancestor GPU quota of zero')
     for label in ('visible', 'restricted'):
         # startvm=false guarantees no hardware assignment even if a native quota regression is found.
         try:
@@ -120,19 +111,13 @@ async def acceptance(app, zone, platform, state):
         'serviceoffering', [])
     if restricted:
         raise AssertionError('Leaf agent can list an unrelated-domain GPU compute offering')
-    try:
-        await check_vm_policy(app, leaf, requests['restricted'])
-    except PermissionError:
-        state['backend_restricted_offering_denied'] = True
-    else:
-        raise AssertionError('Backend accepted an unrelated-domain GPU compute offering')
     state.update(passed=True, completed=time.time(), cloudstack='4.23.0.0', gpu_resource_type=GPU_RESOURCE_TYPE,
                  ancestor_gpu_zero_native_denied=True, descendant_unlimited_did_not_bypass=True,
                  restricted_offering_native_denied=True, no_gpu_assignment_attempted=True)
     await asyncio.to_thread(save, state)
     print(json.dumps({key: state[key] for key in ('passed', 'cloudstack', 'gpu_resource_type',
                       'ancestor_gpu_zero_native_denied', 'descendant_unlimited_did_not_bypass',
-                      'restricted_offering_native_denied', 'backend_restricted_offering_denied',
+                      'restricted_offering_native_denied',
                       'no_gpu_assignment_attempted')}, indent=2))
 
 

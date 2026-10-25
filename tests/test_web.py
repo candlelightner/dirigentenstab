@@ -47,7 +47,7 @@ def test_history_excludes_system_instructions_and_keeps_tool_activity():
 @pytest.mark.asyncio
 async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
     agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
-             'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': False,
+             'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': True,
              'instructions': 'Original prompt'}
 
     class Auth:
@@ -110,6 +110,18 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         assert auth.calls >= 2, user.notify.messages
         assert not user.notify.messages, user.notify.messages
         await user.should_see('Administrator account: cloud-account')
+        expansion = next(iter(user.find('agent_details').elements))
+        assert expansion.value is True
+        header = list(expansion.slots['header'].children[0].descendants())
+        assert {element.text for element in header if isinstance(element, (ui.label, ui.badge))} == {
+            'Research agent', 'Domain administrator'}
+        assert not any(isinstance(element, ui.button) for element in header)
+        body = list(expansion.default_slot.children[0].descendants())
+        assert {element.text for element in body if isinstance(element, ui.button)} == {'Configure', 'Create subgroup'}
+        user.find('agent_details').trigger('update:modelValue', False)
+        assert expansion.value is False
+        user.find('agent_details').trigger('update:modelValue', True)
+        assert expansion.value is True
         user.find('Message').type('Hello research')
         user.find('Send').click()
         user.find('Send').trigger('click')

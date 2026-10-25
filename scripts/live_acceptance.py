@@ -65,7 +65,7 @@ async def acceptance(app, zone):
                     'zoneid': zone['zone_id'], 'templateid': zone['template_id'],
                     'serviceofferingid': zone['service_offering_id'],
                     'displayname': 'Dirigentenstab acceptance ' + name,
-                })
+                }, managed=True)
                 vm = result['virtualmachine']
                 state[key] = vm[0]['id'] if isinstance(vm, list) else vm['id']
             save(state)
@@ -103,22 +103,21 @@ async def acceptance(app, zone):
         state['unrelated_vm_denied'] = True
     else:
         raise AssertionError('Research agent accessed Development VM')
-    for command, params in [('createStoragePool', {}), ('addHost', {}),
-                            ('updateVirtualMachine', {'id': state['research_vm'], 'extraconfig': '/etc/shadow'})]:
-        try:
-            await app.execute(research, command, params)
-        except (PermissionError, ValueError):
-            pass
-        else:
-            raise AssertionError('Platform-only operation was permitted')
-    state.update(host_operations_denied=True, passed=True, completed=time.time(), cloudstack='4.23.0.0')
+    agent = await app.agent(research)
+    catalogue = await (await app.cloud_client(agent)).catalogue(refresh=True)
+    assert 'listDomains' in catalogue and 'deployVirtualMachine' in catalogue
+    for command in ('createServiceOffering', 'updateServiceOffering'):
+        if command in catalogue:
+            assert (await app.describe_api(research, command))['name'] == command
+    state.update(native_catalogue_verified=True, native_api_count=len(catalogue),
+                 passed=True, completed=time.time(), cloudstack='4.23.0.0')
     save(state)
     # Workspaces remain private and readable by the application's unprivileged container user.
     for path in [Path(app.settings.workspace), workspace, *workspace.iterdir()]:
         os.chown(path, 10001, 10001)
     print(json.dumps({key: state[key] for key in ('passed', 'cloudstack', 'python', 'intentional_failure',
                                                 'file_roundtrip', 'guest_nonroot_no_sudo_or_host_sockets',
-                                                'unrelated_vm_denied', 'host_operations_denied')}, indent=2))
+                                                'unrelated_vm_denied', 'native_catalogue_verified')}, indent=2))
 
 
 if __name__ == '__main__':

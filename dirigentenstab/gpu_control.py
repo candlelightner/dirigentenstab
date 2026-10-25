@@ -1,4 +1,4 @@
-"""Privileged GPU controller. Only its Unix-socket service runs with host privileges."""
+"""Human-operated GPU host preparation; VM dispatch keeps the agent identity."""
 import asyncio
 from contextlib import contextmanager
 import hashlib
@@ -142,7 +142,6 @@ class Controller:
     def __init__(self, service, cloud, journal, host, host_id):
         self.service, self.cloud, self.journal, self.host, self.host_id = service, cloud, journal, host, host_id
         self.lock = asyncio.Lock()
-        self.service.gpu_local = True
 
     async def domains(self):
         return (await self.cloud.raw('listDomains', {'listall': True})).get('domain', [])
@@ -529,7 +528,7 @@ class Controller:
                                      'domainid': allocation_owner['domain_id'], 'value': str(policy['release_on_stop']).lower()})
             self.journal.phase(identifier, 'dispatching')
             self.service.gpu_deployment_id = identifier if command == 'deployVirtualMachine' else None
-            result = await self.service.execute(agent['id'], command, params)
+            result = await self.service.execute(agent['id'], command, params, managed=command == 'deployVirtualMachine')
             await self.cloud.raw('discoverGpuDevices', {'id': self.host_id})
             self.journal.phase(identifier, 'completed', result)
             return result
@@ -552,8 +551,8 @@ class Controller:
         actions = {'status': {'session'}, 'set_policy': {'session', 'domain_id', 'policy'},
                    'claim': {'session', 'domain_id', 'uuid'},
                    'offering': {'session', 'domain_id', 'profile', 'cpus', 'memory', 'root_disk'},
-                   'execute': {'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
-                   'resume': {'session', 'operation_id'}, 'authorize': {'agent_id', 'command', 'params', 'context'},
+                   'execute': {'session', 'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
+                   'resume': {'session', 'operation_id'}, 'authorize': {'session', 'agent_id', 'command', 'params', 'context'},
                    'result': {'session', 'operation_id', 'run_id'}}
         action = request.get('action')
         if action not in actions or set(request) != actions[action] | {'action'}:
@@ -579,4 +578,5 @@ class Controller:
                         raise PermissionError('Only a saved pre-dispatch GPU plan may be resumed')
                     return await self.execute(json.loads(rows[0]['request']))
                 return await self.reconcile(rows[0])
+            await self.human(request['session'])
             return await self.execute(request, preflight=action == 'authorize')

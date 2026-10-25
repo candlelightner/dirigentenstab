@@ -72,73 +72,68 @@ async def test_cloudmonkey_file_expansion_is_rejected_before_subprocess(value):
         await cloud.raw('listVirtualMachines', {'name': value})
 
 
-@pytest.mark.parametrize('parameter', ['hostid', 'hosttags', 'extraconfig', 'details', 'mountpoint',
-                                      'path', 'filepath', 'sessionkey', 'apikey', 'secretkey'])
-def test_runtime_cannot_configure_host_or_select_credentials(parameter):
+@pytest.mark.parametrize('parameter', ['sessionkey', 'apikey', 'secretkey', 'signature', 'signatureversion'])
+def test_runtime_cannot_override_server_selected_authentication(parameter):
     metadata = {'params': [{'name': parameter, 'type': 'string'}]}
-    with pytest.raises(ValueError, match='not permitted'):
+    with pytest.raises(ValueError, match='authentication is selected by the server'):
         validate(metadata, {parameter: '/host/private'})
 
 
-async def test_retry_cleanup_uses_actual_cloudstack_userkeys_response(store, monkeypatch):
+@pytest.mark.parametrize('parameter', ['hostid', 'hosttags', 'extraconfig', 'details', 'mountpoint', 'path', 'filepath'])
+def test_remote_cloudstack_parameters_remain_subject_to_native_permissions(parameter):
+    metadata = {'params': [{'name': parameter, 'type': 'string'}]}
+    assert validate(metadata, {parameter: '/cloudstack/remote/path'}) is None
+
+
+async def test_key_retry_adopts_the_committed_operation_pair_without_reissuing_or_deleting(store, monkeypatch):
     service = Service(store, SimpleNamespace())
-    deleted = []
+    agent = {'user_id': 'user', 'account_id': 'account', 'domain_id': 'domain'}
+    pair = {'id': 'orphan', 'apikey': 'orphan-api', 'secretkey': 'orphan-secret'}
+    existing = {**pair, 'name': 'ds-operation-key', 'userid': 'user', 'accountid': 'account',
+                'domainid': 'domain', 'state': 'Enabled'}
 
-    class Cloud:
-        async def catalogue(self):
-            from dirigentenstab.cloud import PROVISION_APIS
-            return {api: {} for api in PROVISION_APIS | {'listVirtualMachines', 'destroyVirtualMachine'}}
+    async def owned(call, actual):
+        assert actual == agent
+        return [existing]
 
-        async def raw(self, command, params):
-            if command == 'listUserKeys':
-                return {'userapikey': [{'id': 'orphan', 'name': 'ds-operation-runtime'},
-                                       {'id': 'unrelated', 'name': 'other-operation-runtime'}]}
-            assert command == 'deleteUserKeys'
-            deleted.append(params['keypairid'])
-            return {'success': True}
+    async def forbidden(*args):
+        pytest.fail('A committed, operation-named pair must be adopted without issuance or deletion')
 
-    async def key(cloud, user_id, name, allowed):
-        return {'id': name, 'apikey': name + '-key', 'secretkey': name + '-secret'}
-
-    monkeypatch.setattr(service, '_key', key)
-    await service._credentials(Cloud(), 'user', 'operation')
-    assert deleted == ['orphan']
+    monkeypatch.setattr(service, '_owned_keys', owned)
+    monkeypatch.setattr(service, '_key', forbidden)
+    assert await service._credentials(forbidden, agent, 'operation') == pair
 
 
-async def test_revocation_includes_replacements_from_interrupted_rotation(store, monkeypatch):
-    def pair(name):
-        return {'id': name, 'apikey': name + '-api', 'secretkey': name + '-secret'}
-
-    current = {'runtime': pair('old-runtime'), 'provisioning': pair('old-provisioning')}
-    replacement = {'runtime': pair('new-runtime'), 'provisioning': pair('new-provisioning')}
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,runtime,provisioning) '
-                  'VALUES(?,?,?,?,?,?,?)', ('agent', 'Agent', 'domain', 'account', 'user',
-                                           store.seal(current['runtime']), store.seal(current['provisioning'])))
-    store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)',
-                  ('agent', 'rotation', store.seal(current), store.seal(replacement), 'validating', time.time()))
+async def test_credential_maintenance_denies_out_of_scope_humans_before_mutation(store, monkeypatch):
     service = Service(store, SimpleNamespace())
-    deleted = []
-    available = [pair['id'] for pair in [*current.values(), *replacement.values()]]
 
-    class Cloud:
-        async def raw(self, command, params):
-            if command == 'listUserKeys':
-                return {'userapikey': [{'id': key, 'name': 'ds-rotation-' + key} for key in available
-                                       if key not in deleted]}
-            assert command == 'deleteUserKeys'
-            deleted.append(params['keypairid'])
-            return {'success': True}
+    async def denied(*args, **kwargs):
+        raise PermissionError('Outside your CloudStack domain')
 
-    async def authorize(identity, agent_id, **kwargs):
-        assert identity['userid'] == 'human' and agent_id == 'agent'
-        return store.one('SELECT * FROM agents WHERE id=?', (agent_id,))
+    async def forbidden(*args):
+        pytest.fail('Denied maintenance must never reach a privileged credential operation')
 
-    async def cloud_client(agent, purpose='runtime'):
-        return Cloud()
+    monkeypatch.setattr(service, 'authorize', denied)
+    monkeypatch.setattr(service, 'human_call', forbidden)
+    for operation in (service.rotate_credentials, service.revoke_agent):
+        with pytest.raises(PermissionError, match='Outside'):
+            await operation({'userid': 'human'}, 'agent')
 
-    monkeypatch.setattr(service, 'authorize', authorize)
-    monkeypatch.setattr(service, 'cloud_client', cloud_client)
-    await service.revoke_agent({'userid': 'human'}, 'agent')
-    assert set(deleted) == set(available)
-    assert deleted[-1] == 'old-provisioning'
-    assert store.one('SELECT enabled FROM agents WHERE id=?', ('agent',))['enabled'] == 0
+
+async def test_agent_cloud_client_uses_only_its_single_recorded_pair(store, monkeypatch):
+    service = Service(store, SimpleNamespace())
+    pair = {'id': 'one-key', 'apikey': 'one-api', 'secretkey': 'one-secret'}
+    observed = []
+    client = object()
+
+    def signed(credentials):
+        observed.append(credentials)
+        return client
+
+    async def forbidden(*args):
+        pytest.fail('Runtime authentication must not fall back to a human session')
+
+    monkeypatch.setattr(service, 'client', signed)
+    monkeypatch.setattr(service, 'human_call', forbidden)
+    assert await service.cloud_client({'credentials': store.seal(pair)}) is client
+    assert observed == [pair]

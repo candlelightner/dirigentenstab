@@ -59,8 +59,8 @@ async def perform(options):
                     prompt = ('Disposable Ubuntu lifecycle acceptance. Create exactly one new minimal CPU-only Ubuntu VM '
                               f'with displayname "{state["displayname"]}" in your own domain, using a managed template. '
                               'Use supported API names from your context and reuse discovery results. List-valued '
-                              'parameters must be comma-separated strings. Backend-managed SSH and pinned host keys '
-                              'are injected automatically; do not create SSH keypairs or user-data. Wait for SSH readiness '
+                              'parameters must be comma-separated strings. For this deployment set execute_api managed=true '
+                              'to opt into backend-managed SSH and pinned host-key enrollment; do not create SSH keypairs or user-data. Wait for SSH readiness '
                               'without reprovisioning. Use run_vm_command to write /tmp/dirigentenstab-v014.py containing '
                               'assert 6*7 == 42; print("DIRIGENTENSTAB_LIFECYCLE_OK=42"), run it with python3 and verify '
                               'exit code zero and that exact output. Verify the guest user is non-root. Then stop ONLY '
@@ -139,11 +139,7 @@ async def perform(options):
         assert not state.get('cleanup_dispatched'), 'Inspect the previous cleanup outcome before repeating it'
         state['cleanup_dispatched'] = True
         save()
-        # Expunge remains an operator-only permission; never widen an agent's runtime key for this test.
-        credentials = json.loads(await asyncio.to_thread(
-            Path('/var/lib/dirigentenstab/setup/cloudstack-admin.json').read_text))
-        operator = app.client({key: credentials[key] for key in ('apikey', 'secretkey')})
-        await operator.execute('destroyVirtualMachine', {'id': state['vm_id'], 'expunge': True})
+        await app.execute(main['id'], 'destroyVirtualMachine', {'id': state['vm_id'], 'expunge': True})
         remaining = (await cloud.raw('listVirtualMachines', {'listall': True})).get('virtualmachine', [])
         assert {vm['id'] for vm in remaining} == set(state['baseline_vms'])
         app.store.execute("UPDATE vm_deployments SET phase='destroyed' WHERE id=? AND vm_id=?",

@@ -33,7 +33,9 @@ async def perform(options, app, login=None):
         print(json.dumps({'provisioning': app.store.all('SELECT id,parent_id,name,phase,error FROM provisioning'),
                           'deployments': app.store.all('SELECT id,agent_id,name,vm_id,phase FROM vm_deployments'),
                           'templates': app.store.all('SELECT id,agent_id,name,template_id,phase FROM template_creations'),
-                          'rotations': app.store.all('SELECT agent_id,operation_id,phase FROM credential_rotations')}, indent=2))
+                          'rotations': app.store.all('SELECT agent_id,operation_id,phase FROM credential_rotations'),
+                          'legacy_credentials': app.store.all('SELECT agent_id FROM legacy_agent_credentials'),
+                          'legacy_credential_count': app.store.one('SELECT COUNT(*) AS count FROM legacy_agent_credentials')['count']}, indent=2))
         return
     if options.command == 'recover-deployments':
         await app.recover_deployments()
@@ -65,12 +67,19 @@ async def perform(options, app, login=None):
     token, _ = await auth.login(login['username'], login['password'], login.get('domain', '/'), 'local-admin')
     try:
         identity = await auth.identity(token)
-        if options.command == 'rotate':
+        if options.command in {'rotate', 'migrate-key'}:
             await app.rotate_credentials(identity, options.identifier)
+        elif options.command == 'migrate-keys':
+            domains = (await app.human_call(identity, 'listDomains', {'listall': True})).get('domain', [])
+            visible = {domain['id'] for domain in domains}
+            for agent in app.store.all('SELECT id,domain_id FROM agents WHERE enabled=1 AND '
+                                      '(id IN (SELECT agent_id FROM legacy_agent_credentials) OR '
+                                      'id IN (SELECT agent_id FROM credential_rotations))'):
+                if agent['domain_id'] in visible:
+                    await app.rotate_credentials(identity, agent['id'])
+                    print('Migrated credentials for ' + agent['id'])
         elif options.command == 'adopt-key':
-            selected = {purpose: getattr(options, purpose + '_key_id') for purpose in ('runtime', 'provisioning')
-                        if getattr(options, purpose + '_key_id')}
-            await app.rotate_credentials(identity, options.identifier, native_key_ids=selected)
+            await app.rotate_credentials(identity, options.identifier, native_key_id=options.key_id)
         elif options.command == 'approve-template':
             if identity['type'] != 1:
                 raise PermissionError('Template approval requires platform administrator')
@@ -97,7 +106,6 @@ async def perform(options, app, login=None):
             if not op or not op['parent_id']:
                 raise SystemExit('Use setup.sh --install to resume bootstrap; no subordinate operation found.')
             await app.authorize(identity, op['parent_id'])
-            app.store.execute('UPDATE provisioning SET credentials=NULL WHERE id=?', (op['id'],))
             await app.create_subgroup(op['parent_id'], op['name'])
         print('Administrative operation completed.')
     finally:
@@ -108,21 +116,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
                                             'rotate', 'revoke', 'repair-provisioning', 'repair-execution',
-                                            'recover-templates', 'approve-template', 'adopt-key'])
+                                            'recover-templates', 'approve-template', 'adopt-key',
+                                            'migrate-key', 'migrate-keys'])
     parser.add_argument('identifier', nargs='?')
     parser.add_argument('--login-file')
     parser.add_argument('--deployment-id')
     parser.add_argument('--confirmed-rejection', action='store_true')
-    parser.add_argument('--runtime-key-id', help='Exact CloudStack-native runtime key pair UUID to adopt')
-    parser.add_argument('--provisioning-key-id', help='Exact CloudStack-native provisioning key pair UUID to adopt')
+    parser.add_argument('--key-id', help='Exact CloudStack-native key pair UUID to adopt')
     parser.add_argument('--guest-admin', action='store_true', help='Approve sudo inside newly deployed guests of this template only')
     options = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root; this command reads the private application master key.')
-    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection', 'approve-template', 'adopt-key'} and not options.identifier:
+    if options.command in {'rotate', 'migrate-key', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection', 'approve-template', 'adopt-key'} and not options.identifier:
         parser.error('This command requires an identifier from status output.')
-    if options.command == 'adopt-key' and not (options.runtime_key_id or options.provisioning_key_id):
-        parser.error('adopt-key requires an explicit --runtime-key-id and/or --provisioning-key-id from CloudStack')
+    if options.command == 'adopt-key' and not options.key_id:
+        parser.error('adopt-key requires an explicit --key-id from CloudStack')
     login = None
     if options.command not in {'status', 'recover-deployments', 'recover-templates', 'resolve-rejection'}:
         if options.login_file:

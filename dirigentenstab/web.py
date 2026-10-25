@@ -317,31 +317,33 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
-                with ui.row().classes('w-full items-center gap-3'):
-                    ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold')
-                    ui.badge('Domain administrator', color='primary')
-                    ui.space()
-                    ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
-                    if agent.get('can_provision'):
-                        ui.button('Create subgroup', icon='create_new_folder',
-                                  on_click=lambda: protect(subgroup_dialog)).props('outline')
-                provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
-                ui.label('Model: ' + provider.get('name', 'No provider') + ' / ' +
-                         (agent.get('model') or provider.get('default_model') or 'not configured')).classes('text-sm')
-                with ui.expansion('Domain details', icon='info').classes('w-full text-sm'):
-                    ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('break-all')
-                    ui.label('CloudStack domain: ' + agent['domain_id']).classes('break-all')
-                    ui.label('Administrator account: ' + agent['account_id']).classes('break-all')
-                    ui.label('Original agent name: ' + agent['name'])
-                    for user in state['data'].get('users', []):
-                        if user.get('domainid') == agent['domain_id'] and user['id'] != agent.get('user_id'):
-                            ui.label('Administrator: ' + user.get('username', user['id']))
-                for operation in state['data'].get('pending_provisioning', []):
-                    if operation['parent_id'] == agent_id:
-                        ui.label(f"Requires reconciliation: {operation['name']} · {operation['phase']} · "
-                                 f"Reference: {operation['id']}").classes('text-amber-900 break-all')
-                        ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
-                                 'to use scripts/admin.py repair-provisioning.').classes('text-sm')
+                with ui.expansion(value=True).classes('w-full').props('header-class="px-0"').mark('agent_details') as expansion:
+                    with expansion.add_slot('header'):
+                        with ui.row().classes('w-full min-w-0 items-center gap-3'):
+                            ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold break-words')
+                            ui.badge('Domain administrator', color='primary')
+                    with ui.row().classes('w-full items-center justify-end gap-3'):
+                        ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
+                        if agent.get('can_provision'):
+                            ui.button('Create subgroup', icon='create_new_folder',
+                                      on_click=lambda: protect(subgroup_dialog)).props('outline')
+                    provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
+                    ui.label('Model: ' + provider.get('name', 'No provider') + ' / ' +
+                             (agent.get('model') or provider.get('default_model') or 'not configured')).classes('text-sm')
+                    with ui.expansion('Domain details', icon='info').classes('w-full text-sm'):
+                        ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('break-all')
+                        ui.label('CloudStack domain: ' + agent['domain_id']).classes('break-all')
+                        ui.label('Administrator account: ' + agent['account_id']).classes('break-all')
+                        ui.label('Original agent name: ' + agent['name'])
+                        for user in state['data'].get('users', []):
+                            if user.get('domainid') == agent['domain_id'] and user['id'] != agent.get('user_id'):
+                                ui.label('Administrator: ' + user.get('username', user['id']))
+                    for operation in state['data'].get('pending_provisioning', []):
+                        if operation['parent_id'] == agent_id:
+                            ui.label(f"Requires reconciliation: {operation['name']} · {operation['phase']} · "
+                                     f"Reference: {operation['id']}").classes('text-amber-900 break-all')
+                            ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
+                                     'to use scripts/admin.py repair-provisioning.').classes('text-sm')
             await histories()
 
         async def refresh():
