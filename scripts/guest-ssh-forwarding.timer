@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep scoped application SSH rules ahead of CloudStack bridge drops
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target

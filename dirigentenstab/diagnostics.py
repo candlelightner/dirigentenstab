@@ -51,7 +51,7 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         else:
             description = f'The model provider rejected the request (HTTP {code}). Check model and tool compatibility.'
     elif isinstance(exc, UsageLimitExceeded):
-        category, description = 'model-provider', 'The agent reached its request or tool-call limit. Completed activity has been saved.'
+        category, description = 'budget', 'The bounded execution window is exhausted. Progress has been saved for continuation.'
     elif isinstance(exc, UnexpectedModelBehavior):
         category, description = 'model-provider', 'The model returned an invalid or incomplete response. Check model tool-calling support.'
     elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
@@ -65,6 +65,7 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
             'Select a model provider in this agent’s settings first',
             'This conversation already has an execution in progress',
             'Conversation reached its context limit; start a new conversation',
+            'Use scalar values, comma-separated lists, or indexed map parameters',
             'Provider missing', 'Invalid provider name or protocol', 'Agent configuration too large',
             'Use an HTTP(S) URL without embedded credentials',
             'Endpoint URLs cannot contain queries, fragments or newlines',
@@ -80,7 +81,7 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         description = 'Agent execution failed. The administrator can investigate using this reference.'
     if reconciliation:
         category = 'provisioning'
-        description += ' Provisioning requires reconciliation; resume the same subgroup name, without creating a duplicate.'
+        description += ' Infrastructure requires reconciliation. Inspect the saved provisioning or VM deployment before continuing; do not create duplicates.'
     # Exception messages, locals and source lines can contain prompts, HTTP bodies and secrets.
     frames = '\n'.join(f'  {frame.filename}:{frame.lineno} in {frame.name}'
                        for frame in traceback.extract_tb(exc.__traceback__))

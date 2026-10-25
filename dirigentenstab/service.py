@@ -128,6 +128,7 @@ class Service:
                 'hierarchy': {'parent': domain.get('parentdomainid'),
                               'children': [{'id': d['id'], 'path': d.get('path', d['name'])}
                                            for d in domains if d.get('parentdomainid') == domain['id']]},
+                'available_api_names': sorted(set(await cloud.catalogue()) & RUNTIME_APIS),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'delegate'],
                 'boundaries': 'Host filesystems, hypervisor configuration and host mounts are platform-admin only.'}
@@ -149,7 +150,9 @@ class Service:
             raise PermissionError('API not available to this identity')
         from .cloud import FORBIDDEN_PARAMS
         return {**api, 'params': [p for p in api.get('params', []) if p['name'] not in FORBIDDEN_PARAMS],
-                'policy': 'Parameters which alter host configuration or mounts are unavailable.'}
+                'policy': 'Use scalar values and comma-separated strings for lists, not JSON arrays. '
+                          'Host configuration and mounts are unavailable. Managed templates receive SSH keys and '
+                          'cloud-init from the backend; use run_vm_command after deployment.'}
 
     async def execute(self, agent_id, command, params):
         agent = await self.agent(agent_id)
@@ -184,7 +187,7 @@ class Service:
         pending = self.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')",
                                  (agent['id'],))
         if pending:
-            raise CloudError(f"Deployment {pending['id']} needs recovery before another managed VM is created")
+            raise CloudError(f"Deployment {pending['id']} needs recovery before another managed VM is created", operation_id=pending['id'])
         metadata = (await cloud.catalogue()).get('deployVirtualMachine')
         if not metadata:
             raise PermissionError('VM deployment unavailable to this identity')
@@ -220,9 +223,9 @@ class Service:
                 self.store.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=?",
                                    (time.time(), op_id))
                 raise
-            raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying') from None
+            raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying', operation_id=op_id) from None
         except (TimeoutError, OSError):
-            raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying') from None
+            raise CloudError(f'Managed deployment {op_id} has an uncertain outcome; recover before retrying', operation_id=op_id) from None
         self.store.execute('UPDATE vm_deployments SET params=?,updated=? WHERE id=?',
                            (self.store.seal({'request': request, 'result': result}), time.time(), op_id))
         if result.get('jobid'):
@@ -233,13 +236,13 @@ class Service:
                     # Failed deployment jobs can retain a Stopped VM and its already-injected SSH identity.
                     self.store.execute("UPDATE vm_deployments SET phase='failed',updated=? WHERE id=?",
                                        (time.time(), op_id))
-                    raise CloudError(f'Managed deployment {op_id} failed; recover before retrying')
+                    raise CloudError(f'Managed deployment {op_id} failed; recover before retrying', operation_id=op_id)
                 if status.get('jobstatus') == 1:
                     result = status['jobresult']
                     break
                 await asyncio.sleep(2)
             else:
-                raise CloudError(f'Managed deployment {op_id} pending; do not retry until recovered')
+                raise CloudError(f'Managed deployment {op_id} pending; do not retry until recovered', operation_id=op_id)
         vm = first(result, 'virtualmachine')
         self._bind_vm(op_id, vm['id'])
         return result

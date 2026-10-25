@@ -62,6 +62,11 @@ async def perform(options, app, login=None):
             await app.rotate_credentials(identity, options.identifier)
         elif options.command == 'revoke':
             await app.revoke_agent(identity, options.identifier)
+        elif options.command == 'repair-execution':
+            from dirigentenstab.runtime import Runtime
+            if not options.deployment_id:
+                raise SystemExit('Specify --deployment-id from the verified recovery operation.')
+            await Runtime.reconcile(app, identity, options.identifier, options.deployment_id)
         elif options.command == 'repair-provisioning':
             op = app.store.one("SELECT * FROM provisioning WHERE id=? AND phase<>'complete'", (options.identifier,))
             if not op or not op['parent_id']:
@@ -77,14 +82,15 @@ async def perform(options, app, login=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
-                                            'rotate', 'revoke', 'repair-provisioning'])
+                                            'rotate', 'revoke', 'repair-provisioning', 'repair-execution'])
     parser.add_argument('identifier', nargs='?')
     parser.add_argument('--login-file')
+    parser.add_argument('--deployment-id')
     parser.add_argument('--confirmed-rejection', action='store_true')
     options = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root; this command reads the private application master key.')
-    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'resolve-rejection'} and not options.identifier:
+    if options.command in {'rotate', 'revoke', 'repair-provisioning', 'repair-execution', 'resolve-rejection'} and not options.identifier:
         parser.error('This command requires an identifier from status output.')
     login = None
     if options.command not in {'status', 'recover-deployments', 'resolve-rejection'}:
