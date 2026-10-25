@@ -22,6 +22,8 @@ Rotation and explicit adoption verify the exact native agent user/account/domain
 
 CloudStack permissions and quotas are the final infrastructure boundary. The installer must not expose unauthenticated libvirt TCP, disable host SSH protections, or attach existing host directories to guest VMs. Dedicated NFS secondary storage is owned and controlled by platform setup; it is not a general host export or an agent-selectable mount.
 
+The isolated Basic-zone guest subnet uses the host as its gateway and a scoped masquerade rule. Its persistent forwarding helper adapts CloudStack's bridge-only structural checks to routed guest packets while keeping live native VM IP sets and security-group egress chains authoritative. A source-IP guard runs before DHCP exceptions, unknown native ports drop, and uplink replies require established/related connection state. The helper edits only its own chain and tagged jumps, without flushing shared tables or opening new inbound guest access. Removed VM mappings disappear on the next timer pass; native teardown flushes any temporarily referenced empty chains/IP sets, so stale references fail closed.
+
 ## Models and data
 
 The configured provider receives the prompt, compact domain context and requested tool results. Choose local inference when these must remain on your machine. Provider configuration is platform-admin only. Keys are decrypted only inside the backend and are redacted from tool responses and stored histories. Treat tool results and model instructions as untrusted; authorization does not depend on prompts.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Keep scoped application SSH rules ahead of CloudStack bridge drops
+Description=Maintain scoped SSH and native-SG routing ahead of CloudStack bridge drops
 
 [Timer]
 OnBootSec=30

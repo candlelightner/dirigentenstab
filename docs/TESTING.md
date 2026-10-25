@@ -16,6 +16,8 @@ The Python tests cover credential encryption, API validation, permissions, provi
 
 Migration tests cover source-path and symlink boundaries, credential quarantine, archive checksums, resumable history import and isolation of imported transcripts from new model requests. Real migration additionally verifies every restored workspace file and stream-decrypts the original history archives to compare byte counts and hashes; private migration artifacts are never CI fixtures.
 
+Guest forwarding tests verify native security-group references, source-IP checks before DHCP exceptions, unknown-port denial, atomic updates without flushing shared tables, idempotence and stale-VM removal. The live firewall repair on 2026-10-25 verified pinned non-root SSH, DNS and HTTP/HTTPS Ubuntu repository metadata from both existing builders; a TCP/25 attempt on the builder with restricted egress still hit its native-policy drop. No VM, application or native service restart was needed for this repair.
+
 ## Real browser checks
 
 ```sh
