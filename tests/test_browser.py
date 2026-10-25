@@ -490,3 +490,70 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             assert await header.get_by_text('Main Agent', exact=True).is_visible()
             assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await browser.close()
+
+
+async def test_browser_thinking_settings_follow_model_metadata_and_pending_animation(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        agent = page.get_by_label('Chat directly with an agent', exact=True)
+        await agent.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
+        thinking = page.get_by_label('Thinking level', exact=True)
+        await thinking.click()
+        await page.get_by_role('option', name='Max', exact=True).click()
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        assert store.one("SELECT thinking FROM agents WHERE id='research'")['thinking'] == 'max'
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await agent.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
+        await thinking.click()
+        await playwright.expect(page.get_by_role('option', name='Max', exact=True)).to_have_attribute('aria-selected', 'true')
+        await page.keyboard.press('Escape')
+        model = page.get_by_label('Model ID', exact=True)
+        await model.fill('second-model')
+        await model.press('Enter')
+        await page.get_by_text('The previous thinking level is unavailable for this model;', exact=False).wait_for()
+        await thinking.click()
+        assert await page.get_by_role('option', name='Max', exact=True).count() == 0
+        assert await page.get_by_role('option', name='On', exact=True).count() == 0
+        await page.get_by_role('option', name='High', exact=True).click()
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        assert store.one("SELECT model,thinking FROM agents WHERE id='research'") == {
+            'model': 'second-model', 'thinking': 'high'}
+        indicator = page.locator('.thinking-indicator')
+        assert not await indicator.is_visible()
+        await page.get_by_label('Message', exact=True).fill('thinking indicator')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await indicator.wait_for()
+        assert await indicator.get_attribute('role') == 'status'
+        assert await indicator.get_by_text('Thinking…', exact=True).is_visible()
+        assert await indicator.locator('.thinking-dot').count() == 3
+        assert await indicator.locator('.thinking-dot').first.evaluate('e => getComputedStyle(e).animationName') == 'thinking-pulse'
+        await page.emulate_media(reduced_motion='reduce')
+        assert await indicator.locator('.thinking-dot').first.evaluate('e => getComputedStyle(e).animationName') == 'none'
+        await page.get_by_text('Pending response complete.', exact=True).wait_for()
+        await indicator.wait_for(state='hidden')
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        assert not await indicator.is_visible()
+        await agent.fill('Research')
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.get_by_label('Conversation', exact=True).fill('thinking indicator')
+        await page.get_by_role('option', name='thinking indicator', exact=True).click()
+        await page.get_by_text('Pending response complete.', exact=True).wait_for()
+        assert not await indicator.is_visible()
+        await page.screenshot(path=str(state / 'thinking-selector-mobile.png'), full_page=True)
+        await browser.close()

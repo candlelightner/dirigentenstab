@@ -79,19 +79,24 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         async def rotate_credentials(self, identity, agent_id):
             self.rotations.append((identity['userid'], agent_id))
 
-        async def update_agent(self, identity, agent_id, provider_id, model, instructions):
+        async def update_agent(self, identity, agent_id, provider_id, model, instructions, *, thinking='default'):
             self.updates.append((identity['userid'], agent_id, instructions))
             agent['instructions'] = instructions
+            agent['thinking'] = thinking
 
     class Runtime:
         sent = []
+        release = asyncio.Event()
+        fail = False
 
         async def conversations(self, identity, agent_id):
             return [{'id': 'conversation', 'title': 'Example'}]
 
         async def chat(self, identity, agent_id, conversation_id, prompt, on_event):
             self.sent.append((identity['userid'], agent_id, prompt))
-            await asyncio.sleep(0.03)
+            await self.release.wait()
+            if self.fail:
+                raise RuntimeError('Synthetic pending reply failed')
             await on_event({'type': 'text', 'text': 'Hello'})
             await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
             return {'conversation_id': 'conversation', 'output': 'Hello'}
@@ -125,8 +130,11 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         user.find('Message').type('Hello research')
         user.find('Send').click()
         user.find('Send').trigger('click')
+        await user.should_see('thinking_indicator')
+        runtime.release.set()
         await asyncio.sleep(0.1)
         await user.should_see('Hello')
+        await user.should_not_see('thinking_indicator')
         assert runtime.sent == [('human', 'agent', 'Hello research')]
         user.find('Configure').click()
         await user.should_see('Rotate credentials')
@@ -142,6 +150,17 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch):
         await asyncio.sleep(0.1)
         assert service.rotations == [('human', 'agent')]
         assert auth.calls >= 4
+        user.find('Cancel').click()
+        user.find('New conversation').click()
+        await asyncio.sleep(0.05)
+        runtime.fail = True
+        runtime.release.clear()
+        user.find('Message').type('Exercise failed reply')
+        user.find('Send').click()
+        await user.should_see('thinking_indicator')
+        runtime.release.set()
+        await user.should_see('Failed ·')
+        await user.should_not_see('thinking_indicator')
         redirects = []
         monkeypatch.setattr(user.navigate, 'to', redirects.append)
         auth.enabled = False
@@ -339,3 +358,90 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         await asyncio.sleep(0.1)
         assert redirects == ['/login']
         assert Integration.assigned == [('agent', 'search', ['web_search'])]
+
+
+async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ignores_stale_discovery():
+    agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain', 'account_id': 'account',
+             'provider_id': 'reported', 'model': 'model-a', 'thinking': 'high'}
+    identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+
+    class Auth:
+        async def identity(self, token):
+            return identity
+
+    class Service:
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            assert current == identity and agent_id == 'agent'
+            return agent
+
+        async def providers(self, current):
+            return [{'id': 'reported', 'name': 'Reported'}, {'id': 'local', 'name': 'Local'},
+                    {'id': 'unavailable', 'name': 'Unavailable'}]
+
+        async def update_agent(self, current, agent_id, provider_id, model, instructions, *, thinking):
+            assert current == identity and agent_id == 'agent'
+            agent.update(provider_id=provider_id, model=model, instructions=instructions, thinking=thinking)
+
+    class Runtime:
+        block = False
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def conversations(self, current, agent_id):
+            return []
+
+        async def models(self, current, provider_id):
+            return ['model-a', 'model-b']
+
+        async def thinking_capabilities(self, current, provider_id, model_id):
+            assert current == identity
+            if provider_id == 'unavailable':
+                raise RuntimeError('Private model API failure payload')
+            if self.block and provider_id == 'reported' and model_id == 'model-b':
+                self.started.set()
+                await self.release.wait()
+                return {'options': {'default': 'Model default', 'max': 'Max'}, 'source': 'Stale response'}
+            if model_id == 'model-b':
+                return {'options': {'default': 'Model default', 'off': 'Off', 'on': 'On'},
+                        'source': 'Model API reports a thinking toggle'}
+            return {'options': {'default': 'Model default', 'low': 'Low', 'high': 'High', 'max': 'Max'},
+                    'source': 'Model API effort.supported_levels'}
+
+    runtime = Runtime()
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), runtime)
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Configure')
+        user.find('Configure').click()
+        await user.should_see('Model API effort.supported_levels')
+        selector = next(iter(user.find(kind=ui.select, content='Thinking level').elements))
+        assert selector.value == 'high'
+        assert list(selector.options) == ['default', 'low', 'high', 'max']
+        user.find('Thinking level').trigger('update:modelValue', {'value': 3})
+        user.find('Save').click()
+        await asyncio.sleep(0.05)
+        assert agent['thinking'] == 'max'
+        user.find('Configure').click()
+        await user.should_see('Model API effort.supported_levels')
+        selector = next(iter(user.find(kind=ui.select, content='Thinking level').elements))
+        assert selector.value == 'max'
+        runtime.block = True
+        user.find('Model ID').trigger('update:modelValue', {'value': 1})
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        user.find('Model provider').trigger('update:modelValue', {'value': 1})
+        await user.should_see('Model API reports a thinking toggle')
+        assert selector.options == {'default': 'Model default', 'off': 'Off', 'on': 'On'}
+        assert selector.value == 'default'
+        runtime.release.set()
+        await asyncio.sleep(0.05)
+        await user.should_not_see('Stale response')
+        assert selector.options == {'default': 'Model default', 'off': 'Off', 'on': 'On'}
+        user.find('Model provider').trigger('update:modelValue', {'value': 2})
+        await user.should_see('Thinking support could not be verified')
+        await user.should_not_see('Private model API failure payload')
+        assert selector.options == {'default': 'Model default'} and selector.value == 'default'
