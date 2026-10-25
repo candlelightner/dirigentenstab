@@ -1,9 +1,12 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -122,3 +125,35 @@ def test_original_backup_authenticates_decrypt_and_checks_file_link_and_byte_tot
     backup.write_bytes(damaged)
     with pytest.raises((ValueError, tarfile.TarError), match='decryption|header|archive|data'):
         migration.verify_original(backup, key, checksum, expected)
+
+
+def test_restore_preserves_source_marker_filename_and_rejects_symlink_destination(tmp_path):
+    content = b'ordinary source file must be preserved'
+    name = '.dirigentenstab-migration.json'
+    archive = tmp_path / '.migration-workspace.tar.gz'
+    with tarfile.open(archive, 'w:gz') as file:
+        member = tarfile.TarInfo(name)
+        member.size = len(content)
+        file.addfile(member, io.BytesIO(content))
+    archive_bytes = archive.read_bytes()
+    checksum = hashlib.sha256(archive_bytes).hexdigest()
+    report = tmp_path / '.migration-files.json'
+    report_json = json.dumps({'files': [{'path': name, 'size': len(content),
+                                       'sha256': hashlib.sha256(content).hexdigest()}], 'links': []})
+    report.write_text(report_json)
+    program = migration.RESTORE_PROGRAM.replace("pathlib.Path('/home/dirigent/workspace')",
+                                                'pathlib.Path(' + repr(str(tmp_path)) + ')')
+    program = program.replace('assert os.getuid()!=0 and base.is_mount()', 'assert base.is_dir()')
+    completed = subprocess.run([sys.executable, '-c', program, checksum], capture_output=True, timeout=10)
+    assert completed.returncode == 0
+    assert (tmp_path / 'legacy' / name).read_bytes() == content
+    assert (tmp_path / 'legacy' / ('.dirigentenstab-migration-' + checksum + '.json')).is_file()
+    other = tmp_path / 'other'
+    other.mkdir()
+    (other / '.migration-workspace.tar.gz').write_bytes(archive_bytes)
+    (other / '.migration-files.json').write_text(report_json)
+    (other / 'legacy').symlink_to(tmp_path / 'legacy', target_is_directory=True)
+    rejected_program = program.replace(repr(str(tmp_path)), repr(str(other)))
+    rejected = subprocess.run([sys.executable, '-c', rejected_program, checksum], capture_output=True, timeout=10)
+    assert rejected.returncode != 0
+    assert (tmp_path / 'legacy' / name).read_bytes() == content

@@ -621,14 +621,16 @@ with archive.open('rb') as f: assert hashlib.file_digest(f,'sha256').hexdigest()
 metadata=json.loads(report.read_text())
 stage=base/'.migration-stage'
 final=base/'legacy'
-marker=final/'.dirigentenstab-migration.json'
+marker_name='.dirigentenstab-migration-'+expected+'.json'
+marker=final/marker_name
+assert not final.is_symlink()
 if final.exists():
     assert marker.is_file() and json.loads(marker.read_text())['archive_sha256']==expected
 else:
     stage.mkdir(exist_ok=True)
     assert not stage.is_symlink()
     with tarfile.open(archive,'r:gz') as t: t.extractall(stage,filter='data')
-    (stage/'.dirigentenstab-migration.json').write_text(json.dumps({'archive_sha256':expected}))
+    (stage/marker_name).write_text(json.dumps({'archive_sha256':expected}))
     stage.rename(final)
 for folder,dirs,files in os.walk(final,followlinks=False):
     os.chmod(folder,os.stat(folder).st_mode|0o700)
