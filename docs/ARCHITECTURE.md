@@ -16,6 +16,12 @@ Pydantic AI builds the selected Chat Completions or Responses model using a reus
 
 CloudMonkey runs directly through `asyncio.create_subprocess_exec`, never a host shell. Temporary credential configuration is mode 600 in tmpfs and removed after execution. Command and parameter policy is checked before dispatch, including blocking CloudMonkey's local file expansion. Async job IDs are polled under the same identity. Responses are bounded and redacted. The audit log records actor, operation, target, time and outcome without plaintext parameters or credentials.
 
+## Optional MCP tools
+
+Human administrators authorized for the main agent domain register HTTPS Streamable HTTP endpoints with encrypted bearer credentials. Per-agent exact tool-name assignments are intersected with each ancestor's assignments using live CloudStack parent links. Descendant administrators can narrow these grants without editing endpoint credentials. New agents have no external tools until explicitly assigned.
+
+Pydantic AI's existing MCP support supplies the transport and tool schemas; the application filters exposed tools and rechecks authorization and configuration at dispatch. Server instructions, sampling and elicitation remain disabled. Results are bounded, redacted and returned as untrusted tool data. Generic MCP calls share the existing durable mutation path so completed calls are reused and uncertain side effects are not replayed automatically. The GUI's per-agent System prompt edits the existing agent instructions used on subsequent model calls.
+
 ## Durable operations
 
 Subgroup provisioning persists intent before making CloudStack changes. Stable operation IDs appear in generated domain/account/key names. Each successful stage persists its IDs; retries find existing resources under the same parent. Credentials are validated before the new agent becomes visible. Lost key-registration responses are handled by finding and revoking that operation's keys before replacement.

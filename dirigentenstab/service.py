@@ -39,6 +39,11 @@ class Service:
                 self._remember(store.open(row[field]))
         for row in store.all('SELECT api_key FROM providers'):
             self._remember(store.open(row['api_key']))
+        for row in store.all('SELECT token FROM mcp_servers'):
+            token = store.open(row['token'])
+            self._remember(token)
+            if token:
+                self._remember('Bearer ' + token)
 
     def _remember(self, value):
         if isinstance(value, str):

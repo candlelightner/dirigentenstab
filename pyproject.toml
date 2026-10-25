@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirigentenstab"
-version = "0.1.5"
+version = "0.1.6"
 description = "Small CloudStack-backed hierarchical AI agent manager"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
   "nicegui>=3,<4",
   "pydantic-ai-slim[openai]>=1,<2",
+  "mcp>=1,<2",
   "cryptography>=46,<49",
   "asyncssh>=2.21,<3",
   "httpx>=0.28,<1",

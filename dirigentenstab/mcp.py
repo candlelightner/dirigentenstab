@@ -1,0 +1,135 @@
+"""Human-managed remote tools; CloudStack remains the administrative scope boundary."""
+
+import json
+import re
+import uuid
+from urllib.parse import urlsplit
+
+from .limits import APP_ROOT_AGENT
+from .settings import endpoint
+
+
+# shortcut: portable names leave room for a server prefix; add mapping if a server needs wider MCP names.
+TOOL_NAME = re.compile(r'^[A-Za-z0-9_-]{1,48}$')
+
+
+class MCP:
+    def __init__(self, service):
+        self.service = service
+        self.store = service.store
+
+    async def _can_manage_servers(self, identity):
+        try:
+            await self.service.authorize(identity, APP_ROOT_AGENT)
+            return True
+        except PermissionError:
+            return False
+
+    async def _chain(self, agent):
+        root = await self.service.agent(APP_ROOT_AGENT)
+        if agent['id'] == root['id']:
+            return [root]
+        cloud = await self.service.cloud_client(root)
+        chain, seen, previous_level = [], set(), None
+        domain_id = agent['domain_id']
+        while domain_id and len(seen) < 64:
+            if domain_id in seen:
+                break
+            seen.add(domain_id)
+            result = await cloud.raw('listDomains', {'id': domain_id, 'listall': True})
+            domain = next((d for d in result.get('domain', []) if d.get('id') == domain_id), None)
+            if not domain or type(domain.get('level')) is not int or domain['level'] < 0:
+                break
+            if previous_level is not None and domain['level'] != previous_level - 1:
+                break
+            member = self.store.one('SELECT * FROM agents WHERE domain_id=? AND enabled=1', (domain_id,))
+            if not member:
+                break
+            chain.append(member)
+            if member['id'] == root['id']:
+                return list(reversed(chain))
+            previous_level = domain['level']
+            domain_id = domain.get('parentdomainid')
+        raise PermissionError('Cannot verify every ancestor MCP assignment')
+
+    def _tools(self, agent_id, server_id):
+        row = self.store.one('SELECT tools FROM mcp_assignments WHERE agent_id=? AND server_id=?',
+                             (agent_id, server_id))
+        return set(json.loads(row['tools'])) if row else set()
+
+    def _effective(self, chain, server_id):
+        tools = self._tools(chain[0]['id'], server_id)
+        for agent in chain[1:]:
+            tools &= self._tools(agent['id'], server_id)
+        return tools
+
+    async def configuration(self, identity, agent_id):
+        agent = await self.service.authorize(identity, agent_id)
+        can_manage = await self._can_manage_servers(identity)
+        servers = self.store.all('SELECT id,name,url,enabled,version FROM mcp_servers ORDER BY name,id')
+        chain = await self._chain(agent) if servers else []
+        return {'can_manage_servers': can_manage, 'servers': [
+            {**server, 'tools': sorted(self._tools(agent_id, server['id'])),
+             'allowed_tools': sorted(self._effective(chain[:-1], server['id'])) if len(chain) > 1 else None}
+            for server in servers]}
+
+    async def save_server(self, identity, name, url, token=None, server_id=None, enabled=True):
+        await self.service.authorize(identity, APP_ROOT_AGENT)
+        if not isinstance(name, str) or not name.strip() or len(name) > 100 or not name.isprintable():
+            raise ValueError('Use a printable MCP server name of 1–100 characters')
+        if not isinstance(url, str) or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+            raise ValueError('Use an HTTPS MCP endpoint without whitespace')
+        endpoint(url)
+        parsed = urlsplit(url)
+        if parsed.scheme != 'https' or parsed.port == 0:
+            raise ValueError('MCP endpoints must use HTTPS')
+        if type(enabled) is not bool:
+            raise ValueError('Invalid MCP server enabled flag')
+        if token is not None and (not isinstance(token, str) or token and not 8 <= len(token) <= 4096
+                                  or any(c.isspace() or ord(c) < 33 or ord(c) > 126 for c in token)):
+            raise ValueError('Use a bearer credential without whitespace or control characters')
+        existing = self.store.one('SELECT token FROM mcp_servers WHERE id=?', (server_id,)) if server_id else None
+        if server_id and not existing:
+            raise ValueError('MCP server is unavailable')
+        encrypted = existing['token'] if existing and token is None else self.store.seal(token or '')
+        secret = self.store.open(encrypted)
+        self.service._remember(secret)
+        if secret:
+            self.service._remember('Bearer ' + secret)
+        server_id = server_id or str(uuid.uuid4())
+        self.store.execute('INSERT INTO mcp_servers(id,name,url,token,enabled) VALUES(?,?,?,?,?) '
+                           'ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,'
+                           'token=excluded.token,enabled=excluded.enabled,version=mcp_servers.version+1',
+                           (server_id, name.strip(), url, encrypted, enabled))
+        self.store.audit(identity['userid'], 'configure-mcp-server', server_id)
+        return server_id
+
+    async def assign(self, identity, agent_id, server_id, tools):
+        agent = await self.service.authorize(identity, agent_id)
+        if (not isinstance(tools, list) or len(tools) > 100
+                or any(not isinstance(name, str) or not TOOL_NAME.fullmatch(name) for name in tools)):
+            raise ValueError('Assign at most 100 exact MCP tool names')
+        if not self.store.one('SELECT id FROM mcp_servers WHERE id=?', (server_id,)):
+            raise ValueError('MCP server is unavailable')
+        chain = await self._chain(agent)
+        if len(chain) > 1 and not set(tools) <= self._effective(chain[:-1], server_id):
+            raise PermissionError('MCP assignments cannot widen ancestor access')
+        self.store.execute('INSERT INTO mcp_assignments VALUES(?,?,?) '
+                           'ON CONFLICT(agent_id,server_id) DO UPDATE SET tools=excluded.tools',
+                           (agent_id, server_id, json.dumps(sorted(set(tools)))))
+        self.store.audit(identity['userid'], 'assign-mcp-tools', agent_id + '/' + server_id)
+
+    async def bindings(self, identity, agent_id):
+        agent = await self.service.authorize(identity, agent_id)
+        servers = self.store.all('SELECT * FROM mcp_servers WHERE enabled=1 ORDER BY id')
+        if not servers:
+            return []
+        chain = await self._chain(agent)
+        return [{**server, 'tools': sorted(tools)} for server in servers
+                if (tools := self._effective(chain, server['id']))]
+
+    async def check(self, identity, agent_id, server_id, tool, version):
+        server = next((row for row in await self.bindings(identity, agent_id) if row['id'] == server_id), None)
+        if not server or tool not in server['tools'] or server['version'] != version:
+            raise PermissionError('MCP tool assignment or server configuration changed')
+        return server

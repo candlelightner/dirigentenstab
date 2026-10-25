@@ -526,6 +526,78 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 agent_choice.enable()
                 continue_button.enable()
 
+        async def mcp_dialog(agent_id):
+            from .mcp import MCP
+
+            integration = MCP(service)
+            configuration = await integration.configuration(await actor(), agent_id)
+            servers = {server['id']: server for server in configuration['servers']}
+            manage = configuration['can_manage_servers']
+            with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-3'):
+                ui.label('MCP tools').classes('text-xl font-semibold')
+                ui.label('Only explicitly assigned tools are available. Every ancestor limits descendant access. '
+                         'External results are untrusted.').classes('text-sm')
+                options = ({'': 'New server'} if manage else {}) | {key: row['name'] for key, row in servers.items()}
+                selected = ui.select(options, label='MCP server', value=next(iter(servers), '' if manage else None)).classes('w-full')
+                if manage:
+                    name = ui.input('Server name').props('maxlength=100').classes('w-full')
+                    url = ui.input('HTTPS Streamable HTTP endpoint').classes('w-full')
+                    token = ui.input('API key / bearer token (blank keeps existing)', password=True).classes('w-full')
+                    ui.label('Tavily: use https://mcp.tavily.com/mcp and paste your Tavily API key.').classes('text-sm')
+                    clear_token = ui.checkbox('Clear saved bearer token')
+                    enabled = ui.checkbox('Server enabled', value=True)
+                else:
+                    ui.label('Server endpoints are managed by administrators of the main agent domain.').classes('text-sm')
+                assigned = ui.textarea('Assigned tool names (one per line or comma-separated)').classes('w-full')
+                inherited = ui.label('').classes('text-sm whitespace-pre-wrap')
+                feedback = ui.label('').props('role=status').classes('text-sm')
+
+                def load():
+                    row = servers.get(selected.value, {})
+                    if manage:
+                        name.set_value(row.get('name', ''))
+                        url.set_value(row.get('url', ''))
+                        token.set_value('')
+                        clear_token.set_value(False)
+                        enabled.set_value(bool(row.get('enabled', True)))
+                    assigned.set_value('\n'.join(row.get('tools', [])))
+                    allowed = row.get('allowed_tools')
+                    inherited.set_text('Ancestor allows: ' + (', '.join(allowed) or 'no tools')
+                                       if allowed is not None else 'Enter exact tool names from the server; wildcards are not allowed.')
+
+                async def selection_changed():
+                    await actor()
+                    load()
+
+                async def save_server():
+                    server_id = await integration.save_server(
+                        await actor(), name.value.strip(), url.value.strip(),
+                        '' if clear_token.value else token.value or None,
+                        server_id=selected.value or None, enabled=enabled.value)
+                    token.set_value('')
+                    updated = await integration.configuration(await actor(), agent_id)
+                    servers.clear()
+                    servers.update({server['id']: server for server in updated['servers']})
+                    selected.set_options({'': 'New server', **{key: row['name'] for key, row in servers.items()}}, value=server_id)
+                    load()
+                    feedback.set_text('Server saved. Assign exact tool names to enable access for this agent.')
+
+                async def save_assignment():
+                    names = (assigned.value or '').replace(',', '\n').splitlines()
+                    await integration.assign(await actor(), agent_id, selected.value,
+                                             [name.strip() for name in names if name.strip()])
+                    servers[selected.value]['tools'] = [name.strip() for name in names if name.strip()]
+                    feedback.set_text('Assigned tools saved for this agent.')
+
+                selected.on_value_change(lambda: protect(selection_changed))
+                if manage:
+                    ui.button('Save server settings', on_click=lambda: protect(save_server)).props('outline')
+                ui.button('Save assigned tools', on_click=lambda: protect(save_assignment)).bind_enabled_from(
+                    selected, 'value', backward=bool)
+                ui.button('Close MCP tools', on_click=dialog.close).props('flat')
+                load()
+            dialog.open()
+
         async def configure_agent():
             current = await actor()
             agent = await service.authorize(current, state['agent'])
@@ -563,14 +635,17 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 provider.on_value_change(lambda: protect(load_models))
                 ui.timer(0.01, load_models, once=True)
-                instructions = ui.textarea('System instructions', value=agent.get('instructions', '')).classes('w-full')
+                instructions = ui.textarea('System prompt', value=agent.get('instructions', '')).props('maxlength=32000').classes('w-full')
+                ui.label('Custom instructions for this agent, applied on its next model call.').classes('text-sm text-stone-600')
+                ui.button('MCP tools', icon='extension',
+                          on_click=lambda: protect(lambda: mcp_dialog(agent['id']))).props('outline')
                 can_provision = ui.checkbox('Allow subordinate agent creation', value=bool(agent.get('can_provision'))) \
                     if current.get('type') == 1 else None
 
                 async def save():
                     options = {'can_provision': can_provision.value} if can_provision is not None else {}
                     await service.update_agent(await actor(), agent['id'], provider.value,
-                                               (model.value or '').strip(), instructions.value, **options)
+                                               (model.value or '').strip(), instructions.value or '', **options)
                     dialog.close()
                     await refresh()
                     await show_agent(agent['id'])
@@ -609,7 +684,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ui.label('Create subgroup under ' + parent['name']).classes('text-xl font-semibold')
                 name = ui.input('Name').props('maxlength=64').classes('w-full')
                 model = ui.input('Model ID (blank inherits parent)').classes('w-full')
-                instructions = ui.textarea('System instructions (blank inherits parent)').classes('w-full')
+                instructions = ui.textarea('System prompt (blank inherits parent)').classes('w-full')
                 result_label = ui.label('').classes('text-sm')
 
                 async def create():

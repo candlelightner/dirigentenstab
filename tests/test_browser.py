@@ -347,3 +347,65 @@ async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await page.screenshot(path=str(state / 'gpu-policy-mobile.png'), full_page=True)
         await browser.close()
+
+
+async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app):
+    from dirigentenstab.limits import APP_ROOT_AGENT
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    secret = 'tvly-browser-fixture-mcp-credential'
+    prompt = 'Answer infrastructure questions in German and ask before deleting resources.'
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        page = await context.new_page()
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        await login(page, url)
+        selector = page.get_by_label('Chat directly with an agent', exact=True)
+        await selector.fill('Main Agent')
+        await page.get_by_role('option', name='Main Agent', exact=True).click()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_label('System prompt', exact=True).fill(prompt)
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        assert await page.get_by_label('System prompt', exact=True).input_value() == prompt
+        await page.get_by_role('button', name='MCP tools', exact=True).click()
+        await page.get_by_label('Server name', exact=True).fill('Tavily web search')
+        await page.get_by_label('HTTPS Streamable HTTP endpoint', exact=True).fill('https://mcp.tavily.com/mcp')
+        bearer = page.get_by_label('API key / bearer token (blank keeps existing)', exact=True)
+        assert await bearer.get_attribute('type') == 'password'
+        await bearer.fill(secret)
+        await page.get_by_role('button', name='Save server settings', exact=True).click()
+        await page.get_by_text('Server saved.', exact=False).wait_for()
+        assert await bearer.input_value() == ''
+        assigned = page.get_by_label('Assigned tool names (one per line or comma-separated)', exact=True)
+        await assigned.fill('tavily_search')
+        await page.get_by_role('button', name='Save assigned tools', exact=True).click()
+        await page.get_by_text('Assigned tools saved for this agent.', exact=True).wait_for()
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        server = store.one('SELECT * FROM mcp_servers')
+        assert server['url'] == 'https://mcp.tavily.com/mcp'
+        assert store.open(server['token']) == secret and secret.encode() not in server['token']
+        assert store.one('SELECT instructions FROM agents WHERE id=?', (APP_ROOT_AGENT,))['instructions'] == prompt
+        assert secret not in await page.content()
+
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await selector.fill('Main Agent')
+        await page.get_by_role('option', name='Main Agent', exact=True).click()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        assert await page.get_by_label('System prompt', exact=True).input_value() == prompt
+        await page.get_by_role('button', name='MCP tools', exact=True).click()
+        assert await assigned.input_value() == 'tavily_search'
+        assert await bearer.input_value() == ''
+        await page.get_by_role('checkbox', name='Clear saved bearer token', exact=True).click()
+        await page.get_by_role('checkbox', name='Clear saved bearer token', exact=True, checked=True).wait_for()
+        await page.get_by_role('button', name='Save server settings', exact=True).click()
+        await page.get_by_text('Server saved.', exact=False).wait_for()
+        assert store.open(store.one('SELECT token FROM mcp_servers')['token']) == ''
+        await page.screenshot(path=str(state / 'mcp-settings.png'), full_page=True)
+        assert not errors
+        await browser.close()

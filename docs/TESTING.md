@@ -12,7 +12,7 @@ python -m pytest -q -m 'not browser and not live'
 ruff check .
 ```
 
-The Python tests cover credential encryption, API validation, permissions, provisioning recovery, SSH host-key checks, bounded transfers, conversations, delegation and UI callbacks. Tests use local fakes where external infrastructure is unnecessary. These checks do not establish that a CloudStack zone can boot a VM.
+The Python tests cover credential encryption, API validation, permissions, provisioning recovery, SSH host-key checks, bounded transfers, conversations, delegation and UI callbacks. MCP checks cover explicit inherited tool assignments, administration scope, revocation, credential protection and endpoint validation, with real SDK protocol exchanges through a local HTTP mock transport; GUI checks save per-agent system prompts. Tests use local fakes where external infrastructure is unnecessary. These checks do not establish that a CloudStack zone can boot a VM.
 
 Migration tests cover source-path and symlink boundaries, credential quarantine, archive checksums, resumable history import and isolation of imported transcripts from new model requests. Real migration additionally verifies every restored workspace file and stream-decrypts the original history archives to compare byte counts and hashes; private migration artifacts are never CI fixtures.
 
