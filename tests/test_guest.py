@@ -63,6 +63,17 @@ async def test_managed_config_unique_nonroot_credentials_and_hostkey_pin(guest):
         await guest._target('agent', 'vm')
 
 
+async def test_backend_workspace_setup_only_initializes_the_new_guest_data_disk(guest):
+    text, _ = await guest.prepare_vm_config('agent', workspace_disk=True)
+    config = json.loads(text.split('\n', 1)[1])
+    assert config['disk_setup'] == {'/dev/vdb': {'table_type': 'gpt', 'layout': True, 'overwrite': False}}
+    assert config['fs_setup'][0]['device'] == '/dev/vdb1'
+    assert not config['fs_setup'][0]['overwrite']
+    assert config['mounts'] == [['LABEL=workspace', '/home/dirigent/workspace', 'ext4', 'defaults,nofail', '0', '2']]
+    assert config['runcmd'] == [['chown', 'dirigent:dirigent', '/home/dirigent/workspace']]
+    assert 'sudo' not in config['users'][0]
+
+
 async def test_missing_hostkey_fails_closed_and_paths_never_escape_workspace(guest, tmp_path):
     await guest.prepare_vm_access('agent', 'vm')
     with pytest.raises(ValueError, match='trusted host key'):

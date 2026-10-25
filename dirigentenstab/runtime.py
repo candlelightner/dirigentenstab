@@ -113,7 +113,7 @@ class Runtime:
         if not conversation:
             raise PermissionError('Conversation is not accessible')
         await self.service.authorize(identity, conversation['agent_id'])
-        return {name: conversation[name] for name in ('id', 'agent_id', 'title')} | {
+        return {name: conversation[name] for name in ('id', 'agent_id', 'title', 'imported')} | {
             'messages': self.service.redact(self.service.store.open(conversation['messages'])),
         }
 
@@ -207,14 +207,17 @@ class Runtime:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32768:
             raise ValueError('Message must contain 1–32768 characters')
         await self.service.authorize(identity, agent_id)
+        history_json = []
         if conversation_id:
             conversation = await self.restore(identity, conversation_id)
             if conversation['agent_id'] != agent_id:
                 raise PermissionError('Conversation belongs to a different agent')
-            history_json = conversation['messages']
-        else:
+            if conversation['imported']:
+                conversation_id = None
+            else:
+                history_json = conversation['messages']
+        if not conversation_id:
             conversation_id = str(uuid.uuid4())
-            history_json = []
             self.service.store.execute(
                 'INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                 (conversation_id, agent_id, identity['userid'], self.service.redact(prompt[:80]),

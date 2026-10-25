@@ -172,7 +172,7 @@ class Service:
                              status='failed')
             raise
 
-    async def _deploy_managed(self, agent, cloud, params):
+    async def _deploy_managed(self, agent, cloud, params, *, workspace_disk=False):
         from .guest import Guest
 
         pending = self.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched')",
@@ -183,6 +183,9 @@ class Service:
         if not metadata:
             raise PermissionError('VM deployment unavailable to this identity')
         validate(metadata, params)
+        await check_vm_policy(self, agent, params, command='deployVirtualMachine')
+        if workspace_disk and not params.get('diskofferingid'):
+            raise ValueError('Workspace initialization requires a newly provisioned CloudStack data disk')
         if 'userdata' in params or 'userdataid' in params:
             raise ValueError('Managed templates receive trusted SSH cloud-init; custom userdata is unavailable in v0.1')
         if params.get('securitygroupnames'):
@@ -190,7 +193,7 @@ class Service:
         group_id = await self._ssh_security_group(cloud)
         op_id = uuid.uuid4().hex
         guest = Guest(self)
-        cloud_init, access = await guest.prepare_vm_config(agent['id'])
+        cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk)
         name = 'ds-vm-' + op_id[:20]
         groups = [group_id, *str(params.get('securitygroupids', '')).split(',')]
         request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode(),
@@ -440,6 +443,9 @@ class Service:
 
     async def bootstrap(self, credentials):
         cloud = self.client(credentials)
+        version = (await cloud.raw('listCapabilities')).get('capability', {}).get('cloudstackversion', '')
+        if not re.fullmatch(r'4\.23\.\d+\.\d+', version):
+            raise RuntimeError('CloudStack 4.23.x is required for restricted key pairs; no identities were created')
         root = next(d for d in (await cloud.raw('listDomains', {'listall': True})).get('domain', [])
                     if d.get('level') == 0)
         op_id = '00000000000000000000000000000001'

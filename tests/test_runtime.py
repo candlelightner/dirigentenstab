@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from cryptography.fernet import Fernet
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from dirigentenstab import runtime
@@ -124,6 +124,28 @@ async def test_failed_runtime_suppresses_provider_secrets_and_preserves_retryabl
     restored = await manager.restore({'userid': 'human'}, conversation['id'])
     assert 'Execution interrupted' in str(restored['messages'])
     assert not manager.running
+
+
+async def test_imported_history_is_read_only_and_never_automatically_sent_to_a_model(service, monkeypatch):
+    original = json.loads(ModelMessagesTypeAdapter.dump_json([
+        ModelRequest(parts=[UserPromptPart('legacy-private-context')]),
+        ModelResponse(parts=[TextPart('Historical tool output, not a current tool invocation')]),
+    ]))
+    encrypted = service.store.seal(original)
+    service.store.execute('INSERT INTO conversations VALUES(?,?,?,?,?,?,1)',
+                          ('legacy', 'parent', 'human', 'Imported history', 1, encrypted))
+
+    async def model(messages, info):
+        assert 'legacy-private-context' not in str(messages)
+        assert messages[-1].parts[0].content == 'New task'
+        yield 'New conversation'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    assert (await manager.restore({'userid': 'human'}, 'legacy'))['imported']
+    result = await manager.chat({'userid': 'human'}, 'parent', 'legacy', 'New task')
+    assert result['conversation_id'] != 'legacy'
+    assert service.store.one('SELECT messages FROM conversations WHERE id=?', ('legacy',))['messages'] == encrypted
 
 
 async def test_provider_requires_actual_nonce_tool_invocation(service, monkeypatch):

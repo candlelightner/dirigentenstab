@@ -255,6 +255,21 @@ def provisioning_service(store, cloud):
     return service
 
 
+@pytest.mark.parametrize('version', ['', '4.22.1.1', '4.24.0.0'])
+async def test_existing_unsupported_cloudstack_is_rejected_before_any_provisioning(store, version):
+    service = Service(store, SimpleNamespace())
+
+    class Cloud:
+        async def raw(self, command):
+            assert command == 'listCapabilities'
+            return {'capability': {'cloudstackversion': version}}
+
+    service.client = lambda credentials: Cloud()
+    with pytest.raises(RuntimeError, match='4.23.x is required'):
+        await service.bootstrap({})
+    assert not store.all('SELECT id FROM provisioning') and not store.all('SELECT id FROM agents')
+
+
 @pytest.mark.parametrize('limit,parent_name,error', [(1, 'Parent', 'hierarchy depth'),
                                                     (10, 'A' * 220, 'domain path')])
 async def test_subgroup_checks_depth_and_actual_generated_path_before_cloud_creation(store, limit, parent_name, error):

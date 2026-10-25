@@ -35,6 +35,8 @@ Configure a provider in the web UI, run **Test tool calling**, and assign its mo
 
 Read [architecture](docs/ARCHITECTURE.md), [security](docs/SECURITY.md), [recovery](docs/RECOVERY.md), and [testing](docs/TESTING.md) before operating a cloud containing valuable data.
 
+Moving from Agentor: the operator-only [workspace migration](docs/MIGRATION.md) and [conversation import](docs/HISTORY_MIGRATION.md) retain the original VMs and volumes for rollback. Imported conversations are read-only references; continuing starts a fresh model conversation.
+
 ## Development
 
 ```sh

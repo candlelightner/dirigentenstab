@@ -55,6 +55,8 @@ Recreate a workload as a CloudStack-managed VM, transfer application data at its
 
 Retire Agentor/Incus only after all workloads are verified and backups/recovery have been exercised. The implementation preserves the existing Agentor container, its running administrative VM, Cloudflare Tunnel, Tailscale and host SSH; deployment of the new application alone is not evidence that migration has finished.
 
+The approved workspace-and-history import follows [MIGRATION.md](MIGRATION.md) and [HISTORY_MIGRATION.md](HISTORY_MIGRATION.md). It retains legacy operating-system disks for rollback. Include the migration manifest, dedicated external CloudStack primary pool, encrypted original archives and per-file verification reports in the backup inventory. The application's SQLite database alone does not contain guest workspace disks. Restore the native CloudStack databases and every corresponding primary-storage filesystem together; never format or replace the external filesystem while recovering a management service.
+
 ### Verified legacy inventory
 
 `sudo python3 scripts/migration_inventory.py` collects metadata only and writes a root-private inventory under native setup state. It reads container mounts, Incus device/volume metadata, disk file sizes, and SQLite schema/row counts. It does not read conversation rows, credential contents, guest files or shared-directory contents, and does not stop, snapshot, export, mount or modify a legacy VM.

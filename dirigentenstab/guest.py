@@ -202,7 +202,7 @@ class Guest:
             'ssh_pwauth': False, 'disable_root': True,
         })
 
-    async def prepare_vm_config(self, agent_id: str):
+    async def prepare_vm_config(self, agent_id: str, *, workspace_disk=False):
         """Backend-only: user-data contains the generated guest host private key, never expose it."""
         await self.service.agent(agent_id)
         client_key = asyncssh.generate_private_key('ssh-ed25519')
@@ -211,13 +211,21 @@ class Guest:
             'username': 'dirigent', 'private_key': self.service.store.seal(client_key.export_private_key().decode()),
             'host_key': host_key.export_public_key().decode().strip(), 'port': 22,
         }
-        cloud_init = '#cloud-config\n' + json.dumps({
+        config = {
             'users': [{'name': record['username'], 'shell': '/bin/bash', 'lock_passwd': True,
                        'ssh_authorized_keys': [client_key.export_public_key().decode().strip()]}],
             'ssh_pwauth': False, 'disable_root': True,
             'ssh_keys': {'ed25519_private': host_key.export_private_key('openssh').decode(),
                          'ed25519_public': record['host_key']},
-        })
+        }
+        if workspace_disk:
+            config.update({
+                'disk_setup': {'/dev/vdb': {'table_type': 'gpt', 'layout': True, 'overwrite': False}},
+                'fs_setup': [{'device': '/dev/vdb1', 'filesystem': 'ext4', 'label': 'workspace', 'overwrite': False}],
+                'mounts': [['LABEL=workspace', '/home/dirigent/workspace', 'ext4', 'defaults,nofail', '0', '2']],
+                'runcmd': [['chown', 'dirigent:dirigent', '/home/dirigent/workspace']],
+            })
+        cloud_init = '#cloud-config\n' + json.dumps(config)
         return cloud_init, record
 
     def persist_vm_access(self, agent_id: str, vm_id: str, record):

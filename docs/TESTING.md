@@ -14,6 +14,8 @@ ruff check .
 
 The Python tests cover credential encryption, API validation, permissions, provisioning recovery, SSH host-key checks, bounded transfers, conversations, delegation and UI callbacks. Tests use local fakes where external infrastructure is unnecessary. These checks do not establish that a CloudStack zone can boot a VM.
 
+Migration tests cover source-path and symlink boundaries, credential quarantine, archive checksums, resumable history import and isolation of imported transcripts from new model requests. Real migration additionally verifies every restored workspace file and stream-decrypts the original history archives to compare byte counts and hashes; private migration artifacts are never CI fixtures.
+
 ## Real browser checks
 
 ```sh
@@ -47,5 +49,9 @@ The acceptance script creates two durably tracked private VMs under the Research
 ### Live portal smoke test, 2026-10-25
 
 Chromium also tested the actual portal at its private local HTTPS endpoint on the Ubuntu 24.04 host, with native CloudStack 4.23.0.0 and the separately configured local Qwen inference provider. The live check passed CloudStack-backed login, Secure/HttpOnly/SameSite cookies, the real domain tree, direct agent selection, model configuration display and authenticated WebSocket handshakes.
+
+The same live check passed through Tailscale Serve with normal browser certificate validation. Existing Serve routes were preserved; the added route is tailnet-only. No CloudStack API or guest SSH port was published.
+
+A separate live Chromium check restored a nonempty imported legacy transcript, verified its read-only notice, sent a benign new prompt, and confirmed a new conversation with empty prior model history. The imported ciphertext remained unchanged, logout succeeded, and the browser reported no page errors. The check recorded counts and assertions without screenshots or private transcript text.
 
 A new read-only conversation called `search_api` against the live catalogue and displayed streamed text plus tool activity. Reloading the portal restored that conversation, including its tool history. A database check confirmed the persisted messages were encrypted. The browser content and WebSocket frames were checked against the installation, agent and provider credentials without recording those credentials. Logout revoked the browser session. The browser reported no page errors. This portal check did not mutate infrastructure and is separate from the real VM/SSH acceptance described above.

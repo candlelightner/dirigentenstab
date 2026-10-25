@@ -73,7 +73,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await login(page, url)
         cookie = next(cookie for cookie in await context.cookies() if cookie['name'] == 'ds_session')
         assert cookie['httpOnly'] and cookie['secure'] and cookie['sameSite'] == 'Strict'
-        await page.get_by_label('Chat directly with an agent', exact=True).click()
+        await page.get_by_label('Chat directly with an agent', exact=True).fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
         await page.get_by_text('Administrator account: research-account', exact=True).wait_for()
         await page.get_by_label('Message', exact=True).fill('Inspect the research VM')
@@ -86,7 +86,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         content = await page.content()
         assert all(secret not in content for secret in PRIVATE_VALUES)
         await page.get_by_role('button', name='New conversation', exact=True).click()
-        await page.get_by_label('Conversation', exact=True).click()
+        await page.get_by_label('Conversation', exact=True).fill('Inspect the research VM')
         await page.get_by_role('option', name='Inspect the research VM', exact=True).click()
         await page.get_by_text(output, exact=True).wait_for()
         await page.get_by_role('button', name='Model providers', exact=True).click()

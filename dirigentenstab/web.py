@@ -102,7 +102,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             except Exception:
                 ui.notify('The operation failed. Check the configuration and server audit log.', type='negative')
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False}
         agents = {row['id']: row for row in data.get('agents', [])}
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
             ui.icon('account_tree').classes('text-teal-900 text-2xl')
@@ -123,7 +123,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 tree = ui.tree(hierarchy_nodes(data)).classes('w-full')
                 tree.expand()
                 agent_choice = ui.select({key: row['name'] for key, row in agents.items()},
-                                         label='Chat directly with an agent').classes('w-full').mark('agent_selector')
+                                         label='Chat directly with an agent', with_input=True).classes('w-full').mark('agent_selector')
                 ui.separator()
                 ui.label('Infrastructure').classes('font-semibold')
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes(
@@ -140,7 +140,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         'text-stone-600')
                 with ui.card().classes('w-full gap-3'):
                     with ui.row().classes('w-full items-center'):
-                        history_select = ui.select({}, label='Conversation').classes('flex-1 min-w-48')
+                        history_select = ui.select({}, label='Conversation', with_input=True).classes('flex-1 min-w-48')
                         new_button = ui.button('New conversation', icon='add').props('flat')
                     with ui.scroll_area().classes('w-full h-[52vh] min-h-64'):
                         transcript = ui.column().classes('w-full gap-4 p-2')
@@ -172,8 +172,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             current = await actor()
             agent = await service.authorize(current, agent_id)
-            state.update(agent=agent_id, conversation=None)
+            state.update(agent=agent_id, conversation=None, imported=False)
             transcript.clear()
+            progress.set_text('')
             agent_choice.set_value(agent_id)
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
@@ -236,6 +237,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if restored['agent_id'] != state['agent']:
                 raise PermissionError('Conversation belongs to another agent')
             state['conversation'] = restored['id']
+            state['imported'] = bool(restored.get('imported'))
+            progress.set_text('Imported history is read-only. Sending starts a new conversation without '
+                              'forwarding this history to the model.' if state['imported'] else '')
             transcript.clear()
             for kind, content in history_parts(restored):
                 message(kind, content)
@@ -244,6 +248,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             await actor()
             if not state['busy']:
                 state['conversation'] = None
+                state['imported'] = False
+                progress.set_text('')
                 history_select.set_value(None)
                 transcript.clear()
 
@@ -253,6 +259,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             current = await actor()
             agent_id = state['agent']
             await service.authorize(current, agent_id)
+            if state['imported']:
+                transcript.clear()
             state['busy'] = True
             send_button.disable()
             prompt.disable()
@@ -275,6 +283,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             try:
                 result = await runtime.chat(current, agent_id, state['conversation'], text, event_received)
                 state['conversation'] = result['conversation_id']
+                state['imported'] = False
                 answer.set_text(result['output'])
                 await histories()
             finally:
