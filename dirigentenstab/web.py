@@ -166,7 +166,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
-            .nicegui-content{padding:0;height:calc(100dvh - 65px);min-height:0}
+            .nicegui-content{padding:0;height:calc(var(--viewport-height,100dvh) - 65px);min-height:0}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -179,7 +179,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .markdown pre{padding:12px;background:#f5f5f4;border-radius:6px}
             .q-message-text{background:#f5f5f4!important;color:#292524!important;max-width:100%}
             .q-message-container,.q-message-text-content{min-width:0;max-width:100%}
-            .q-dialog__inner>.q-card{max-height:85dvh;overflow-y:auto}
+            .q-dialog__inner{height:var(--viewport-height,100dvh);bottom:auto}
+            .q-dialog__inner>.q-card{max-height:calc(var(--viewport-height,100dvh)*.85);overflow-y:auto}
             .q-tree__node{padding-left:8px}
             .q-tree__children{padding-left:6px}
             .q-tree__node-header{min-height:44px;overflow-wrap:anywhere}
@@ -187,20 +188,21 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             button,.q-btn{min-height:44px}
             .dashboard-mobile{display:none;min-height:44px}
             @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}
-            @media(max-width:600px) and (max-height:600px){
-                .workspace:has(.composer textarea:focus) .agent-details{display:none}}
+            .workspace.compact .agent-details{display:none}
             @media(max-width:600px){.workspace{padding:6px;gap:6px}.agent-details{padding:10px}
-            .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(100dvh - 61px)}
+            .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
         """)
         # Resize the bounded workspace with the mobile visual viewport (including the virtual keyboard).
         ui.add_body_html("""<script>
             (() => { const fit = () => { const el=document.querySelector('.workspace');
                 const header=document.querySelector('.q-header');
-                if(el) el.style.height=Math.max(100,(window.visualViewport?.height || innerHeight)
-                    -(header?.getBoundingClientRect().height || 65))+'px'; };
+                const height=window.visualViewport?.height || innerHeight;
+                document.documentElement.style.setProperty('--viewport-height',height+'px');
+                if(el) { el.classList.toggle('compact',innerWidth<=600 && height<=600);
+                    el.style.height=Math.max(100,height-(header?.getBoundingClientRect().height || 65))+'px'; } };
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
-                setTimeout(fit,500); })();
+                fit(); setTimeout(fit,500); })();
         </script>""")
         # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
         with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300 '

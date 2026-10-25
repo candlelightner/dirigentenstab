@@ -192,12 +192,41 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await page.screenshot(path=str(state / 'mobile-chat.png'), full_page=True)
         await message.focus()
-        # A reduced visual viewport is how Android exposes the open keyboard to web layouts.
-        await page.set_viewport_size({'width': 390, 'height': 500})
-        await page.wait_for_timeout(500)
+        # Android Chrome can shrink only visualViewport, and can move focus during keyboard animation.
+        await page.evaluate('''() => {
+            Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>480});
+            visualViewport.dispatchEvent(new Event('resize'));
+            document.activeElement.blur();
+        }''')
+        await page.locator('.agent-details').wait_for(state='hidden')
+        assert await page.evaluate('innerHeight') == 844
+        box = await message.bounding_box()
+        assert box and box['y'] + box['height'] <= 480
+        await page.screenshot(path=str(state / 'mobile-visual-keyboard.png'), full_page=True)
+        await page.evaluate("delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'))")
+        await page.locator('.agent-details').wait_for()
+        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.get_by_label('Model ID', exact=True).wait_for()
+        await page.evaluate('''() => {
+            Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>480});
+            visualViewport.dispatchEvent(new Event('resize'));
+        }''')
+        cancel = page.get_by_role('button', name='Cancel', exact=True)
+        await cancel.scroll_into_view_if_needed()
+        dialog = await page.locator('.q-dialog__inner > .q-card').bounding_box()
+        cancel_box = await cancel.bounding_box()
+        await page.screenshot(path=str(state / 'mobile-config-keyboard.png'), full_page=True)
+        assert dialog and dialog['y'] >= 0 and dialog['y'] + dialog['height'] <= 480
+        assert cancel_box and cancel_box['y'] + cancel_box['height'] <= 480
+        await cancel.click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await page.evaluate("delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'))")
+        await message.focus()
+        await page.set_viewport_size({'width': 390, 'height': 480})
+        await page.locator('.agent-details').wait_for(state='hidden')
         box = await message.bounding_box()
         await page.screenshot(path=str(state / 'mobile-keyboard.png'), full_page=True)
-        assert box and box['y'] + box['height'] <= 500, await page.evaluate('''() => ({
+        assert box and box['y'] + box['height'] <= 480, await page.evaluate('''() => ({
             viewport:visualViewport.height, elements:[...document.querySelectorAll('.q-header,.nicegui-content,.workspace,.conversation,.composer')]
             .map(el=>({class:el.className,rect:el.getBoundingClientRect().toJSON(),min:getComputedStyle(el).minHeight}))})''')
         await page.set_viewport_size({'width': 390, 'height': 844})
