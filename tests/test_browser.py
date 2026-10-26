@@ -734,6 +734,8 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
             await page.locator(f'.run-status[data-operation-id="{run(title)["id"]}"]').wait_for()
         async def conversation_options():
             await page.get_by_label('Conversation', exact=True).fill('')
+            await playwright.expect(page.get_by_role('option')).to_have_count(2)
+            await page.get_by_role('option', name='stop fixture first independent conversation', exact=True).wait_for()
             await page.get_by_role('option', name='stop fixture second independent conversation', exact=True).wait_for()
             labels = await page.get_by_role('option').locator('.q-item__label').all_text_contents()
             await page.keyboard.press('Escape')
