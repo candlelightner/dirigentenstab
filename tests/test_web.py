@@ -10,6 +10,14 @@ from dirigentenstab.web import build_ui, hierarchy_nodes, history_parts
 class AgentCapabilities:
     class store:
         @staticmethod
+        def one(*args):
+            return None
+
+        @staticmethod
+        def execute(*args):
+            pass
+
+        @staticmethod
         def all(*args):
             return []
 
@@ -158,7 +166,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
 
     auth, runtime, service = Auth(), Runtime(), Service()
     from types import SimpleNamespace
-    service.store = SimpleNamespace(all=lambda *args: [dict(id=key, agent_id='agent', title=value['title'],
+    service.store = SimpleNamespace(one=lambda *args: None, execute=lambda *args: None, all=lambda *args: [dict(id=key, agent_id='agent', title=value['title'],
         operation_id=key, status=value['runs'][-1]['status'], updated=1 if value['runs'][-1]['status'] == 'running' else 2)
         for key, value in runtime.rows.items()])
     async with user_simulation() as user:
@@ -618,7 +626,9 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         await user.open('/')
         user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
-        await user.should_not_see('Stop conversation')
+        if not restored:
+            user.find('New conversation').click()
+            await user.should_not_see('Stop conversation')
         if restored:
             user.find('Conversation').trigger('update:modelValue', {'value': 0})
         else:
@@ -720,7 +730,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         user.find('Context window override').type('20000')
         await user.should_see('Manual context window override.')
         await user.should_see('20,000 − 5,000 response tokens = 15,000 tokens')
-        user.find('Save').click()
+        user.find(kind=ui.button, content='Save').click()
         await asyncio.sleep(0.05)
         assert {key: agent[key] for key in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window')} == {
             'compaction_provider_id': 'summary', 'compaction_model': 'summary-small', 'auto_compact_percent': 75, 'context_window': 20000}
@@ -736,7 +746,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         user.find('Compact at %').clear()
         user.find('Compaction provider').trigger('update:modelValue', {'value': 0})
         await user.should_not_see('Compaction model')
-        user.find('Save').click()
+        user.find(kind=ui.button, content='Save').click()
         await asyncio.sleep(0.05)
         assert agent['auto_compact_percent'] is None and agent['context_window'] is None
         assert agent['compaction_provider_id'] is None and agent['compaction_model'] == ''
