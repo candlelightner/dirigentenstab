@@ -333,7 +333,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             current = await actor()
             if state['agent']:
                 rows = await runtime.conversations(current, state['agent'])
-                history_select.set_options({row['id']: row['title'] for row in rows}, value=state['conversation'])
+                options = {row['id']: row['title'] for row in rows}
+                # Keep numeric select values stable when only activity ordering changes.
+                if history_select.options != options:
+                    history_select.set_options(options, value=state['conversation'])
 
         async def show_agent(agent_id, *, close_navigation=True):
             state['requested_agent'] = agent_id

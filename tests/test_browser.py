@@ -723,6 +723,12 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
             await page.get_by_label('Conversation', exact=True).fill(title)
             await page.get_by_role('option', name=title, exact=True).click()
             await page.locator(f'.run-status[data-operation-id="{run(title)["id"]}"]').wait_for()
+        async def conversation_options():
+            await page.get_by_label('Conversation', exact=True).fill('')
+            await page.get_by_role('option', name='stop fixture second independent conversation', exact=True).wait_for()
+            labels = await page.get_by_role('option').locator('.q-item__label').all_text_contents()
+            await page.keyboard.press('Escape')
+            return labels
         def run(title):
             return store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
                              'WHERE c.title=? ORDER BY r.created DESC LIMIT 1', (title,))
@@ -738,9 +744,12 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         assert run('stop fixture second independent conversation')['status'] == 'running'
         await choose('stop fixture first independent conversation')
         await playwright.expect(page.get_by_label('Message', exact=True)).to_have_value('Keep this first conversation draft')
+        options_before_stop = await conversation_options()
         await page.get_by_role('button', name='Stop conversation', exact=True).click()
         await page.get_by_text('Stopped', exact=True).wait_for()
         assert run('stop fixture second independent conversation')['status'] == 'running'
+        await page.get_by_text('Blocked / paused', exact=False).wait_for()
+        assert await conversation_options() == options_before_stop
         await choose('stop fixture second independent conversation')
         await send('Inspect resources after interrupting this conversation')
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()

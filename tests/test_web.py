@@ -716,3 +716,54 @@ def test_hub_activity_only_includes_owner_visible_agents_and_latest_run():
     assert conversation_activity(Store(), 'owner', ['visible']) == [
         {'id': 'c', 'agent_id': 'visible', 'title': 'Owned task', 'operation_id': 'new', 'status': 'completed', 'updated': 3}]
     assert conversation_activity(Store(), 'owner', []) == []
+
+
+async def test_polling_preserves_conversation_option_values_when_activity_reorders_rows():
+    identity = {'userid': 'owner', 'username': 'owner', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account'}
+
+    class Auth:
+        async def identity(self, token):
+            return identity
+
+    class Service(AgentCapabilities):
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        rows = [{'id': 'second', 'title': 'Second task'}, {'id': 'first', 'title': 'First task'}]
+        restored = []
+
+        async def conversations(self, current, agent_id):
+            return self.rows
+
+        async def restore(self, current, conversation_id):
+            self.restored.append(conversation_id)
+            return {'id': conversation_id, 'agent_id': 'agent', 'messages': [], 'runs': []}
+
+    runtime = Runtime()
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), runtime)
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Configure')
+        selector = next(iter(user.find(kind=ui.select, content='Conversation').elements))
+        assert list(selector.options) == ['second', 'first']
+        poll = next(element for element in user.client.elements.values()
+                    if isinstance(element, ui.timer) and element.callback.__name__ == 'poll_activity')
+        poll.deactivate()
+        # Stopping the first task moves it ahead in the runtime's activity-sorted query.
+        runtime.rows = list(reversed(runtime.rows))
+        await poll.callback()
+        assert list(selector.options) == ['second', 'first']
+        user.find('Conversation').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Ready')
+        await asyncio.sleep(0)
+        assert runtime.restored == ['second']
