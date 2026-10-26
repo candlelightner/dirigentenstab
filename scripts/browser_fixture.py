@@ -91,6 +91,14 @@ def fake_api(state):
                                       'state': 'enabled', 'accounttype': 1}]}
             elif command == 'listDomains':
                 value = {'domain': [d for d in DOMAINS if not params.get('id') or d['id'] == params['id']]}
+            elif command == 'listApis':
+                value = {'api': [{'name': 'createServiceOffering', 'params': [
+                    {'name': name, 'type': kind} for name, kind in [('name', 'string'),
+                    ('displaytext', 'string'), ('cpunumber', 'integer'), ('cpuspeed', 'integer'),
+                    ('memory', 'integer'), ('domainid', 'uuid')]], 'isasync': False}]}
+            elif command == 'createServiceOffering':
+                (state / 'offering-created.json').write_text(json.dumps(params))
+                value = {'serviceoffering': {'id': 'fixture-offering', 'name': params['name']}}
             elif command == 'logout':
                 value = {'success': True}
             else:
@@ -161,6 +169,15 @@ async def fake_model(messages, info):
                    if part.part_kind == 'user-prompt'), '')
     if 'Summarize the user request' in str(info.instructions):
         yield 'Summarized Chat Title'
+    elif 'offering fixture' in prompt:
+        requested = any(part.part_kind == 'tool-return' and part.tool_name == 'request_compute_offering'
+                        for message in messages for part in message.parts)
+        if requested:
+            yield 'Offering requested.'
+        else:
+            yield {0: DeltaToolCall(name='request_compute_offering', json_args=json.dumps({'params': {
+                'name': 'Browser compute', 'displaytext': 'Browser compute', 'cpunumber': 2,
+                'cpuspeed': 2000, 'memory': 4096}}), tool_call_id='offering-fixture')}
     elif 'heartbeat fixture' in prompt:
         loop = asyncio.get_running_loop()
         deadline, index = loop.time() + 40, 0

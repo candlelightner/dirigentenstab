@@ -261,6 +261,27 @@ class Controller:
         self.service.store.audit(actor['userid'], 'gpu-offering', offering['id'])
         return {'offering_id': offering['id']}
 
+    async def validate_offering(self, request):
+        if request['session'] is not None:
+            raise PermissionError('Offering validation requires the requesting durable agent conversation')
+        actor = await self.execution_actor(request)
+        agent = await self.service.authorize(actor, request['agent_id'])
+        params = request['params']
+        count = gpu_count(params)
+        if type(params.get('gpucount')) is not int or count <= 0 or not params.get('vgpuprofileid'):
+            raise PermissionError('Offering requires a native mediated vGPU profile and positive integer GPU count')
+        cloud = await self.service.cloud_client(agent)
+        profiles = (await cloud.raw('listVgpuProfiles', {'id': params['vgpuprofileid']})).get('vgpuprofile', [])
+        native = next((profile for profile in profiles if profile.get('id') == params['vgpuprofileid']), None)
+        profile = next((profile for profile in self.host.profiles().values()
+                        if native and profile['name'] == native.get('name')), None)
+        if not profile:
+            raise PermissionError('Requested vGPU profile is not a visible native mediated host profile')
+        policy, _ = await self.authorize(agent, profile['id'])
+        if count > profile['maximum'] or 0 <= policy['max_allocations'] < count:
+            raise PermissionError('Requested GPU count exceeds the mediated profile or ancestor allocation limit')
+        return {'profile': profile['id'], 'gpucount': count}
+
     async def authorize(self, agent, profile):
         domains = await self.domains()
         chain = self.chain(domains, agent['domain_id'])
@@ -594,6 +615,7 @@ class Controller:
                    'offering': {'session', 'domain_id', 'profile', 'cpus', 'memory', 'root_disk'},
                    'execute': {'session', 'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
                    'resume': {'session', 'operation_id'}, 'authorize': {'session', 'agent_id', 'command', 'params', 'context'},
+                   'validate_offering': {'session', 'agent_id', 'params', 'run_id'},
                    'result': {'session', 'operation_id', 'run_id'},
                    'recover': {'session', 'operation_id', 'run_id', 'active_run_id'}}
         action = request.get('action')
@@ -602,6 +624,8 @@ class Controller:
         if action == 'status':
             return await self.status(request['session'])
         async with self.lock:
+            if action == 'validate_offering':
+                return await self.validate_offering(request)
             if action in {'result', 'recover'}:
                 return await self.owned_result(request, recover=action == 'recover')
             if action == 'set_policy':

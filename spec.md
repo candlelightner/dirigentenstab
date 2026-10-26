@@ -51,6 +51,29 @@ users. There is no new hub account or registration system.
 - Native permission changes govern subsequent actions; agent autonomy and
   system prompts do not override them.
 
+## Compute offering requests
+
+- Every agent can request a native CloudStack compute offering by default. The
+  owner or an ancestor can disable this tool; disabling any ancestor blocks all
+  descendants immediately while preserving their individual selections.
+- The tool accepts native `createServiceOffering` parameters and durably queues
+  the request for the human owner's review. Requests do not borrow administrator
+  credentials or directly create offerings.
+- Approval creates the requested offering through the owner's current native
+  CloudStack session, scoped to the requesting agent's domain. Native CloudStack
+  authority still applies. Approval does not resize or create a VM.
+- Denial dismisses the request without changing infrastructure or invoking the
+  agent. Its originating chat shows only a centered UI note: “Compute offering
+  request declined”. Approved offerings notify the requesting agent that the
+  offering is available. Durable decisions and notifications survive application
+  restarts. Uncertain creation outcomes are inspected rather than submitted again.
+- Agents with existing mediated GPU permission may request native vGPU-profile
+  offerings. Validate their current inherited GPU policy and native quota both
+  when queuing and approving. No physical GPU passthrough or legacy GPU details
+  bypass is allowed, and requesting an offering does not mutate host devices.
+- A top-right header icon opens requests on mobile and desktop. Pending requests
+  pulse between orange and red; the idle icon is gray.
+
 ## Autonomous execution and conversations
 
 - Work begins from the owner's message. There are no scheduled or recurring

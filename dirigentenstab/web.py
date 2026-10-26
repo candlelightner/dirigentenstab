@@ -91,8 +91,13 @@ def history_parts(history):
     for message in history.get('messages', []):
         for part in message.get('parts', []):
             kind = part.get('part_kind')
-            if kind in {'user-prompt', 'text'}:
+            if kind == 'user-prompt' and str(part.get('content', '')).startswith(
+                    '<system>[System notification: compute offering decision]'):
+                yield 'notice', 'Compute offering approved and now available.'
+            elif kind in {'user-prompt', 'text'}:
                 yield 'human' if kind == 'user-prompt' else 'agent', str(part.get('content', ''))
+            elif kind == 'system-prompt' and part.get('dynamic_ref') == 'compute_offering_decision':
+                yield 'notice', 'Compute offering approved and now available.'
             elif kind in {'tool-call', 'tool-return'}:
                 event_type = 'tool_call' if kind == 'tool-call' else 'tool_result'
                 key = (event_type, part.get('tool_call_id'))
@@ -208,6 +213,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
+            offering_button = ui.button(icon='approval', color=None, on_click=lambda: protect(open_offerings)).props(
+                'flat round aria-label="Compute offering requests: 0 pending"').classes('offering-requests').mark('offering_requests')
+            offering_button.set_visibility(identity.get('type') == 1)
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
@@ -215,6 +223,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .agent-details-toggle{font-size:20px;padding:0 4px}
             .agent-details-toggle .q-btn__content{justify-content:space-between;flex-wrap:nowrap}
             .agent-details-toggle .q-btn__content>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+            .offering-requests{color:#78716c;flex-shrink:0}
+            .offering-requests.pending{animation:offering-pulse 2s ease-in-out infinite alternate}
+            @keyframes offering-pulse{from{color:#ea580c}to{color:#dc2626}}
+            @media(prefers-reduced-motion:reduce){.offering-requests.pending{animation:none;color:#ea580c}}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -370,6 +382,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         def message(kind, content):
             with transcript:
+                if kind == 'notice':
+                    return ui.label(content).classes('w-full text-center text-sm text-stone-500').props('role=status')
                 if kind == 'tool':
                     with ui.expansion('Tool activity', icon='terminal').classes('w-full bg-stone-50 rounded'):
                         ui.label(content[:65536]).classes('whitespace-pre-wrap font-mono text-xs break-all')
@@ -597,6 +611,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             sync_composer()
             sync_run_details()
             parts = list(history_parts(restored))
+            parts.extend(('notice', 'Compute offering request declined') for _ in service.store.all(
+                "SELECT id FROM compute_offering_requests WHERE conversation_id=? AND status='deferred' ORDER BY updated",
+                (restored['id'],)))
             keys = [(kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
                     if kind == 'activity' else (kind, index)
                     for index, (kind, content) in enumerate(parts)]
@@ -628,17 +645,80 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             transcript_scroll.scroll_to(percent=1)
             state['activity_token'] = None
 
+        offering_rows = []
+        deciding_offerings = set()
+        with ui.dialog() as offering_dialog, ui.card().classes('w-full max-w-xl gap-4'):
+            ui.label('Compute offering requests').classes('text-xl font-semibold')
+            offering_content = ui.column().classes('w-full gap-4')
+            ui.button('Close', on_click=offering_dialog.close).props('flat')
+
+        async def decide_offering(request_id, approve):
+            if request_id in deciding_offerings:
+                return
+            deciding_offerings.add(request_id)
+            render_offerings()
+            try:
+                await service.decide_compute_offering(await actor(), request_id, approve)
+                if approve:
+                    await runtime.deliver_offering_decisions()
+            finally:
+                deciding_offerings.discard(request_id)
+                await refresh_offerings(await actor())
+
+        def render_offerings():
+            offering_content.clear()
+            with offering_content:
+                if not offering_rows:
+                    ui.label('No compute offering requests.')
+                for row in offering_rows:
+                    with ui.card().classes('w-full min-w-0'):
+                        ui.label(agents.get(row['agent_id'], {}).get('name', row['agent_id'])).classes('font-semibold break-all')
+                        ui.label('Dismissed' if row['status'] == 'deferred' else row['status'].capitalize()).classes('text-sm')
+                        ui.label(json.dumps(row['params'], indent=2, ensure_ascii=False)).classes(
+                            'w-full whitespace-pre-wrap break-all font-mono text-xs')
+                        if row['status'] == 'pending':
+                            with ui.row():
+                                approve = ui.button('Approve', on_click=lambda _, request_id=row['id']: protect(
+                                    lambda: decide_offering(request_id, True)))
+                                deny = ui.button('Deny', on_click=lambda _, request_id=row['id']: protect(
+                                    lambda: decide_offering(request_id, False))).props('outline')
+                                approve.set_enabled(row['id'] not in deciding_offerings)
+                                deny.set_enabled(row['id'] not in deciding_offerings)
+                        if row.get('result'):
+                            ui.label(json.dumps(row['result'], indent=2, ensure_ascii=False)).classes(
+                                'w-full whitespace-pre-wrap break-all text-xs')
+
+        async def refresh_offerings(current):
+            nonlocal offering_rows
+            if current.get('type') != 1:
+                return
+            rows = await service.list_compute_offering_requests(current)
+            count = sum(row['status'] == 'pending' for row in rows)
+            offering_button.props(f'aria-label="Compute offering requests: {count} pending"')
+            offering_button.classes(add='pending' if count else '', remove='' if count else 'pending')
+            if rows != offering_rows:
+                offering_rows = rows
+                render_offerings()
+
+        async def open_offerings():
+            await refresh_offerings(await actor())
+            render_offerings()
+            offering_dialog.open()
+
         async def poll_activity():
             if client.is_deleted or not state['agent'] or state['submitting']:
                 return
             agent_id, conversation_id = state['agent'], state['conversation']
             try:
                 current = await actor()
+                await refresh_offerings(current)
                 await histories()
                 rows = conversation_activity(service.store, current['userid'], list(agents))
                 selected = next((row for row in rows if row['id'] == conversation_id), None)
                 if selected:
-                    activity_token = (selected['operation_id'], selected['status'], selected['updated'])
+                    declines = tuple((row['id'], row['updated']) for row in offering_rows
+                                     if row['conversation_id'] == conversation_id and row['status'] == 'deferred')
+                    activity_token = (selected['operation_id'], selected['status'], selected['updated'], declines)
                     if activity_token != state['activity_token']:
                         restored = await runtime.restore(current, conversation_id)
                         if state['agent'] == agent_id and state['conversation'] == conversation_id:
@@ -911,6 +991,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if not key_access['allowed']:
                     owner_key_enabled.disable()
                     ui.label('Disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
+                offering_access = await service.compute_offering_access(agent)
+                offering_enabled = ui.checkbox('Request compute offerings', value=offering_access['selected'] and offering_access['allowed'])
+                if not offering_access['allowed']:
+                    offering_enabled.disable()
+                    ui.label('Compute offering requests disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
                 provider_access = await service.provider_configuration(current, agent['id'])
                 enabled_providers = ui.select(options, label='Enabled providers', multiple=True,
                     value=provider_access['selected']).classes('w-full')
@@ -1088,6 +1173,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 async def save():
                     options = {'enabled_providers': enabled_providers.value}
+                    if offering_access['allowed']:
+                        options['compute_offering_requests_enabled'] = offering_enabled.value
                     if key_access['allowed']:
                         options['owner_ssh_key_enabled'] = owner_key_enabled.value
                     if automatic.value and (type(auto_percent.value) not in {int, float}

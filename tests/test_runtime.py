@@ -101,6 +101,21 @@ def service(tmp_path):
                 raise PermissionError('not authorized')
             return await self.agent(agent_id)
 
+        async def compute_offering_access(self, agent):
+            return {'enabled': bool(agent['compute_offering_requests_enabled'])}
+
+        async def request_compute_offering(self, agent_id, params, **context):
+            from dirigentenstab.service import Service
+            return await Service.request_compute_offering(self, agent_id, params, **context)
+
+        async def _validate_offering_gpu(self, agent_id, params, run_id):
+            from dirigentenstab.service import Service
+            return await Service._validate_offering_gpu(self, agent_id, params, run_id)
+
+        def _offering_request(self, row):
+            from dirigentenstab.service import Service
+            return Service._offering_request(self, row)
+
         async def context(self, agent):
             return {'name': agent['name'], 'domain_id': agent['domain_id']}
 
@@ -1262,3 +1277,167 @@ async def test_history_decryption_does_not_block_event_loop(service, monkeypatch
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def offering_request_for_run(service, run, status='approved'):
+    import time
+    import uuid
+    request_id = str(uuid.uuid4())
+    service.store.execute('INSERT INTO compute_offering_requests '
+                          '(id,agent_id,conversation_id,run_id,call_id,human_id,params,result,status,created,updated) '
+                          'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                          (request_id, 'parent', run['conversation_id'], run['operation_id'], 'offering-request',
+                           'human', service.store.seal({'name': 'Requested offering'}),
+                           service.store.seal({'serviceoffering': {'id': 'offering-id'}}), status, time.time(), time.time()))
+    return request_id
+
+
+async def test_compute_offering_tool_queues_then_agent_can_pause_without_holding_execution(service, monkeypatch):
+    async def model(messages, info):
+        tools = {tool.name: tool for tool in info.function_tools}
+        assert 'Finish other work' in tools['request_compute_offering'].description
+        if messages[-1].parts[0].part_kind == 'tool-return':
+            result = messages[-1].parts[0].content
+            assert result['status'] == 'pending' and result['request_id']
+            yield {0: DeltaToolCall(name='pause_work', json_args='{"reason":"Waiting for offering"}', tool_call_id='pause')}
+        else:
+            yield {0: DeltaToolCall(name='request_compute_offering', json_args='{"params":{"name":"Requested offering"}}', tool_call_id='request')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    result = await manager.chat({'userid': 'human'}, 'parent', None, 'Need a compute offering')
+    assert result['status'] == 'interrupted' and not manager.active
+    request = service.store.one('SELECT * FROM compute_offering_requests')
+    assert request['status'] == 'pending' and request['run_id'] == result['operation_id']
+    assert service.store.open(request['params'])['domainid'] == 'parent-domain'
+    assert manager.slots._value == 4
+
+
+@pytest.mark.parametrize('disabled_before_dispatch', [False, True])
+async def test_compute_offering_tool_visibility_and_service_recheck(service, monkeypatch, disabled_before_dispatch):
+    if not disabled_before_dispatch:
+        service.store.execute("UPDATE agents SET compute_offering_requests_enabled=0 WHERE id='parent'")
+    async def model(messages, info):
+        names = {tool.name for tool in info.function_tools}
+        if not disabled_before_dispatch:
+            assert 'request_compute_offering' not in names
+            yield 'Disabled'
+        elif messages[-1].parts[0].part_kind == 'tool-return':
+            assert messages[-1].parts[0].content['category'] == 'authorization'
+            yield 'Access changed'
+        else:
+            assert 'request_compute_offering' in names
+            service.store.execute("UPDATE agents SET compute_offering_requests_enabled=0 WHERE id='parent'")
+            yield {0: DeltaToolCall(name='request_compute_offering', json_args='{"params":{"name":"Requested offering"}}', tool_call_id='request')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Need an offering')
+    assert not service.store.all('SELECT * FROM compute_offering_requests')
+
+
+async def test_approved_offering_delivery_is_atomic_restart_safe_and_preserves_recovery(service, monkeypatch):
+    import asyncio
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    original = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
+    await manager.stop({'userid': 'human'}, original['operation_id'])
+    checkpoint = {'reason': 'agent_paused', 'mutations': {'saved': {'status': 'uncertain', 'tool': 'execute'}}}
+    service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?',
+                          (service.store.seal(checkpoint), original['operation_id']))
+    request_id = await offering_request_for_run(service, original)
+    # A crash after commit but before launch must resume the same accepted run exactly once.
+    monkeypatch.setattr(manager, '_launch', lambda *args: (_ for _ in ()).throw(RuntimeError('Process interrupted')))
+    await manager.deliver_offering_decisions()
+    delivered = service.store.one('SELECT delivery_run_id FROM compute_offering_requests WHERE id=?', (request_id,))['delivery_run_id']
+    assert delivered and len(service.store.all('SELECT * FROM chat_runs')) == 2
+    calls = []
+    async def model(messages, info):
+        notifications = [part for message in messages for part in message.parts
+                         if part.part_kind == 'system-prompt' and part.dynamic_ref == 'compute_offering_decision']
+        assert len(notifications) == 1 and 'offering-id' in notifications[0].content
+        assert 'saved' in info.instructions and 'uncertain' in info.instructions
+        calls.append(messages)
+        yield 'Offering available'
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    await asyncio.gather(*list(restarted.active.values()))
+    await restarted.deliver_offering_decisions()
+    assert len(calls) == 1 and len(service.store.all('SELECT * FROM chat_runs')) == 2
+    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests')['delivery_run_id'] == delivered
+
+
+async def test_offering_denial_and_explicit_stop_never_invoke_agent(service):
+    import asyncio
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    stopped = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
+    await manager.stop({'userid': 'human'}, stopped['operation_id'])
+    request_id = await offering_request_for_run(service, stopped, 'deferred')
+    before = service.store.one('SELECT messages FROM conversations')['messages']
+    await manager.deliver_offering_decisions()
+    assert service.store.one('SELECT messages FROM conversations')['messages'] == before
+    service.store.execute("UPDATE compute_offering_requests SET status='approved' WHERE id=?", (request_id,))
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    assert not restarted.active and len(service.store.all('SELECT * FROM chat_runs')) == 1
+    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests')['delivery_run_id'] is None
+
+
+async def test_offering_approval_waits_for_current_work_and_preserves_other_conversations(service, monkeypatch):
+    import asyncio
+    entered, release, notified = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def model(messages, info):
+        if any(message.metadata and message.metadata.get('system_notification') == 'compute_offering_decision'
+               for message in messages):
+            notified.set()
+            yield 'Offering available'
+        else:
+            entered.set()
+            await release.wait()
+            yield 'Other work finished'
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    first = await manager.submit({'userid': 'human'}, 'parent', None, 'Work first')
+    await asyncio.wait_for(entered.wait(), 2)
+    other = await manager.submit({'userid': 'human'}, 'child', None, 'Unrelated work')
+    await offering_request_for_run(service, first)
+    await manager.deliver_offering_decisions()
+    assert len(service.store.all('SELECT * FROM chat_runs')) == 2
+    assert other['operation_id'] in manager.active and not notified.is_set()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*list(manager.active.values())), 5)
+    await asyncio.wait_for(notified.wait(), 2)
+    await asyncio.gather(*list(manager.active.values()))
+    rows = service.store.all('SELECT * FROM chat_runs')
+    assert len(rows) == 3 and sum(row['agent_id'] == 'child' for row in rows) == 1
+
+
+async def test_offering_delivery_rolls_back_history_and_marker_together(service, monkeypatch):
+    import asyncio
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    original = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
+    await manager.stop({'userid': 'human'}, original['operation_id'])
+    service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?',
+                          (service.store.seal({'reason': 'agent_paused'}), original['operation_id']))
+    request_id = await offering_request_for_run(service, original)
+    before = service.store.one('SELECT messages FROM conversations')['messages']
+    def fail_insert(*args):
+        raise RuntimeError('Database write interrupted')
+    monkeypatch.setattr(manager, '_new_run', fail_insert)
+    await manager.deliver_offering_decisions()
+    assert service.store.one('SELECT messages FROM conversations')['messages'] == before
+    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests WHERE id=?', (request_id,))['delivery_run_id'] is None
+    assert len(service.store.all('SELECT * FROM chat_runs')) == 1
+
+
+async def test_offering_restart_marks_inflight_creation_uncertain_without_replay(service):
+    import asyncio
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    original = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
+    await manager.stop({'userid': 'human'}, original['operation_id'])
+    await offering_request_for_run(service, original, 'applying')
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    assert not restarted.active
+    assert service.store.one('SELECT status FROM compute_offering_requests')['status'] == 'uncertain'

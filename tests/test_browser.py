@@ -973,3 +973,62 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         assert await page.evaluate('window.socket.connected && socketFailures.length === 0 && retainedMessage.isConnected')
         assert await page.get_by_text('Previous answer 149', exact=True).count() == 1
         await browser.close()
+
+
+async def test_compute_offering_requests_mobile_approve_deny_and_inheritance(browser_app):
+    from dirigentenstab.limits import APP_ROOT_AGENT
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        page = await context.new_page()
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        requests = page.get_by_role('button', name='Compute offering requests: 0 pending', exact=True)
+        await requests.wait_for()
+        assert await requests.evaluate("el => getComputedStyle(el).animationName") == 'none'
+        assert await requests.evaluate("el => getComputedStyle(el).color") == 'rgb(120, 113, 108)'
+        await page.get_by_label('Message', exact=True).fill('offering fixture')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        pending = page.get_by_role('button', name='Compute offering requests: 1 pending', exact=True)
+        await pending.wait_for()
+        assert await pending.evaluate("el => getComputedStyle(el).animationName") == 'offering-pulse'
+        await page.emulate_media(reduced_motion='reduce')
+        assert await pending.evaluate("el => getComputedStyle(el).animationName") == 'none'
+        await pending.click()
+        await page.get_by_role('dialog').get_by_text('Browser compute', exact=False).wait_for()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.screenshot(path=str(state / 'compute-offering-pending-mobile.png'), full_page=True, animations='disabled')
+        await page.get_by_role('button', name='Approve', exact=True).click()
+        await page.get_by_text('Approved', exact=True).wait_for()
+        created = json.loads((state / 'offering-created.json').read_text())
+        assert created['domainid'] == '00000000-0000-0000-0000-000000000002'
+        await page.get_by_role('button', name='Close', exact=True).click()
+        await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await select_agent(page, 'Research Admin')
+        await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
+        await page.get_by_role('button', name='New conversation', exact=True).click()
+        await page.get_by_label('Message', exact=True).fill('offering fixture')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await pending.wait_for()
+        await pending.click()
+        await page.get_by_role('button', name='Deny', exact=True).click()
+        await page.get_by_text('Dismissed', exact=True).wait_for()
+        await page.get_by_role('button', name='Close', exact=True).click()
+        await page.get_by_text('Compute offering request declined', exact=True).wait_for()
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        declined = store.one("SELECT * FROM compute_offering_requests WHERE status='deferred'")
+        assert not declined['delivery_run_id']
+        store.execute('UPDATE agents SET compute_offering_requests_enabled=0 WHERE id=?', (APP_ROOT_AGENT,))
+        await open_configuration(page)
+        toggle = page.get_by_role('checkbox', name='Request compute offerings', exact=True)
+        await playwright.expect(toggle).to_be_disabled()
+        await playwright.expect(toggle).not_to_be_checked()
+        assert store.one("SELECT compute_offering_requests_enabled FROM agents WHERE id='research'")['compute_offering_requests_enabled'] == 1
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.screenshot(path=str(state / 'compute-offering-mobile.png'), full_page=True, animations='disabled')
+        await browser.close()

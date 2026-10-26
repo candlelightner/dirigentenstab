@@ -27,6 +27,12 @@ class AgentCapabilities:
     async def subgroup_capability(self, agent_id):
         return True
 
+    async def list_compute_offering_requests(self, identity):
+        return []
+
+    async def compute_offering_access(self, agent):
+        return {'selected': True, 'allowed': True, 'enabled': True}
+
     async def owner_ssh_key_access(self, agent):
         return {'selected': bool(agent.get('owner_ssh_key_enabled', True)),
                 'allowed': True}
@@ -896,3 +902,27 @@ async def test_polling_updates_text_and_tool_status_without_replacing_history(mo
         assert 'listVirtualMachines' in str(card._props['call_content'])
         await poll.callback()
         assert not text.is_deleted and not card.is_deleted
+
+
+def test_history_displays_only_labeled_offering_system_notifications():
+    history = {'messages': [{'parts': [
+        {'part_kind': 'system-prompt', 'content': 'private instructions'},
+        {'part_kind': 'system-prompt', 'dynamic_ref': 'compute_offering_decision', 'content': 'Offering approved'},
+    ]}]}
+    assert list(history_parts(history)) == [('notice', 'Compute offering approved and now available.')]
+
+
+def test_history_hides_provider_converted_offering_notification_instructions():
+    history = {'messages': [{'metadata': {'system_notification': 'compute_offering_decision'}, 'parts': [
+        {'part_kind': 'user-prompt', 'content': '<system>[System notification: compute offering decision] internal approval instructions</system>'},
+    ]}]}
+    assert list(history_parts(history)) == [('notice', 'Compute offering approved and now available.')]
+
+
+def test_history_preserves_real_user_beside_merged_offering_notification():
+    history = {'messages': [{'parts': [
+        {'part_kind': 'user-prompt', 'content': 'Continue with my VM'},
+        {'part_kind': 'user-prompt', 'content': '<system>[System notification: compute offering decision] private data</system>'},
+    ]}]}
+    assert list(history_parts(history)) == [
+        ('human', 'Continue with my VM'), ('notice', 'Compute offering approved and now available.')]

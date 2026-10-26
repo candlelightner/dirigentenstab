@@ -22,7 +22,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 16
+    assert reopened.one('PRAGMA user_version')['user_version'] == 17
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -41,6 +41,8 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
+    store.execute('DROP TABLE compute_offering_requests')
     store.execute('PRAGMA user_version=9')
     runtime = store.seal({'id': 'runtime-key-id', 'apikey': 'runtime'})
     provisioning = store.seal({'id': 'provisioning-key-id', 'apikey': 'provision'})
@@ -82,6 +84,8 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
+    store.execute('DROP TABLE compute_offering_requests')
     store.execute('PRAGMA user_version=11')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
@@ -109,6 +113,8 @@ def test_thinking_migration_preserves_credentials_and_conversations_with_model_d
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
+    store.execute('DROP TABLE compute_offering_requests')
     store.execute('PRAGMA user_version=12')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
