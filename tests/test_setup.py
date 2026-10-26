@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 
 import pytest
 
@@ -163,3 +164,133 @@ def test_gpu_automatic_setup_checks_opt_in_and_detects_local_hardware(tmp_path, 
     monkeypatch.setattr(installer.socket, 'getfqdn', lambda: 'test-host.local')
     installer.automatic()
     assert installed == [('0000:07:00.0', 'local-host')]
+
+
+def test_test_runner_manifest_computation_and_invalidation(tmp_path):
+    repo = Path(__file__).parents[1]
+    spec_tr = importlib.util.spec_from_file_location('test_runner', repo / 'scripts/test_runner.py')
+    test_runner = importlib.util.module_from_spec(spec_tr)
+    spec_tr.loader.exec_module(test_runner)
+
+    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml'):
+        (tmp_path / name).write_text((repo / name).read_text(encoding='utf-8'), encoding='utf-8')
+
+    base = test_runner.compute_manifest(tmp_path)
+    assert base['python_version'] == '3.12'
+    assert base['playwright_version'] == '1.64.1'
+    assert base['image'] == 'ghcr.io/candlelightner/dirigentenstab'
+    assert base['tag'].startswith('test-runner-py3.12-pw1.64.1-')
+
+    manifest_file = tmp_path / 'manifest.json'
+    test_runner.write_manifest(tmp_path, manifest_file)
+
+    # Changing version in pyproject.toml does NOT invalidate manifest
+    pyproj = (tmp_path / 'pyproject.toml').read_text(encoding='utf-8')
+    (tmp_path / 'pyproject.toml').write_text(pyproj.replace('version = "0.1.14"', 'version = "0.1.15"'))
+    bumped = test_runner.compute_manifest(tmp_path)
+    assert bumped['manifest_sha256'] == base['manifest_sha256']
+    assert bumped['tag'] == base['tag']
+
+    # Changing dependencies in pyproject.toml DOES invalidate manifest and fails validate
+    (tmp_path / 'pyproject.toml').write_text(pyproj.replace('"nicegui>=3,<4",', '"nicegui>=3,<4",\n  "demo>=1",'))
+    dep_changed = test_runner.compute_manifest(tmp_path)
+    assert dep_changed['manifest_sha256'] != base['manifest_sha256']
+    assert dep_changed['tag'] != base['tag']
+    with pytest.raises(RuntimeError, match='Manifest validation failed'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=False)
+
+    # Changing optional dependencies (playwright) DOES invalidate manifest
+    (tmp_path / 'pyproject.toml').write_text(pyproj.replace('playwright==1.64.1', 'playwright==1.65.0'))
+    pw_changed = test_runner.compute_manifest(tmp_path)
+    assert pw_changed['manifest_sha256'] != base['manifest_sha256']
+    assert pw_changed['playwright_version'] == '1.65.0'
+
+    # Violating requires-python raises ValueError
+    (tmp_path / 'pyproject.toml').write_text(
+        pyproj.replace('requires-python = ">=3.12"', 'requires-python = ">=3.13"')
+    )
+    with pytest.raises(ValueError, match='violates requires-python'):
+        test_runner.compute_manifest(tmp_path)
+
+    # Changing requirements.lock DOES invalidate manifest
+    (tmp_path / 'pyproject.toml').write_text(pyproj)
+    reqs = (tmp_path / 'requirements.lock').read_text(encoding='utf-8')
+    (tmp_path / 'requirements.lock').write_text(reqs + 'extra-locked==1.0.0\n')
+    lock_changed = test_runner.compute_manifest(tmp_path)
+    assert lock_changed['manifest_sha256'] != base['manifest_sha256']
+
+    # Changing Dockerfile.test-runner DOES invalidate manifest
+    (tmp_path / 'requirements.lock').write_text(reqs)
+    df = (tmp_path / 'Dockerfile.test-runner').read_text(encoding='utf-8')
+    (tmp_path / 'Dockerfile.test-runner').write_text(df + '# modification\n')
+    df_changed = test_runner.compute_manifest(tmp_path)
+    assert df_changed['manifest_sha256'] != base['manifest_sha256']
+
+
+def test_test_runner_workflow_validation(tmp_path):
+    repo = Path(__file__).parents[1]
+    spec_tr = importlib.util.spec_from_file_location('test_runner', repo / 'scripts/test_runner.py')
+    test_runner = importlib.util.module_from_spec(spec_tr)
+    spec_tr.loader.exec_module(test_runner)
+
+    # The repository workflows must pass full validation
+    manifest_file = tmp_path / 'manifest.json'
+    test_runner.write_manifest(repo, manifest_file)
+    test_runner.validate(repo, manifest_file, check_workflows=True)
+
+    # Setup isolated test directory with workflows
+    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml'):
+        (tmp_path / name).write_text((repo / name).read_text(encoding='utf-8'), encoding='utf-8')
+    wf_dir = tmp_path / '.github/workflows'
+    wf_dir.mkdir(parents=True)
+    ci_text = (repo / '.github/workflows/ci.yaml').read_text(encoding='utf-8')
+    browser_text = (repo / '.github/workflows/browser.yaml').read_text(encoding='utf-8')
+    (wf_dir / 'ci.yaml').write_text(ci_text, encoding='utf-8')
+    (wf_dir / 'browser.yaml').write_text(browser_text, encoding='utf-8')
+
+    test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+
+    # Workflow without pinned digest fails
+    (wf_dir / 'ci.yaml').write_text(re.sub(r'@sha256:[a-f0-9]{64}', '', ci_text), encoding='utf-8')
+    with pytest.raises(RuntimeError, match='does not pin'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'ci.yaml').write_text(ci_text, encoding='utf-8')
+
+    # Workflow with redundant playwright install fails
+    (wf_dir / 'browser.yaml').write_text(browser_text + '\n      - run: playwright install\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='redundant playwright install'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'browser.yaml').write_text(browser_text, encoding='utf-8')
+
+    # Workflow with redundant pip install -r fails
+    (wf_dir / 'ci.yaml').write_text(ci_text + '\n      - run: pip install -r requirements.lock\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='redundant pip install -r'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'ci.yaml').write_text(ci_text, encoding='utf-8')
+
+    # Workflow with packages: write fails
+    (wf_dir / 'ci.yaml').write_text(ci_text.replace('contents: read', 'packages: write'), encoding='utf-8')
+    with pytest.raises(RuntimeError, match='unauthorized packages: write'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'ci.yaml').write_text(ci_text, encoding='utf-8')
+
+    # Workflow missing timeout-minutes fails
+    (wf_dir / 'browser.yaml').write_text(browser_text.replace('timeout-minutes:', 'timeout:'), encoding='utf-8')
+    with pytest.raises(RuntimeError, match='missing timeout-minutes'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'browser.yaml').write_text(browser_text, encoding='utf-8')
+
+    # Docker steps in browser workflow fail
+    (wf_dir / 'browser.yaml').write_text(browser_text + '\n      - run: docker compose ps\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='must not contain docker steps'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+    (wf_dir / 'browser.yaml').write_text(browser_text, encoding='utf-8')
+
+    # Docker steps in ci test job fail
+    (wf_dir / 'ci.yaml').write_text(
+        ci_text.replace('run: python scripts/test_runner.py prepare',
+                        'run: python scripts/test_runner.py prepare\n      - run: docker compose ps'),
+        encoding='utf-8',
+    )
+    with pytest.raises(RuntimeError, match='test job must not run docker commands'):
+        test_runner.validate(tmp_path, manifest_file, check_workflows=True)

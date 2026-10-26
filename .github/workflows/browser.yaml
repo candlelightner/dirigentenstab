@@ -12,15 +12,18 @@ permissions:
 jobs:
   chromium:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
+    container:
+      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-8e89f79303a87df7@sha256:17f9208d340e3628961fecbf5a5c406626c475cf2731c19eed33ac85cb8aab84
+      options: --shm-size=1g
+    env:
+      HOME: /root
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: python -m pip install -r requirements.lock -e '.[test]' playwright==1.64.1
-      - run: python -m playwright install --with-deps --only-shell --no-remove chromium firefox
-      - run: python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
+      - run: python scripts/test_runner.py prepare
+      - name: Browser tests
+        timeout-minutes: 7
+        run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -8,22 +8,24 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    container:
+      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-8e89f79303a87df7@sha256:17f9208d340e3628961fecbf5a5c406626c475cf2731c19eed33ac85cb8aab84
+    env:
+      HOME: /root
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-      - run: pip install -r requirements.lock && pip install --no-deps -e .
-      - run: ruff check .
+      - run: python scripts/test_runner.py prepare
+      - run: ruff check . && bash -n setup.sh
       - name: Unit and integration, including multi-turn conversations and 65-tool continuation
-        run: pytest -q
-      - run: bash -n setup.sh
-      - run: docker compose --env-file .env.example config --quiet
+        timeout-minutes: 4
+        run: python scripts/test_runner.py run unit-and-integration -- pytest -q -m "not browser and not live"
   container:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - run: docker compose --env-file .env.example config --quiet
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
