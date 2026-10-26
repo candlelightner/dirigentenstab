@@ -22,7 +22,7 @@ DEFAULTS = {
 def load_network(path=None):
     values = DEFAULTS.copy()
     path = Path(path) if path else Path(__file__).resolve().parent.parent / '.env'
-    if path.exists():
+    if path.is_file() and os.access(path, os.R_OK):
         for line in path.read_text().splitlines():
             key, separator, value = line.strip().removeprefix('export ').partition('=')
             key = key.strip()
