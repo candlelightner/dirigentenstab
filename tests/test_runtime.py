@@ -1220,3 +1220,31 @@ async def test_subgroup_tool_can_narrow_inherited_provider_server_and_tool_selec
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Create restricted subgroup')
     assert result['status'] == 'completed' and observed == [('parent', 'Restricted', selected)]
+
+
+async def test_history_decryption_does_not_block_event_loop(service, monkeypatch):
+    import asyncio
+    import threading
+
+    service.store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                          ('threaded-history', 'parent', 'human', 'History', 0, service.store.seal([])))
+    manager = runtime.Runtime(service)
+    original = service.store.open
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_open(value):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(2), 'History processing blocked the event loop'
+        return original(value)
+
+    monkeypatch.setattr(service.store, 'open', slow_open)
+    task = asyncio.create_task(manager.restore({'userid': 'human'}, 'threaded-history'))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        release.set()
+        restored = await task
+        assert restored['id'] == 'threaded-history' and restored['messages'] == []
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

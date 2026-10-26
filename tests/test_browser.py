@@ -822,3 +822,51 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await page.screenshot(path=str(state / 'independent-conversations-mobile.png'), full_page=True)
         await browser.close()
+
+
+async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(browser_app):
+    import asyncio
+    from dirigentenstab.limits import APP_ROOT_AGENT
+    from dirigentenstab.store import Store
+    from scripts.browser_fixture import HUMAN_ID
+
+    url, state = browser_app
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    history = []
+    for index in range(150):
+        history.extend([
+            {'kind': 'request', 'parts': [{'part_kind': 'user-prompt', 'content': f'Previous request {index}'}]},
+            {'kind': 'response', 'parts': [{'part_kind': 'text', 'content': f'Previous answer {index}'}],
+             'provider_details': {'fixture_padding': 'x' * 120_000}},
+        ])
+    store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                  ('large-history', APP_ROOT_AGENT, HUMAN_ID, 'Large history fixture', time.time(), store.seal(history)))
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True)
+        await login(page, url)
+        await page.get_by_label('Conversation', exact=True).fill('Large history fixture')
+        await page.get_by_role('option', name='Large history fixture', exact=True).click()
+        await page.get_by_text('Previous answer 149', exact=True).wait_for()
+        await page.evaluate("window.socketFailures = []; window.socket.on('disconnect', reason => socketFailures.push(reason))")
+        await asyncio.sleep(6)
+        assert await page.evaluate('window.socket.connected && socketFailures.length === 0')
+        await page.get_by_label('Message', exact=True).fill('heartbeat fixture')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Heartbeat 0.', exact=False).wait_for()
+        await page.evaluate("window.retainedMessage = document.querySelector('.q-message')")
+        await asyncio.sleep(3)
+        assert await page.evaluate('window.retainedMessage.isConnected')
+        # Reopening an active conversation must use the same incremental refresh path.
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.get_by_label('Conversation', exact=True).fill('Large history fixture')
+        await page.get_by_role('option', name='Large history fixture', exact=True).click()
+        await page.get_by_text('Heartbeat 0.', exact=False).wait_for()
+        await page.evaluate("window.retainedMessage = document.querySelector('.q-message'); window.socketFailures = []; window.socket.on('disconnect', reason => socketFailures.push(reason))")
+        await asyncio.sleep(3)
+        assert await page.evaluate('window.socket.connected && socketFailures.length === 0 && retainedMessage.isConnected')
+        await page.get_by_text('Streaming complete.', exact=False).wait_for(timeout=60000)
+        assert await page.evaluate('window.socket.connected && socketFailures.length === 0 && retainedMessage.isConnected')
+        assert await page.get_by_text('Previous answer 149', exact=True).count() == 1
+        await browser.close()

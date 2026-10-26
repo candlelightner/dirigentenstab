@@ -307,13 +307,17 @@ class Runtime:
         if not conversation:
             raise PermissionError('Conversation is not accessible')
         await self.service.authorize(identity, conversation['agent_id'])
+        # Large encrypted histories must not delay Socket.IO heartbeats.
+        return await asyncio.to_thread(self._restore, conversation)
+
+    def _restore(self, conversation):
         return {name: conversation[name] for name in ('id', 'agent_id', 'title', 'imported')} | {
             'messages': self.service.redact(self.service.store.open(conversation['messages'])),
             'runs': [{k: row[k] for k in ('id', 'status', 'tool', 'category')} | {
                 'budget': self._progress(self.service.store.open(row['checkpoint'])) if row['checkpoint'] else None,
                 'events': self.service.redact(self.service.store.open(row['events']))}
                 for row in self.service.store.all('SELECT * FROM chat_runs WHERE conversation_id=? ORDER BY created',
-                                                  (conversation_id,))],
+                                                  (conversation['id'],))],
         }
 
     @staticmethod
