@@ -25,7 +25,9 @@ def service(tmp_path):
             raise PermissionError('Agent outside your CloudStack domain')
         return await app.agent(agent_id)
 
-    app.authorize = authorize
+    async def chain(agent):
+        return [agent]
+    app.authorize, app.agent_chain = authorize, chain
     return app
 
 
@@ -77,9 +79,11 @@ def test_compaction_migration_retains_original_encrypted_history_and_keys(servic
     store.execute('DROP TABLE conversation_compactions')
     for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
         store.execute('ALTER TABLE agents DROP COLUMN ' + column)
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('PRAGMA user_version=13')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 14
+    assert reopened.one('PRAGMA user_version')['user_version'] == 15
     assert reopened.one('SELECT messages FROM conversations')['messages'] == history
     assert reopened.one('SELECT credentials FROM agents')['credentials'] == original
     assert reopened.one('SELECT auto_compact_percent FROM agents')['auto_compact_percent'] is None

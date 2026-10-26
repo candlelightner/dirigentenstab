@@ -68,6 +68,13 @@ async def login(page, url):
     await page.wait_for_function('window.socket?.connected && window.did_handshake')
 
 
+async def open_configuration(page):
+    header = page.locator('.agent-details .q-expansion-item__container > .q-item').first
+    if await header.get_attribute('aria-expanded') == 'false':
+        await header.click()
+    await page.get_by_role('button', name='Configure', exact=True).click()
+
+
 async def test_browser_secure_login_direct_chat_history_provider_and_logout(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:
@@ -83,7 +90,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         assert cookie['httpOnly'] and cookie['secure'] and cookie['sameSite'] == 'Strict'
         await page.get_by_label('Chat directly with an agent', exact=True).fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.get_by_text('Research Admin', exact=True).last.wait_for()
+        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Message', exact=True).fill('Inspect the research VM')
         await page.get_by_role('button', name='Send', exact=True).click()
         output = 'Infrastructure checked. The research VM is running.'
@@ -106,6 +113,9 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await page.evaluate('window.scrollTo(0, 0)')
         await page.screenshot(path=str(state / 'desktop.png'), full_page=True)
         await page.set_viewport_size({'width': 390, 'height': 844})
+        await page.locator('.q-drawer--mobile').wait_for(state='attached')
+        await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
+        await page.locator('.agent-details').get_by_role('button', name='Configure', exact=True).wait_for(state='hidden')
         await page.evaluate('window.scrollTo(0, 0)')
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         await page.screenshot(path=str(state / 'mobile.png'), full_page=True)
@@ -155,10 +165,10 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
                 await page.screenshot(path=str(state / 'selection-failure.png'), full_page=True)
                 raise
             await search.wait_for(state='hidden')
-            await page.get_by_text(name, exact=True).last.wait_for()
+            await page.locator('.agent-details').get_by_text(name, exact=True).wait_for()
             assert (await message.bounding_box())['x'] < 60
             assert await page.evaluate('window.scrollY === 0')
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         model = page.get_by_label('Model ID', exact=True)
         await page.get_by_text('2 models available.', exact=False).wait_for()
         await model.fill('custom-private-model')
@@ -172,15 +182,14 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
             assert await model.input_value() == 'custom-private-model'
         await page.get_by_role('button', name='Save', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
-        await page.get_by_text('custom-private-model', exact=False).last.wait_for()
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.get_by_label('Chat directly with an agent', exact=True).fill('Team 2 Level 3')
         await page.get_by_role('option', name='Team 2 Level 3', exact=True).click()
-        await page.get_by_text('Model: Local fixture / custom-private-model', exact=True).wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await page.locator('.agent-details').get_by_text('Team 2 Level 3', exact=True).wait_for()
+        await open_configuration(page)
         await page.get_by_label('Model ID', exact=True).wait_for()
-        assert await page.get_by_label('Model ID', exact=True).input_value() == 'custom-private-model'
+        await playwright.expect(page.get_by_label('Model ID', exact=True)).to_have_value('custom-private-model')
         await page.get_by_role('button', name='Cancel', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
         await message.fill('markdown stress')
@@ -211,7 +220,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await page.screenshot(path=str(state / 'mobile-visual-keyboard.png'), full_page=True)
         await page.evaluate("delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'))")
         await page.locator('.agent-details').wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_label('Model ID', exact=True).wait_for()
         await page.evaluate('''() => {
             Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>480});
@@ -243,7 +252,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await browser.close()
 
 
-async def test_browser_budget_pause_reload_and_continue(browser_app):
+async def test_browser_long_task_completes_without_budget_pause_and_restores(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
@@ -251,26 +260,12 @@ async def test_browser_budget_pause_reload_and_continue(browser_app):
         await login(page, url)
         await page.get_by_label('Message', exact=True).fill('bounded lifecycle')
         await page.get_by_role('button', name='Send', exact=True).click()
-        continuation = page.get_by_role('button', name='Continue saved task', exact=True)
-        await continuation.wait_for()
-        await page.get_by_text('Window limits: 2 requests / 2 tools', exact=False).wait_for()
-        await page.screenshot(path=str(state / 'budget-paused.png'), full_page=True)
-        await page.reload()
-        await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await page.get_by_label('Conversation', exact=True).fill('bounded lifecycle')
-        await page.get_by_role('option', name='bounded lifecycle', exact=True).click()
-        await continuation.wait_for()
-        for tools in (4, 5):
-            await continuation.click()
-            await page.get_by_text(f'Tools: {tools}', exact=False).wait_for()
-            await page.get_by_text('Paused · Completed activity saved' if tools == 4 else 'Completed',
-                                   exact=tools == 5).wait_for()
         await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
-        assert not await continuation.is_visible()
+        assert await page.get_by_role('button', name='Continue saved task', exact=True).count() == 0
         await page.get_by_text('Tools: 5', exact=False).wait_for()
         box = await page.get_by_label('Message', exact=True).bounding_box()
         assert box['y'] + box['height'] <= 844
-        await page.screenshot(path=str(state / 'budget-completed.png'), full_page=True)
+        await page.screenshot(path=str(state / 'long-task-completed.png'), full_page=True)
         await page.get_by_label('Message', exact=True).fill('Inspect resources in a second turn')
         await page.get_by_role('button', name='Send', exact=True).click()
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
@@ -372,12 +367,12 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         selector = page.get_by_label('Chat directly with an agent', exact=True)
         await selector.fill('Main Agent')
         await page.get_by_role('option', name='Main Agent', exact=True).click()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_label('System prompt', exact=True).fill(prompt)
         await page.get_by_role('button', name='Save', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
-        await page.get_by_role('button', name='Configure', exact=True).click()
-        assert await page.get_by_label('System prompt', exact=True).input_value() == prompt
+        await open_configuration(page)
+        await playwright.expect(page.get_by_label('System prompt', exact=True)).to_have_value(prompt)
         await page.get_by_role('button', name='MCP tools', exact=True).click()
         await page.get_by_label('Server name', exact=True).fill('Tavily web search')
         await page.get_by_label('HTTPS Streamable HTTP endpoint', exact=True).fill('https://mcp.tavily.com/mcp')
@@ -410,8 +405,8 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await selector.fill('Main Agent')
         await page.get_by_role('option', name='Main Agent', exact=True).click()
-        await page.get_by_role('button', name='Configure', exact=True).click()
-        assert await page.get_by_label('System prompt', exact=True).input_value() == prompt
+        await open_configuration(page)
+        await playwright.expect(page.get_by_label('System prompt', exact=True)).to_have_value(prompt)
         await page.get_by_role('button', name='MCP tools', exact=True).click()
         await page.get_by_role('checkbox', name='tavily_search', exact=True, checked=True).wait_for()
         assert await extract_tool.get_attribute('aria-checked') == 'false'
@@ -433,11 +428,7 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
 
 
 async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(browser_app):
-    from dirigentenstab.store import Store
-
     url, state = browser_app
-    store = Store(str(state / 'browser.db'), str(state / 'master'))
-    store.execute("UPDATE agents SET can_provision=1 WHERE id='research'")
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
@@ -451,13 +442,22 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             await page.set_viewport_size({'width': width, 'height': height})
             await selector.fill('Research')
             await page.get_by_role('option', name='Research Admin', exact=True).click()
+            await header.get_by_text('Research Admin', exact=True).wait_for()
+            if width <= 600:
+                await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
+                await header.click()
             await configure.wait_for()
             await subgroup.wait_for()
             await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for()
-            assert await header.get_attribute('aria-expanded') == 'true'
+            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
             await details.get_by_text('Domain details', exact=True).click()
             account = details.get_by_text('Administrator account: research-account', exact=True)
-            await account.wait_for()
+            try:
+                await account.wait_for()
+            except Exception:
+                await page.screenshot(path=str(state / 'account-expansion-failure.png'), full_page=True)
+                print('Expansion width:', width, await header.get_attribute('aria-expanded'))
+                raise
             expanded_height = (await details.bounding_box())['height']
             await header.click()
             await configure.wait_for(state='hidden')
@@ -465,7 +465,7 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             await account.wait_for(state='hidden')
             await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for(state='hidden')
             await details.get_by_text('Domain details', exact=True).wait_for(state='hidden')
-            assert await header.get_attribute('aria-expanded') == 'false'
+            await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
             assert await header.get_by_text('Research Admin', exact=True).is_visible()
             assert await header.get_by_text('Domain administrator', exact=True).is_visible()
             assert (await details.bounding_box())['height'] < expanded_height
@@ -478,20 +478,24 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             await page.get_by_label('System prompt', exact=True).wait_for()
             await page.get_by_role('button', name='Cancel', exact=True).click()
             await page.get_by_role('dialog').wait_for(state='hidden')
-            assert await header.get_attribute('aria-expanded') == 'true'
+            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
             await subgroup.click()
             await page.get_by_text('Create subgroup under Research Admin', exact=True).wait_for()
             await page.get_by_role('button', name='Cancel', exact=True).click()
             await page.get_by_role('dialog').wait_for(state='hidden')
-            assert await header.get_attribute('aria-expanded') == 'true'
+            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
             await header.focus()
             await header.press('Space')
             await configure.wait_for(state='hidden')
             await page.screenshot(path=str(state / f'agent-details-collapsed-{width}.png'), full_page=True)
             await selector.fill('Main Agent')
             await page.get_by_role('option', name='Main Agent', exact=True).click()
+            await header.get_by_text('Main Agent', exact=True).wait_for()
+            if width <= 600:
+                await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
+                await header.click()
             await configure.wait_for()
-            assert await header.get_attribute('aria-expanded') == 'true'
+            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
             assert await header.get_by_text('Main Agent', exact=True).is_visible()
             assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await browser.close()
@@ -509,7 +513,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         await agent.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
         await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         thinking = page.get_by_label('Thinking level', exact=True)
         await thinking.click()
@@ -523,7 +527,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         await agent.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
         await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         await thinking.click()
         await playwright.expect(page.get_by_role('option', name='Max', exact=True)).to_have_attribute('aria-selected', 'true')
@@ -585,7 +589,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
             await page.get_by_label('Message', exact=True).fill(title)
             await page.get_by_role('button', name='Send', exact=True).click()
             await page.get_by_text('Partial reply retained', exact=True).wait_for()
-            await page.get_by_role('button', name='Stop agent', exact=True).wait_for()
+            await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
             if restored:
                 await page.reload()
                 await page.wait_for_function('window.socket?.connected && window.did_handshake')
@@ -594,17 +598,17 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
                 await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
                 await page.get_by_label('Conversation', exact=True).fill(title)
                 await page.get_by_role('option', name=title, exact=True).click()
-                await page.get_by_role('button', name='Stop agent', exact=True).wait_for()
-            await page.get_by_role('button', name='Stop agent', exact=True).click()
-            await page.get_by_text('Stopped · Reference:', exact=False).wait_for()
-            await page.get_by_role('button', name='Stop agent', exact=True).wait_for(state='hidden')
+                await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
+            await page.get_by_role('button', name='Stop conversation', exact=True).click()
+            await page.get_by_text('Stopped', exact=True).wait_for()
+            await page.get_by_role('button', name='Stop conversation', exact=True).wait_for(state='hidden')
             await page.locator('.thinking-indicator').wait_for(state='hidden')
             await page.get_by_text('Partial reply retained', exact=True).wait_for()
             assert await page.get_by_label('Message', exact=True).is_enabled()
             run = store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id WHERE c.title=?', (title,))
             assert run['status'] == 'interrupted'
             assert store.open(run['checkpoint'])['reason'] == 'stopped'
-            await page.get_by_role('button', name='Continue saved task', exact=True).wait_for()
+            assert await page.get_by_role('button', name='Continue saved task', exact=True).count() == 0
             await page.get_by_role('button', name='New conversation', exact=True).click()
             await page.get_by_text('Partial reply retained', exact=True).wait_for(state='hidden')
         await page.screenshot(path=str(state / 'stopped-agent-mobile.png'), full_page=True)
@@ -624,7 +628,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await selector.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
         await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_text('Context compaction', exact=True).click()
         await page.get_by_text('Provider model API (context_window).', exact=False).wait_for()
         automatic = page.get_by_role('checkbox', name='Automatically compact context', exact=True)
@@ -653,7 +657,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await selector.fill('Research')
         await page.get_by_role('option', name='Research Admin', exact=True).click()
         await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
-        await page.get_by_role('button', name='Configure', exact=True).click()
+        await open_configuration(page)
         await page.get_by_text('Manual context-window override.', exact=False).wait_for()
         assert await model.input_value() == 'second-model'
         assert await override.input_value() == '65536'
@@ -699,4 +703,69 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await page.get_by_text('Context usage unavailable for this activity.', exact=True).wait_for()
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         assert 'in show_context' not in (state / 'browser-server.log').read_text()
+        await browser.close()
+
+
+async def test_browser_independent_conversations_interrupt_and_logout(browser_app):
+    import asyncio
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        async def send(text):
+            await page.get_by_label('Message', exact=True).fill(text)
+            await page.get_by_role('button', name='Send', exact=True).click()
+        async def choose(title):
+            await page.get_by_label('Conversation', exact=True).fill(title)
+            await page.get_by_role('option', name=title, exact=True).click()
+            await page.locator(f'.run-status[data-operation-id="{run(title)["id"]}"]').wait_for()
+        def run(title):
+            return store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
+                             'WHERE c.title=? ORDER BY r.created DESC LIMIT 1', (title,))
+
+        await send('stop fixture first independent conversation')
+        await page.get_by_text('Partial reply retained', exact=True).wait_for()
+        await page.get_by_label('Message', exact=True).fill('Keep this first conversation draft')
+        await page.get_by_role('button', name='New conversation', exact=True).click()
+        await page.get_by_text('Partial reply retained', exact=True).wait_for(state='hidden')
+        await send('stop fixture second independent conversation')
+        await page.get_by_text('Partial reply retained', exact=True).wait_for()
+        assert run('stop fixture first independent conversation')['status'] == 'running'
+        assert run('stop fixture second independent conversation')['status'] == 'running'
+        await choose('stop fixture first independent conversation')
+        await playwright.expect(page.get_by_label('Message', exact=True)).to_have_value('Keep this first conversation draft')
+        await page.get_by_role('button', name='Stop conversation', exact=True).click()
+        await page.get_by_text('Stopped', exact=True).wait_for()
+        assert run('stop fixture second independent conversation')['status'] == 'running'
+        await choose('stop fixture second independent conversation')
+        await send('Inspect resources after interrupting this conversation')
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        assert run('stop fixture first independent conversation')['status'] == 'interrupted'
+        assert run('stop fixture second independent conversation')['status'] == 'completed'
+
+        await page.get_by_role('button', name='New conversation', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for(state='hidden')
+        await send('background fixture survives logout')
+        await page.get_by_text('Background work accepted.', exact=True).wait_for()
+        await page.get_by_role('button', name='Sign out', exact=True).click()
+        await page.get_by_role('button', name='Sign in', exact=True).wait_for()
+        for _ in range(100):
+            if run('background fixture survives logout')['status'] == 'completed':
+                break
+            await asyncio.sleep(.1)
+        assert run('background fixture survives logout')['status'] == 'completed'
+        await login(page, url)
+        await choose('background fixture survives logout')
+        await page.get_by_text('Background work accepted. Background work completed.', exact=True).wait_for()
+        await page.screenshot(path=str(state / 'independent-conversations-desktop.png'), full_page=True)
+        await page.set_viewport_size({'width': 390, 'height': 844})
+        await page.locator('.q-drawer--mobile').wait_for(state='attached')
+        await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
+        await page.locator('.agent-details').get_by_role('button', name='Configure', exact=True).wait_for(state='hidden')
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await page.screenshot(path=str(state / 'independent-conversations-mobile.png'), full_page=True)
         await browser.close()

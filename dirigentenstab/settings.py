@@ -34,7 +34,6 @@ class Settings:
     max_output: int = 65536
     ssh_networks: str = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
     ssh_source_cidr: str = '10.253.80.1/32'
-    max_hierarchy_depth: int = 10
     cloudstack_ui_url: str = ''
     guest_assets: str = '/data/guest-assets'
     gpu_helper_socket: str = ''
@@ -42,8 +41,6 @@ class Settings:
     def __post_init__(self):
         if self.cloudstack_ui_url:
             self.cloudstack_ui_url = dashboard_endpoint(self.cloudstack_ui_url)
-        if type(self.max_hierarchy_depth) is not int or self.max_hierarchy_depth < 1:
-            raise ValueError('MAX_HIERARCHY_DEPTH must be a positive integer')
 
     @classmethod
     def load(cls):
@@ -60,5 +57,4 @@ class Settings:
                    ssh_source_cidr=os.getenv('SSH_SOURCE_CIDR', '10.253.80.1/32'),
                    cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
                    guest_assets=os.getenv('GUEST_ASSETS', '/data/guest-assets'),
-                   gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''),
-                   max_hierarchy_depth=int(os.getenv('MAX_HIERARCHY_DEPTH', '10')))
+                   gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''))

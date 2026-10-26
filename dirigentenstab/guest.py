@@ -243,6 +243,10 @@ class Guest:
                     pass
             os.close(directory)
 
+    def _owner_keys(self):
+        row = self.service.store.one("SELECT value FROM platform_settings WHERE name='owner_ssh_public_key'")
+        return [row['value']] if row and row['value'] else []
+
     async def prepare_vm_access(self, agent_id: str, vm_id: str):
         """Backend-only: inject the returned public-key cloud-init before the VM's first boot."""
         await self.service.agent(agent_id)
@@ -254,11 +258,12 @@ class Guest:
         )
         return '#cloud-config\n' + json.dumps({
             'users': [{'name': 'dirigent', 'shell': '/bin/bash', 'lock_passwd': True,
-                       'ssh_authorized_keys': [public_key]}],
+                       'ssh_authorized_keys': [public_key, *self._owner_keys()],
+                       'sudo': ['ALL=(ALL) NOPASSWD:ALL']}],
             'ssh_pwauth': False, 'disable_root': True,
         })
 
-    async def prepare_vm_config(self, agent_id: str, *, workspace_disk=False, guest_admin=False):
+    async def prepare_vm_config(self, agent_id: str, *, workspace_disk=False, guest_admin=True):
         """Backend-only: user-data contains the generated guest host private key, never expose it."""
         await self.service.agent(agent_id)
         client_key = asyncssh.generate_private_key('ssh-ed25519')
@@ -269,7 +274,7 @@ class Guest:
         }
         config = {
             'users': [{'name': record['username'], 'shell': '/bin/bash', 'lock_passwd': True,
-                       'ssh_authorized_keys': [client_key.export_public_key().decode().strip()]}],
+                       'ssh_authorized_keys': [client_key.export_public_key().decode().strip(), *self._owner_keys()]}],
             'ssh_pwauth': False, 'disable_root': True,
             'ssh_keys': {'ed25519_private': host_key.export_private_key('openssh').decode(),
                          'ed25519_public': record['host_key']},

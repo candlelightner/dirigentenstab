@@ -96,8 +96,7 @@ def context():
     settings = Settings(values['CLOUDSTACK_URL'], values['PUBLIC_ORIGIN'],
                         database=str(data / 'dirigentenstab.db'), key_file=str(key),
                         ssh_networks=values.get('SSH_NETWORKS', '10.253.80.0/24'),
-                        ssh_source_cidr=values.get('SSH_SOURCE_CIDR', '10.253.80.1/32'),
-                        max_hierarchy_depth=int(values.get('MAX_HIERARCHY_DEPTH', '10')))
+                        ssh_source_cidr=values.get('SSH_SOURCE_CIDR', '10.253.80.1/32'))
     store = Store(settings.database, settings.key_file)
     return Service(store, settings), key
 

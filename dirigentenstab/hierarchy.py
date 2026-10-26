@@ -4,14 +4,12 @@ MAX_DOMAIN_NAME_CHARS = 255
 MAX_DOMAIN_PATH_CHARS = 255
 
 
-def validate_child(parent_domain: dict, child_name: str, max_depth: int = 10) -> None:
+def validate_child(parent_domain: dict, child_name: str) -> None:
     """Validate the actual generated child name; ROOT is level zero.
 
     CloudStack's domain name/path columns are VARCHAR(255), utf8mb3. Its API
     renders the stored path '/' as 'ROOT' and '/Agents/' as 'ROOT/Agents'.
     """
-    if type(max_depth) is not int or max_depth < 1:
-        raise ValueError('MAX_HIERARCHY_DEPTH must be a positive integer')
     if not isinstance(parent_domain, dict):
         raise ValueError('CloudStack parent domain metadata is missing')
     path, level = parent_domain.get('path'), parent_domain.get('level')
@@ -28,8 +26,6 @@ def validate_child(parent_domain: dict, child_name: str, max_depth: int = 10) ->
             raise ValueError(f'CloudStack domain names cannot exceed {MAX_DOMAIN_NAME_CHARS} characters')
     if parent_domain.get('name', parts[-1]) != parts[-1]:
         raise ValueError('CloudStack parent name does not match its returned domain path')
-    if level + 1 > max_depth:
-        raise ValueError(f'Maximum hierarchy depth is {max_depth} levels below ROOT')
     # Stored paths omit the API's ROOT prefix and include both surrounding slashes.
     stored_child_path = path[len('ROOT'):] + '/' + child_name + '/'
     if len(stored_child_path) > MAX_DOMAIN_PATH_CHARS:

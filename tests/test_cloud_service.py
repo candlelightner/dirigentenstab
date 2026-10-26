@@ -48,7 +48,9 @@ async def test_agent_thinking_configuration_is_persistent_and_older_callers_pres
             raise PermissionError('Agent outside your CloudStack domain')
         return await service.agent(agent_id)
 
-    service.authorize = authorize
+    async def chain(agent):
+        return [agent]
+    service.authorize, service.agent_chain = authorize, chain
     identity = {'userid': 'owner', 'type': 2}
     assert (await service.agent('parent'))['thinking'] == 'default'
     await service.update_agent(identity, 'parent', 'provider', 'parent-model', 'Updated prompt', thinking='high')
@@ -318,6 +320,9 @@ class ProvisioningCloud:
 
 def provisioning_service(store, cloud):
     service = Service(store, SimpleNamespace(max_output=65536))
+    async def chain(agent):
+        return [agent]
+    service.agent_chain = chain
 
     class CredentialClient:
         def __init__(self, credentials):
@@ -389,15 +394,12 @@ async def test_existing_unsupported_cloudstack_is_rejected_before_any_provisioni
     assert not store.all('SELECT id FROM provisioning') and not store.all('SELECT id FROM agents')
 
 
-@pytest.mark.parametrize('limit,parent_name,error', [(1, 'Parent', 'hierarchy depth'),
-                                                    (10, 'A' * 220, 'domain path')])
-async def test_subgroup_checks_depth_and_actual_generated_path_before_cloud_creation(store, limit, parent_name, error):
+async def test_subgroup_checks_actual_generated_native_path_before_cloud_creation(store):
     add_parent(store)
     cloud = ProvisioningCloud()
-    cloud.parent_domain.update(name=parent_name, path='ROOT/' + parent_name)
+    cloud.parent_domain.update(name='A' * 220, path='ROOT/' + 'A' * 220)
     service = provisioning_service(store, cloud)
-    service.settings.max_hierarchy_depth = limit
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match='domain path'):
         await service.create_subgroup('parent', 'Research')
     assert not cloud.domains and not cloud.accounts and not cloud.keys
 
@@ -590,6 +592,8 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
         store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)', ('parent', 'pending', journal, journal, 'validating', 1))
@@ -643,7 +647,7 @@ async def test_managed_gpu_lifecycle_uses_authenticated_controller_and_native_ca
     monkeypatch.setattr(service_module, 'helper_call', helper)
     params = {'serviceofferingid': 'gpu'} if command == 'deployVirtualMachine' else {'id': 'vm'}
     context = {'session': 'backend-session', 'run_id': 'durable-run', 'call_id': 'tool-call'}
-    for invalid in (None, {key: value for key, value in context.items() if key != 'session'}):
+    for invalid in (None, {key: value for key, value in context.items() if key != 'call_id'}):
         token = GPU_CONTEXT.set(invalid)
         try:
             with pytest.raises(PermissionError, match='authenticated durable'):
@@ -707,7 +711,7 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
                 self.deployments += 1
                 self.userdata = request['userdata']
                 config = json.loads(base64.b64decode(request['userdata']).decode().split('\n', 1)[1])
-                assert bool(config['users'][0].get('sudo')) == bool(guest_admin)
+                assert config['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
                 pending = store.one('SELECT * FROM vm_deployments WHERE name=?', (request['name'],))
                 assert pending['phase'] == 'dispatched' and pending['name'] == request['name']
                 assert store.one('SELECT host_key FROM vm_access WHERE vm_id=?',
@@ -758,7 +762,10 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
     with pytest.raises(CloudError, match='recovery'):
         await service.execute('parent', 'deployVirtualMachine', params, managed=True)
     assert cloud.deployments == 1
-    await service.recover_deployments()
+    recovered = await service.recover_operation('parent', operation['id'])
+    assert recovered['phase'] == 'complete' and 'BEGIN OPENSSH PRIVATE KEY' not in str(recovered)
+    with pytest.raises(PermissionError):
+        await service.recover_operation('different-agent', operation['id'])
     await service.recover_deployments()
     assert cloud.deployments == 1
     assert store.one('SELECT * FROM vm_deployments')['phase'] == 'complete'
@@ -1055,8 +1062,11 @@ async def test_managed_agent_feature_gate_does_not_override_native_infrastructur
     assert (await service.describe_api('parent', 'createDomain'))['name'] == 'createDomain'
     result = await service.execute('parent', 'createDomain', {'name': 'Native domain'})
     assert result['domain']['id'] == 'native-domain'
-    with pytest.raises(PermissionError, match='Subgroup creation disabled'):
-        await service.create_subgroup('parent', 'Managed agent')
+    # The stored legacy flag no longer gates subgroup creation; the native account decides.
+    native = ProvisioningCloud()
+    managed = provisioning_service(store, native)
+    result = await managed.create_subgroup('parent', 'Managed agent')
+    assert result['id'] and native.domains
 
 
 @pytest.mark.parametrize('rule_count', [1, 449])
@@ -1130,3 +1140,56 @@ async def test_admin_migrates_only_legacy_agents_in_the_humans_visible_domains(s
     status = json.loads(output[output.index('{'):])
     assert status['legacy_credential_count'] == 2
     assert 'private-login' not in output and 'parent-secret' not in output
+
+
+async def test_subgroup_copies_model_compaction_provider_and_mcp_selections(store):
+    add_parent(store)
+    store.execute('UPDATE agents SET thinking=?,compaction_provider_id=?,compaction_model=?,'
+                  'auto_compact_percent=?,context_window=?,enabled_providers=?,enabled_mcp_servers=? WHERE id=?',
+                  ('high', 'provider', 'summary', 75, 100000, '["provider"]', '["tools"]', 'parent'))
+    store.execute('INSERT INTO mcp_servers(id,name,url,token) VALUES(?,?,?,?)',
+                  ('tools', 'Tools', 'https://tools.invalid/mcp', store.seal('secret')))
+    store.execute('INSERT INTO mcp_assignments VALUES(?,?,?)', ('parent', 'tools', '["search"]'))
+    result = await provisioning_service(store, ProvisioningCloud()).create_subgroup('parent', 'Inherited')
+    child = store.one('SELECT * FROM agents WHERE id=?', (result['id'],))
+    assert {name: child[name] for name in ('thinking', 'compaction_provider_id', 'compaction_model',
+                                         'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers')} == {
+        'thinking': 'high', 'compaction_provider_id': 'provider', 'compaction_model': 'summary',
+        'auto_compact_percent': 75, 'context_window': 100000,
+        'enabled_providers': '["provider"]', 'enabled_mcp_servers': '["tools"]'}
+    assert store.one('SELECT tools FROM mcp_assignments WHERE agent_id=?', (child['id'],))['tools'] == '["search"]'
+
+
+async def test_owner_ssh_configuration_accepts_public_keys_only_and_vm_overview_is_informational(store):
+    import asyncssh
+    add_parent(store)
+    service = Service(store, SimpleNamespace(max_output=65536, cloudstack_ui_url='https://cloud.invalid/client'))
+    owner = {'userid': 'human-owner', 'type': 1}
+    key = asyncssh.generate_private_key('ssh-ed25519')
+    public = key.export_public_key().decode().strip()
+    await service.save_owner_ssh_key(owner, public)
+    assert service.owner_ssh_key(owner) == public
+    for invalid in (key.export_private_key().decode(), 'not a public key'):
+        with pytest.raises(ValueError):
+            await service.save_owner_ssh_key(owner, invalid)
+    with pytest.raises(PermissionError):
+        await service.save_owner_ssh_key({'_agent_id': 'parent', 'userid': 'human-owner', 'type': 1}, public)
+    async def authorize(identity, agent_id):
+        return await service.agent(agent_id)
+    calls = []
+    class Native:
+        async def raw(self, command, params):
+            calls.append((command, params))
+            return {'virtualmachine': [{'id': 'vm', 'name': 'Managed', 'state': 'Running',
+                                        'nic': [{'isdefault': True, 'ipaddress': '10.50.0.2'}]}]}
+    async def client(agent):
+        assert agent['id'] == 'parent'
+        return Native()
+    service.authorize, service.cloud_client = authorize, client
+    store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key) VALUES(?,?,?,?)',
+                  ('vm', 'parent', 'dirigent', store.seal('private')))
+    machines = await service.vm_overview(owner, 'parent')
+    assert machines[0]['username'] == 'dirigent' and machines[0]['address'] == '10.50.0.2'
+    assert machines[0]['cloudstack_url'] == 'https://cloud.invalid/client/#/vm/vm'
+    assert calls == [('listVirtualMachines', {'listall': True})]
+    assert 'private' not in str(machines)

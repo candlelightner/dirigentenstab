@@ -104,8 +104,11 @@ def service(tmp_path):
         async def context(self, agent):
             return {'name': agent['name'], 'domain_id': agent['domain_id']}
 
-        async def can_delegate(self, caller, target):
-            return caller == 'parent' and target == 'child'
+        async def execution_identity(self, agent_id, human_id):
+            return {'userid': human_id, '_agent_id': agent_id}
+
+        async def providers(self, identity):
+            return store.all('SELECT * FROM providers')
 
         async def execute(self, agent_id, command, params):
             self.executions.append((agent_id, command, params))
@@ -132,45 +135,6 @@ def service(tmp_path):
     return Service()
 
 
-async def test_streamed_delegation_uses_child_identity_and_restores_private_history(service, monkeypatch):
-    observed_child_history = []
-
-    def child(messages, info):
-        assert 'parent-secret' not in str(messages) + str(info.instructions)
-        if any(part.part_kind == 'tool-return' for part in messages[-1].parts):
-            observed_child_history.extend(messages)
-            assert 'SUPERSECRET' not in str(messages[-1])
-            return ModelResponse(parts=[TextPart('Child completed its own task')])
-        return ModelResponse(parts=[ToolCallPart('execute_api', {'command': 'listVirtualMachines', 'params': {}})])
-
-    async def parent(messages, info):
-        if any(part.part_kind == 'tool-return' for part in messages[-1].parts):
-            yield 'Delegation '
-            yield 'complete'
-        else:
-            yield {0: DeltaToolCall(name='delegate', json_args=json.dumps({'agent_id': 'child', 'task': 'inspect'}))}
-
-    monkeypatch.setattr(runtime, 'build_model', lambda provider, model, store:
-                        FunctionModel(child) if model == 'child' else FunctionModel(stream_function=parent))
-    manager = runtime.Runtime(service)
-    events = []
-
-    async def emit(event):
-        events.append(event)
-
-    result = await manager.chat({'userid': 'human'}, 'parent', None, 'inspect SUPERSECRET', emit)
-    assert result['output'] == 'Delegation complete'
-    assert service.executions == [('child', 'listVirtualMachines', {})]
-    assert observed_child_history
-    assert any(event['type'] == 'tool_result' and event['name'] == 'delegate' for event in events)
-    assert ''.join(event['text'] for event in events if event['type'] == 'text') == result['output']
-    restored = await manager.restore({'userid': 'human'}, result['conversation_id'])
-    assert 'SUPERSECRET' not in str(restored)
-    assert '[redacted]' in str(restored)
-    assert len(await manager.conversations({'userid': 'human'}, 'child')) == 1
-    with pytest.raises(PermissionError):
-        await manager.restore({'userid': 'other-human'}, result['conversation_id'])
-    assert b'Child completed its own task' not in service.store.path.read_bytes()
 
 
 async def test_failed_runtime_suppresses_provider_secrets_and_preserves_retryable_history(service, monkeypatch):
@@ -403,106 +367,12 @@ def test_interrupted_tool_history_is_closed_without_reexecuting():
     assert 'Outcome unknown' in result.content
 
 
-async def test_bounded_windows_resume_pending_calls_and_never_replay_mutation(service, monkeypatch):
-    monkeypatch.setattr(runtime, 'TOOLS_PER_WINDOW', 2)
-    monkeypatch.setattr(runtime, 'REQUESTS_PER_WINDOW', 3)
-    monkeypatch.setattr(runtime, 'AUTOMATIC_WINDOWS', 2)
-    searches = []
-    async def search(*args):
-        searches.append(args)
-        return {'api': ['listDomains']}
-    service.search_api = search
-    calls = [('execute_api', {'command': 'deployVirtualMachine', 'params': {'name': 'disposable'}}),
-             ('search_api', {'query': 'domain'}),
-             ('execute_api', {'command': 'deployVirtualMachine', 'params': {'name': 'disposable'}}),
-             ('search_api', {'query': 'domain'}),
-             ('describe_api', {'command': 'listDomains'}),
-             ('execute_api', {'command': 'listDomains', 'params': {}})]
-
-    async def model(messages, info):
-        completed = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
-        if completed == len(calls):
-            yield 'Python and verification complete'
-        else:
-            name, args = calls[completed]
-            yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=f'long-{completed}')}
-
-    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    paused = await manager.chat({'userid': 'human'}, 'parent', None, 'Full lifecycle')
-    assert paused['status'] == 'paused'
-    restored = await manager.restore({'userid': 'human'}, paused['conversation_id'])
-    assert restored['runs'][-1]['budget']['tool_calls'] == 4
-    assert restored['runs'][-1]['budget']['resumable']
-    # Reopen after restart with the same operation and original task; no synthetic retry prompt.
-    manager = runtime.Runtime(service)
-    with pytest.raises(PermissionError):
-        await manager.resume({'userid': 'other-human'}, paused['operation_id'])
-    result = await manager.resume({'userid': 'human'}, paused['operation_id'])
-    assert result['status'] == 'completed' and result['operation_id'] == paused['operation_id']
-    assert [c[1] for c in service.executions] == ['deployVirtualMachine', 'listDomains']
-    assert len(searches) == 1
-    restored = await manager.restore({'userid': 'human'}, paused['conversation_id'])
-    assert restored['runs'][-1]['budget']['tool_calls'] == 6
-    assert sum(p['part_kind'] == 'user-prompt' for m in restored['messages'] for p in m['parts']) == 1
-    assert len(restored['runs'][-1]['events']) == 12
-    with pytest.raises(ValueError):
-        await manager.resume({'userid': 'human'}, paused['operation_id'])
 
 
-async def test_uncertain_mutation_blocks_continuation_and_duplicate_dispatch(service, monkeypatch):
-    from dirigentenstab.cloud import CloudError
-    dispatched = []
-    async def execute(*args):
-        dispatched.append(args)
-        raise CloudError('Unknown dispatch outcome')
-    service.execute = execute
-    async def model(messages, info):
-        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
-            {'command': 'deployVirtualMachine', 'params': {'name': 'one'}}))}
-    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Create one VM')
-    run = service.store.one('SELECT * FROM chat_runs')
-    assert run['status'] == 'reconciliation' and len(dispatched) == 1
-    with pytest.raises(ValueError):
-        await manager.resume({'userid': 'human'}, run['id'])
-    assert len(dispatched) == 1
 
 
-async def test_timeout_before_dispatch_can_resume_saved_results(service, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(runtime, 'WINDOW_SECONDS', 0.05)
-    async def slow(messages, info):
-        await asyncio.sleep(0.01)
-        raise TimeoutError('Synthetic provider timeout')
-        yield 'Too late'
-    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=slow))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError, match='time budget paused'):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Inspect')
-    run = service.store.one('SELECT * FROM chat_runs')
-    assert run['status'] == 'interrupted'
-    async def fast(messages, info):
-        yield 'Done'
-    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=fast))
-    result = await manager.resume({'userid': 'human'}, run['id'])
-    assert result['status'] == 'completed'
 
 
-async def test_oversized_batch_pauses_without_an_endless_continue_action(service, monkeypatch):
-    monkeypatch.setattr(runtime, 'TOOLS_PER_WINDOW', 2)
-    async def model(messages, info):
-        yield {n: DeltaToolCall(name='execute_api', json_args=json.dumps(
-            {'command': 'listDomains', 'params': {}})) for n in range(3)}
-    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    result = await manager.chat({'userid': 'human'}, 'parent', None, 'Inspect')
-    assert result['status'] == 'paused' and not result['resumable']
-    assert not service.executions
-    with pytest.raises(ValueError):
-        await manager.resume({'userid': 'human'}, result['operation_id'])
 
 
 async def test_ssh_readiness_can_retry_and_new_verification_calls_are_fresh(service, monkeypatch):
@@ -528,163 +398,14 @@ async def test_ssh_readiness_can_retry_and_new_verification_calls_are_fresh(serv
     assert [e['failed'] for e in calls] == [True, False, False]
 
 
-@pytest.mark.parametrize('phase', ['rejected', 'complete'])
-async def test_admin_reconciliation_preserves_task_and_reuses_recovered_vm(service, monkeypatch, phase):
-    from dirigentenstab.cloud import CloudError
-    args = {'command': 'deployVirtualMachine', 'params': {'displayname': 'disposable', 'zoneid': 'zone'}}
-    dispatched = []
-    async def execute(agent, command, params):
-        if command == 'listVirtualMachines':
-            return {'virtualmachine': [{'id': 'recovered-vm', 'state': 'Stopped'}]}
-        dispatched.append(command)
-        service.store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?,?,?)',
-                              ('deployment', agent, 'managed', service.store.seal({'request': params}), None, 'failed', 1))
-        raise CloudError('Needs recovery', operation_id='deployment')
-    service.execute = execute
-    async def model(messages, info):
-        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
-        name, values = ('describe_api', {'command': 'deployVirtualMachine'}) if count == 0 else ('execute_api', args)
-        yield {0: DeltaToolCall(name=name, json_args=json.dumps(values), tool_call_id=f'recover-{count}')}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Create and verify one VM')
-    run = service.store.one('SELECT * FROM chat_runs')
-    with pytest.raises(ValueError, match='Recover or resolve'):
-        await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'deployment')
-    with pytest.raises(PermissionError):
-        await runtime.Runtime.reconcile(service, {'userid': 'other-human'}, run['id'], 'deployment')
-    service.store.execute('UPDATE vm_deployments SET phase=?,vm_id=? WHERE id=?',
-                          (phase, 'recovered-vm' if phase == 'complete' else None, 'deployment'))
-    await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'deployment')
-    restored = await manager.restore({'userid': 'human'}, run['conversation_id'])
-    assert restored['runs'][-1]['budget']['resumable']
-    requests = []
-    async def resumed(messages, info):
-        requests.append(True)
-        if phase == 'complete' and len(requests) == 1:
-            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(args))}
-        else:
-            yield 'Recovered task verified'
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=resumed))
-    result = await manager.resume({'userid': 'human'}, run['id'])
-    assert result['status'] == 'completed' and result['operation_id'] == run['id']
-    assert dispatched == ['deployVirtualMachine']
 
 
-async def test_time_window_yields_before_dispatch_instead_of_cancelling_mutation(service, monkeypatch):
-    import asyncio
-    monkeypatch.setattr(runtime, 'WINDOW_SECONDS', .5)
-    async def model(messages, info):
-        if any(p.part_kind == 'tool-return' for p in messages[-1].parts):
-            yield 'Completed safely'
-        else:
-            await asyncio.sleep(.65)
-            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
-                {'command': 'deployVirtualMachine', 'params': {'name': 'one'}}), tool_call_id='time-boundary')}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    result = await manager.chat({'userid': 'human'}, 'parent', None, 'Create one VM')
-    assert result['status'] == 'completed' and len(service.executions) == 1
-    saved = await manager.restore({'userid': 'human'}, result['conversation_id'])
-    assert saved['runs'][-1]['budget']['windows'] == 2
 
 
-async def test_three_turn_conversation_preserves_65_tool_chain_across_restart(service, monkeypatch):
-    """CI exercises real Pydantic AI windows with a longer chain than production's tool cap."""
-    async def model(messages, info):
-        prompts = [str(p.content) for m in messages for p in m.parts if p.part_kind == 'user-prompt']
-        if prompts[-1] == 'Remember inventory':
-            yield 'Inventory reference retained'
-        elif prompts[-1] == 'Verify the previous task':
-            assert 'Inventory reference retained' in str(messages)
-            assert 'Lifecycle verified after 65 calls' in str(messages)
-            assert sum(p.part_kind == 'tool-return' for m in messages for p in m.parts) == 65
-            yield 'Both previous turns and their tool results are retained'
-        else:
-            completed = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
-            if completed == 65:
-                yield 'Lifecycle verified after 65 calls'
-            else:
-                # A later model request repeats its creation intent; only one dispatch is allowed.
-                params = {'name': 'one-disposable'} if completed in (0, 32) else {'page': completed}
-                command = 'deployVirtualMachine' if completed in (0, 32) else 'listVirtualMachines'
-                yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
-                    {'command': command, 'params': params}), tool_call_id=f'chain-{completed}')}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    first = await manager.chat({'userid': 'human'}, 'parent', None, 'Remember inventory')
-    second = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Run the lifecycle')
-    assert second['status'] == 'paused'
-    assert second['conversation_id'] == first['conversation_id']
-    manager = runtime.Runtime(service)
-    completed = await manager.resume({'userid': 'human'}, second['operation_id'])
-    assert completed['status'] == 'completed' and completed['operation_id'] == second['operation_id']
-    third = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Verify the previous task')
-    assert third['status'] == 'completed'
-    saved = await manager.restore({'userid': 'human'}, first['conversation_id'])
-    assert len(saved['runs']) == 3
-    long_run = next(r for r in saved['runs'] if r['id'] == second['operation_id'])
-    assert long_run['budget']['tool_calls'] == 65 and long_run['budget']['windows'] >= 4
-    assert len(long_run['events']) == 130
-    assert sum(command == 'deployVirtualMachine' for _, command, _ in service.executions) == 1
-    assert sum(p['part_kind'] == 'user-prompt' for m in saved['messages'] for p in m['parts']) == 3
 
 
-async def test_restart_keeps_uncertain_template_dispatch_in_reconciliation(service, monkeypatch):
-    from dirigentenstab.cloud import CloudError
-    async def dispatch(*args):
-        raise CloudError('Template accepted, response lost')
-    service.execute = dispatch
-    async def model(messages, info):
-        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
-            {'command': 'createTemplate', 'params': {'name': 'private', 'volumeid': 'root'}}))}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Create a private image')
-    run = service.store.one('SELECT * FROM chat_runs')
-    service.store.execute("UPDATE chat_runs SET status='running' WHERE id=?", (run['id'],))
-    restarted = runtime.Runtime(service)
-    current = service.store.one('SELECT * FROM chat_runs WHERE id=?', (run['id'],))
-    assert current['status'] == 'reconciliation'
-    with pytest.raises(ValueError):
-        await restarted.resume({'userid': 'human'}, run['id'])
 
 
-async def test_recovered_private_template_continues_the_same_owned_task(service, monkeypatch):
-    from dirigentenstab.cloud import CloudError
-    values = {'name': 'image', 'volumeid': 'root', 'ostypeid': 'linux'}
-    dispatched = []
-    async def execute(agent, command, params):
-        dispatched.append(command)
-        service.store.execute('INSERT INTO template_creations VALUES(?,?,?,?,?,NULL,?,?,?)',
-                              ('image-op', agent, 'root', 'managed-image',
-                               service.store.seal({'request': {**params, 'name': 'managed-image'}}),
-                               'dispatched', 0, 1))
-        raise CloudError('Accepted but connection lost', operation_id='image-op')
-    async def bind(op):
-        assert op['agent_id'] == 'parent' and op['template_id'] == 'private-image'
-        return {'id': 'private-image', 'ispublic': False}
-    service.execute, service._bind_private_template = execute, bind
-    async def model(messages, info):
-        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(
-            {'command': 'createTemplate', 'params': values}), tool_call_id='one-image')}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human'}, 'parent', None, 'Create one private image')
-    run = service.store.one('SELECT * FROM chat_runs')
-    with pytest.raises(ValueError):
-        await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'image-op')
-    service.store.execute("UPDATE template_creations SET phase='complete',template_id='private-image'")
-    await runtime.Runtime.reconcile(service, {'userid': 'human'}, run['id'], 'image-op')
-    async def finish(messages, info):
-        yield 'Reused the recovered private image'
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=finish))
-    result = await manager.resume({'userid': 'human'}, run['id'])
-    assert result['operation_id'] == run['id'] and result['status'] == 'completed'
-    assert dispatched == ['createTemplate']
 
 
 @pytest.mark.parametrize('command,params', [
@@ -718,7 +439,7 @@ async def test_managed_gpu_dispatch_uses_private_server_context_without_exposing
     result = await runtime.Runtime(service).chat({'userid': 'human', '_session': session}, 'parent', None,
                                                'Deploy a managed GPU VM')
     assert result['status'] == 'completed'
-    assert seen == [{'run_id': result['operation_id'], 'call_id': 'gpu-call', 'session': session}]
+    assert seen == [{'run_id': result['operation_id'], 'call_id': 'gpu-call', 'session': None}]
     assert GPU_CONTEXT.get() is None
     run = service.store.one('SELECT * FROM chat_runs')
     conversation = service.store.one('SELECT messages FROM conversations')
@@ -726,43 +447,6 @@ async def test_managed_gpu_dispatch_uses_private_server_context_without_exposing
     assert session not in str(service.store.open(conversation['messages']))
 
 
-@pytest.mark.parametrize('managed', [False, True])
-async def test_verified_gpu_recovery_preserves_owned_conversation_and_does_not_replay(service, monkeypatch, managed):
-    from dirigentenstab.diagnostics import OperationError
-    from dirigentenstab.gpu import GPU_CONTEXT, operation_id
-    args = {'command': 'deployVirtualMachine', 'params': {'templateid': 'base', 'serviceofferingid': 'gpu'}}
-    if managed:
-        args['managed'] = True
-    calls = []
-    async def execute(*values, **options):
-        assert options == ({'managed': True} if managed else {})
-        assert GPU_CONTEXT.get() == {'run_id': service.store.one('SELECT id FROM chat_runs')['id'],
-                                      'call_id': 'gpu-call', 'session': 'private-session-hash'}
-        calls.append(values)
-        raise OperationError('gpu', 'Saved host operation requires reconciliation', 'reference', reconciliation=True)
-    service.execute = execute
-    async def model(messages, info):
-        yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps(args), tool_call_id='gpu-call')}
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
-    manager = runtime.Runtime(service)
-    with pytest.raises(ValueError):
-        await manager.chat({'userid': 'human', '_session': 'private-session-hash'}, 'parent', None, 'Create a GPU VM')
-    assert GPU_CONTEXT.get() is None
-    run = service.store.one('SELECT * FROM chat_runs')
-    async def confirmed(settings, action, **payload):
-        assert action == 'result' and payload['session'] == 'private-session-hash'
-        assert payload['operation_id'] == operation_id({'run_id': run['id'], 'call_id': 'gpu-call'})
-        return {'phase': 'completed', **args, 'result': {'virtualmachine': {'id': 'already-created'}}}
-    monkeypatch.setattr(runtime, 'helper_call', confirmed)
-    with pytest.raises(PermissionError):
-        await manager.reconcile_gpu(service, {'userid': 'other-human', '_session': 'forged'}, run['id'])
-    await manager.reconcile_gpu(service, {'userid': 'human', '_session': 'private-session-hash'}, run['id'])
-    async def finish(messages, info):
-        assert 'already-created' in str(messages)
-        yield 'Reused the verified GPU VM'
-    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=finish))
-    completed = await manager.resume({'userid': 'human'}, run['id'])
-    assert completed['status'] == 'completed' and completed['operation_id'] == run['id'] and len(calls) == 1
 
 
 async def test_mcp_sdk_filters_tools_and_keeps_results_untrusted_redacted_and_durable(service, mcp_remote, monkeypatch):
@@ -841,11 +525,10 @@ async def test_mcp_error_ignores_remote_readonly_hint_and_blocks_replay(service,
     manager = runtime.Runtime(service)
     result = await manager.chat({'userid': 'human'}, 'parent', None, 'Search')
     run = service.store.one('SELECT * FROM chat_runs')
-    assert result['status'] == run['status'] == 'reconciliation' and len(mcp_remote.calls) == 1
+    assert result['status'] == run['status'] == 'completed' and len(mcp_remote.calls) == 1
     saved = service.store.open(run['checkpoint'])
     assert list(saved['mutations'].values())[0]['status'] == 'uncertain'
-    with pytest.raises(ValueError):
-        await manager.resume({'userid': 'human'}, run['id'])
+    assert 'External action needs review' in result['output']
     assert len(mcp_remote.calls) == 1
 
 
@@ -1001,14 +684,14 @@ async def test_agent_thinking_settings_apply_per_agent_and_reject_unsupported_ch
 
     monkeypatch.setattr(manager, 'thinking_capabilities', capabilities)
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(lambda *args: ModelResponse(parts=[TextPart('Done')])))
-    parent = await manager._agent({'userid': 'human'}, 'parent', {'remaining': 8}, 0, emit)
-    child = await manager._agent({'userid': 'human'}, 'child', {'remaining': 8}, 1, emit)
+    parent = await manager._agent({'userid': 'human'}, 'parent', {}, emit)
+    child = await manager._agent({'userid': 'human'}, 'child', {}, emit)
     assert parent.model_settings == {'max_tokens': 8192, 'timeout': 60, 'openai_reasoning_effort': 'high',
                                      'extra_body': {'thinking': {'type': 'enabled'}}}
     assert child.model_settings == {'max_tokens': 8192, 'timeout': 60, 'extra_body': {'thinking': {'type': 'disabled'}}}
     service.store.execute("UPDATE agents SET thinking='ultra' WHERE id='parent'")
     with pytest.raises(ValueError, match='unavailable for this model'):
-        await manager._agent({'userid': 'human'}, 'parent', {'remaining': 8}, 0, emit)
+        await manager._agent({'userid': 'human'}, 'parent', {}, emit)
 
 
 async def test_deepseek_reasoning_content_survives_tool_continuation_persistence_and_next_turn(service, monkeypatch):
@@ -1182,71 +865,356 @@ async def test_stop_rejects_other_humans_and_current_domain_scope_even_for_known
     assert service.store.one('SELECT status FROM chat_runs')['status'] == 'completed'
 
 
-async def test_stop_during_mutation_preserves_uncertain_result_and_blocks_resume(service, monkeypatch):
+
+
+
+
+async def test_owner_disconnect_detaches_and_execution_never_reuses_human_session(service, monkeypatch):
     import asyncio
 
-    dispatched, cancelled = asyncio.Event(), asyncio.Event()
-    calls = []
+    started, finish = asyncio.Event(), asyncio.Event()
+    identities = []
+    authorize = service.authorize
 
-    async def mutation(agent_id, command, params):
-        calls.append((agent_id, command, params))
-        dispatched.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
+    async def checked(identity, agent_id, **kwargs):
+        identities.append(dict(identity))
+        return await authorize(identity, agent_id, **kwargs)
 
     async def model(messages, info):
-        yield {0: DeltaToolCall(name='execute_api', json_args='{"command":"destroyVirtualMachine","params":{"id":"vm"}}',
-                                tool_call_id='mutating-call')}
+        started.set()
+        await finish.wait()
+        yield 'Finished without a browser'
 
-    service.execute = mutation
+    service.authorize = checked
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     manager = runtime.Runtime(service)
-    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Destroy selected VM'))
-    await asyncio.wait_for(dispatched.wait(), 2)
-    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
-    assert (await manager.stop({'userid': 'human'}, operation_id))['status'] == 'reconciliation'
+    browser = asyncio.create_task(manager.chat({'userid': 'human', '_session': 'expires-now'}, 'parent', None, 'Work'))
+    await asyncio.wait_for(started.wait(), 2)
+    browser.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
-    run = service.store.one('SELECT * FROM chat_runs')
-    state = service.store.open(run['checkpoint'])
-    assert cancelled.is_set() and len(calls) == 1
-    assert state['reason'] == 'stopped' and state['resumable'] is False
-    assert list(state['mutations'].values())[0]['status'] == 'uncertain'
-    with pytest.raises(ValueError, match='cannot be continued safely'):
-        await manager.resume({'userid': 'human'}, operation_id)
-    assert len(calls) == 1 and not manager.active
+        await browser
+    assert manager.active
+    finish.set()
+    await asyncio.gather(*list(manager.active.values()))
+    assert service.store.one('SELECT status FROM chat_runs')['status'] == 'completed'
+    assert identities[0].get('_session') == 'expires-now'
+    assert all('_session' not in identity for identity in identities[1:])
 
 
-async def test_stop_propagates_through_delegation_and_saves_child_history(service, monkeypatch):
+async def test_new_message_and_stop_only_interrupt_the_same_conversation(service, monkeypatch):
     import asyncio
 
-    entered, cancelled = asyncio.Event(), asyncio.Event()
-
-    async def parent(messages, info):
-        yield {0: DeltaToolCall(name='delegate', json_args='{"agent_id":"child","task":"Inspect delegated task"}',
-                                tool_call_id='delegated-call')}
-
-    async def child(messages, info):
-        entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    monkeypatch.setattr(runtime, 'build_model', lambda provider, model, store:
-                        FunctionModel(child) if model == 'child' else FunctionModel(stream_function=parent))
+    first_started, other_started = asyncio.Event(), asyncio.Event()
     manager = runtime.Runtime(service)
-    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Delegate inspection'))
-    await asyncio.wait_for(entered.wait(), 2)
-    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
-    assert (await manager.stop({'userid': 'human'}, operation_id))['status'] == 'interrupted'
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    child_conversation = service.store.one("SELECT messages FROM conversations WHERE agent_id='child'")
-    assert cancelled.is_set() and child_conversation
-    assert 'Inspect delegated task' in str(service.store.open(child_conversation['messages']))
+
+    async def model(messages, info):
+        assert 'delegate' not in [tool.name for tool in info.function_tools]
+        assert 'Active conversations for this agent: 2' in info.instructions
+        latest = [p.content for m in messages for p in m.parts if isinstance(p, UserPromptPart)][-1]
+        if latest == 'First':
+            yield 'Saved progress'
+            first_started.set()
+            await asyncio.Event().wait()
+        elif latest == 'Other':
+            other_started.set()
+            await asyncio.Event().wait()
+        else:
+            assert 'Saved progress' in str(messages)
+            yield 'Revised instruction complete'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    first = await manager.submit({'userid': 'human'}, 'parent', None, 'First')
+    other = await manager.submit({'userid': 'human'}, 'parent', None, 'Other')
+    await asyncio.wait_for(asyncio.gather(first_started.wait(), other_started.wait()), 2)
+    first_task = manager.active[first['operation_id']]
+    result = await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Revised')
+    assert result['status'] == 'completed' and first_task.cancelled()
+    assert other['operation_id'] in manager.active
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs WHERE id=?', (first['operation_id'],))['checkpoint'])
+    assert state['reason'] == 'new_message'
+    await manager.stop({'userid': 'human'}, other['operation_id'])
+    assert not manager.active
+
+
+async def test_restart_resumes_only_active_work_and_closes_uncertain_calls(service, monkeypatch):
+    import asyncio
+
+    entered = asyncio.Event()
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    active = await manager.submit({'userid': 'human'}, 'parent', None, 'Create only one VM')
+    stopped = await manager.submit({'userid': 'human'}, 'parent', None, 'Stopped task')
+    paused = await manager.submit({'userid': 'human'}, 'parent', None, 'Paused task')
+    await asyncio.sleep(0)
+    await manager.stop({'userid': 'human'}, stopped['operation_id'])
+    await manager.stop({'userid': 'human'}, paused['operation_id'])
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs WHERE id=?', (paused['operation_id'],))['checkpoint'])
+    state['reason'] = 'agent_paused'
+    service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?', (service.store.seal(state), paused['operation_id']))
+    await manager.pause_agents(['parent'])
+    run = service.store.one('SELECT * FROM chat_runs WHERE id=?', (active['operation_id'],))
+    state = service.store.open(run['checkpoint'])
+    state['mutations']['uncertain-action'] = {'status': 'running', 'tool': 'execute', 'args': ['parent', 'deployVirtualMachine', {'name': 'one'}]}
+    service.store.execute("UPDATE chat_runs SET status='running',checkpoint=? WHERE id=?", (service.store.seal(state), run['id']))
+    history = [ModelRequest(parts=[UserPromptPart('Create only one VM')]), ModelResponse(parts=[ToolCallPart('execute_api', {'command': 'deployVirtualMachine', 'params': {'name': 'one'}}, tool_call_id='old-dispatch')])]
+    service.store.execute('UPDATE conversations SET messages=? WHERE id=?',
+                          (service.store.seal(json.loads(ModelMessagesTypeAdapter.dump_json(history))), active['conversation_id']))
+
+    async def model(messages, info):
+        assert 'uncertain-action' in info.instructions and 'deployVirtualMachine' in info.instructions
+        assert messages[-1].parts[0].part_kind == 'tool-return'
+        assert 'Outcome unknown' in messages[-1].parts[0].content
+        entered.set()
+        yield 'Inspected saved state and continued'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    tasks = list(restarted.active.values())
+    assert len(tasks) == 1
+    await asyncio.wait_for(asyncio.gather(*tasks), 2)
+    assert entered.is_set() and not service.executions
+    assert service.store.one('SELECT status FROM chat_runs WHERE id=?', (active['operation_id'],))['status'] == 'completed'
+    assert service.store.one('SELECT status FROM chat_runs WHERE id=?', (stopped['operation_id'],))['status'] == 'interrupted'
+
+
+async def test_long_task_has_no_request_or_tool_budget(service, monkeypatch):
+    async def model(messages, info):
+        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+        if count == 65:
+            yield 'All 65 steps completed'
+        else:
+            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps({'command': 'listVirtualMachines', 'params': {'page': count}}), tool_call_id=f'step-{count}')}
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    result = await manager.chat({'userid': 'human'}, 'parent', None, 'Inspect every page')
     state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs')['checkpoint'])
-    assert state['reason'] == 'stopped' and state['resumable'] is True
-    assert not manager.active and not manager.running
+    assert result['status'] == 'completed' and len(service.executions) == 65
+    assert state['tool_calls'] == 65 and state['requests'] == 66
+
+
+async def test_uncertain_action_is_reported_to_agent_without_blocking_inspection_or_explicit_retry(service, monkeypatch):
+    from dirigentenstab.cloud import CloudError
+
+    calls = []
+
+    async def execute(agent_id, command, params):
+        calls.append(command)
+        if len(calls) == 1:
+            raise CloudError('Response lost after dispatch')
+        if command == 'listVirtualMachines':
+            return {'virtualmachine': [], 'verified_no_submission': True}
+        return {'virtualmachine': {'id': 'created-on-explicit-retry'}}
+
+    async def model(messages, info):
+        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+        if count == 3:
+            yield 'Verified retry complete'
+        else:
+            command, params = ('listVirtualMachines', {}) if count == 1 else ('deployVirtualMachine', {'name': 'one'})
+            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps({'command': command, 'params': params}), tool_call_id=f'recovery-{count}')}
+
+    service.execute = execute
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Create one VM')
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs')['checkpoint'])
+    assert result['status'] == 'completed'
+    assert calls == ['deployVirtualMachine', 'listVirtualMachines', 'deployVirtualMachine']
+    assert [item['status'] for item in state['mutations'].values()] == ['uncertain', 'complete']
+
+
+async def test_configuration_pauses_resumes_active_only_and_self_prompt_reloads(service, monkeypatch):
+    import asyncio
+
+    entered = asyncio.Event()
+    manager = runtime.Runtime(service)
+    previous = []
+
+    async def model(messages, info):
+        if 'Updated system prompt' in info.instructions:
+            previous.append('updated')
+            yield 'Continued with new settings'
+        else:
+            yield 'Progress before configuration'
+            entered.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    accepted = await manager.submit({'userid': 'human'}, 'parent', None, 'Keep working')
+    await asyncio.wait_for(entered.wait(), 2)
+    await manager.pause_agents(['parent'])
+    service.store.execute("UPDATE agents SET instructions='Updated system prompt' WHERE id='parent'")
+    await manager.resume_agents(['parent'])
+    await asyncio.wait_for(asyncio.gather(*list(manager.active.values())), 2)
+    assert previous == ['updated']
+    restored = await manager.restore({'userid': 'human'}, accepted['conversation_id'])
+    assert 'Progress before configuration' in str(restored['messages'])
+    assert restored['runs'][-1]['status'] == 'completed'
+
+    async def configure(actor_id, target_id, settings):
+        assert actor_id == target_id == 'parent'
+        if settings is None:
+            return {'agent': {'id': target_id}, 'providers': [{'id': 'provider', 'name': 'Local'}]}
+        await manager.pause_agents(['parent'])
+        service.store.execute('UPDATE agents SET instructions=? WHERE id=?', (settings['instructions'], target_id))
+        await manager.resume_agents(['parent'])
+        return {'updated': True}
+
+    async def self_edit(messages, info):
+        if 'Self edited prompt' in info.instructions:
+            yield 'New prompt applied'
+        elif messages[-1].parts[0].part_kind == 'tool-return':
+            assert messages[-1].parts[0].content['providers'][0]['id'] == 'provider'
+            yield {0: DeltaToolCall(name='configure_agent', json_args=json.dumps({'target_agent_id': 'parent', 'settings': {'instructions': 'Self edited prompt'}}), tool_call_id='self-edit')}
+        else:
+            yield {0: DeltaToolCall(name='configure_agent', json_args=json.dumps({'target_agent_id': 'parent'}), tool_call_id='inspect-config')}
+
+    service.configure_agent = configure
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=self_edit))
+    result = await asyncio.wait_for(manager.chat({'userid': 'human'}, 'parent', None, 'Update your prompt'), 2)
+    assert result['output'] == 'New prompt applied'
+
+
+async def test_agent_pause_is_durable_and_not_resumed_by_start(service, monkeypatch):
+    async def model(messages, info):
+        yield {0: DeltaToolCall(name='pause_work', json_args='{"reason":"Need the owner to provide a guest credential"}', tool_call_id='pause')}
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    result = await manager.chat({'userid': 'human'}, 'parent', None, 'Inspect guest')
+    assert result['status'] == 'interrupted' and 'guest credential' in result['output']
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    assert not restarted.active
+    restored = await restarted.restore({'userid': 'human'}, result['conversation_id'])
+    assert restored['runs'][-1]['budget']['reason'] == 'agent_paused'
+
+
+async def test_gpu_uncertain_outcome_is_inspected_without_a_human_session(service, monkeypatch):
+    from dirigentenstab.gpu import GPU_CONTEXT, operation_id
+    from dirigentenstab.diagnostics import OperationError
+
+    calls, inspections = [], []
+    service.settings.gpu_helper_socket = '/fixture-only'
+
+    async def execute(*args, **kwargs):
+        calls.append(GPU_CONTEXT.get())
+        raise OperationError('gpu', 'Lost GPU response', 'gpu-reference', reconciliation=True)
+
+    async def result(settings, action, **payload):
+        inspections.append(action)
+        assert payload == {'session': None, 'run_id': calls[0]['run_id'],
+                           'operation_id': operation_id({'run_id': calls[0]['run_id'], 'call_id': 'gpu-lost'}),
+                           **({'active_run_id': calls[0]['run_id']} if action == 'recover' else {})}
+        return {'phase': 'preparing' if action == 'result' else 'completed', 'command': 'deployVirtualMachine',
+                'params': {'templateid': 'gpu'}, 'result': {'virtualmachine': {'id': 'gpu-created'}}}
+
+    async def model(messages, info):
+        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+        if count == 0:
+            name, args = 'execute_api', {'command': 'deployVirtualMachine', 'params': {'templateid': 'gpu'}, 'managed': True}
+        elif count == 1:
+            name, args = 'execution_state', {}
+        elif count == 2:
+            saved = messages[-1].parts[0].content['actions']
+            action = next(iter(saved.values()))
+            assert action['inspection']['phase'] == 'preparing'
+            name, args = 'recover_operation', {'operation_id': action['gpu_operation_id']}
+        else:
+            assert messages[-1].parts[0].content['phase'] == 'completed'
+            yield 'Reused the GPU controller result'
+            return
+        yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id='gpu-lost' if count == 0 else f'check-{count}')}
+
+    service.execute = execute
+    monkeypatch.setattr(runtime, 'helper_call', result)
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human', '_session': 'expired'}, 'parent', None, 'Prepare GPU VM')
+    assert result['status'] == 'completed' and len(calls) == 1
+    assert calls[0]['session'] is None and inspections == ['result', 'recover']
+
+
+async def test_stop_before_worker_starts_is_durable_across_restart(service, monkeypatch):
+    def forbidden(*args):
+        pytest.fail('An explicitly stopped execution must never dispatch')
+
+    monkeypatch.setattr(runtime, 'build_model', forbidden)
+    manager = runtime.Runtime(service)
+    run = await manager.submit({'userid': 'human'}, 'parent', None, 'Do not dispatch yet')
+    assert (await manager.stop({'userid': 'human'}, run['operation_id']))['status'] == 'interrupted'
+    assert not manager.active
+    restarted = runtime.Runtime(service)
+    await restarted.start()
+    assert not restarted.active
+    state = service.store.open(service.store.one('SELECT checkpoint FROM chat_runs')['checkpoint'])
+    assert state['reason'] == 'stopped'
+
+
+async def test_new_instruction_recovers_gpu_action_from_previous_run_with_current_authority(service, monkeypatch):
+    import asyncio
+    from dirigentenstab.gpu import GPU_CONTEXT, operation_id
+
+    dispatched = asyncio.Event()
+    old_context, recovery = {}, []
+    service.settings.gpu_helper_socket = '/fixture-only'
+
+    async def execute(*args, **kwargs):
+        old_context.update(GPU_CONTEXT.get())
+        dispatched.set()
+        await asyncio.Event().wait()
+
+    async def inspect(settings, action, **payload):
+        assert payload['run_id'] == old_context['run_id'] and payload['session'] is None
+        assert payload['operation_id'] == operation_id({'run_id': old_context['run_id'], 'call_id': 'original-gpu'})
+        if action == 'recover':
+            recovery.append(payload['active_run_id'])
+            assert payload['active_run_id'] != old_context['run_id']
+        return {'phase': 'preparing' if action == 'result' else 'completed', 'command': 'deployVirtualMachine',
+                'params': {'templateid': 'gpu'}, 'result': {'virtualmachine': {'id': 'recovered-gpu'}}}
+
+    async def model(messages, info):
+        latest = [p.content for m in messages for p in m.parts if isinstance(p, UserPromptPart)][-1]
+        if latest == 'Start GPU work':
+            name, args, call_id = 'execute_api', {'command': 'deployVirtualMachine', 'params': {'templateid': 'gpu'}, 'managed': True}, 'original-gpu'
+        else:
+            latest_parts = messages[-1].parts
+            if any(p.part_kind == 'tool-return' and p.tool_name == 'recover_operation' for p in latest_parts):
+                yield 'Recovered previous operation'
+                return
+            if any(p.part_kind == 'tool-return' and p.tool_name == 'execution_state' for p in latest_parts):
+                saved = latest_parts[0].content['actions']
+                name, args = 'recover_operation', {'operation_id': next(iter(saved.values()))['gpu_operation_id']}
+            else:
+                name, args = 'execution_state', {}
+            call_id = name
+        yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=call_id)}
+
+    service.execute = execute
+    monkeypatch.setattr(runtime, 'helper_call', inspect)
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    original = await manager.submit({'userid': 'human'}, 'parent', None, 'Start GPU work')
+    await asyncio.wait_for(dispatched.wait(), 2)
+    result = await asyncio.wait_for(manager.chat({'userid': 'human'}, 'parent', original['conversation_id'], 'Continue after interruption'), 2)
+    assert result['status'] == 'completed' and recovery == [result['operation_id']]
+
+
+async def test_subgroup_tool_can_narrow_inherited_provider_server_and_tool_selections(service, monkeypatch):
+    selected = {'enabled_providers': ['provider'], 'enabled_mcp_servers': ['search'], 'mcp_tools': {'search': ['find']}}
+    observed = []
+
+    async def subgroup(agent_id, name, model, instructions, **selections):
+        observed.append((agent_id, name, selections))
+        return {'id': 'new-child'}
+
+    async def model(messages, info):
+        if messages[-1].parts[0].part_kind == 'tool-return':
+            yield 'Subgroup created with selected access'
+        else:
+            yield {0: DeltaToolCall(name='create_subgroup', json_args=json.dumps({'name': 'Restricted', **selected}), tool_call_id='create')}
+
+    service.create_subgroup = subgroup
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Create restricted subgroup')
+    assert result['status'] == 'completed' and observed == [('parent', 'Restricted', selected)]

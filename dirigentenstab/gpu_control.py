@@ -407,9 +407,20 @@ class Controller:
         self.journal.phase(op['id'], 'completed', result)
         return result
 
-    async def owned_result(self, request):
-        actor = await self.human(request['session'], platform=False)
-        run = self.service.store.one('SELECT r.agent_id,c.human_id FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
+    async def execution_actor(self, request):
+        if request['session']:
+            return await self.human(request['session'], platform=False)
+        run_id = (request.get('context') or {}).get('run_id') or request.get('run_id')
+        run = self.service.store.one('SELECT r.agent_id,c.human_id FROM chat_runs r '
+                                     'JOIN conversations c ON c.id=r.conversation_id WHERE r.id=?', (run_id,))
+        if not run or request.get('agent_id', run['agent_id']) != run['agent_id']:
+            raise PermissionError('GPU operation requires a durable agent conversation')
+        # Only the authenticated backend reaches this socket; native keys remain the action authority.
+        return await self.service.execution_identity(run['agent_id'], run['human_id'])
+
+    async def owned_result(self, request, *, recover=False):
+        actor = await self.execution_actor(request)
+        run = self.service.store.one('SELECT r.agent_id,r.conversation_id,c.human_id FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id '
                                      'WHERE r.id=?', (request['run_id'],))
         rows = self.journal.rows('SELECT * FROM operations WHERE id=?', (request['operation_id'],))
         if not run or run['human_id'] != actor['userid'] or not rows:
@@ -419,15 +430,24 @@ class Controller:
         original = json.loads(op['request'])
         if original['context']['run_id'] != request['run_id'] or original['agent_id'] != run['agent_id']:
             raise PermissionError('GPU operation agent or conversation identity mismatch')
+        if recover:
+            active = self.service.store.one('SELECT agent_id,conversation_id,status FROM chat_runs WHERE id=?',
+                                             (request['active_run_id'],))
+            if (not active or active['agent_id'] != run['agent_id'] or active['conversation_id'] != run['conversation_id']
+                    or active['status'] != 'running'):
+                raise PermissionError('GPU recovery requires an active instruction in the same agent conversation')
         if op['phase'] not in {'completed', 'failed'}:
             if op['phase'] == 'preparing':
-                raise RuntimeError('A platform administrator must resume the saved pre-dispatch GPU plan first')
-            await self.reconcile(op)
+                if not recover:
+                    return {'phase': 'preparing', 'result': None, 'command': original['command'], 'params': original['params']}
+                await self.execute(original, actor=actor, recovery_run_id=request['active_run_id'])
+            else:
+                await self.reconcile(op)
             op = self.journal.rows('SELECT * FROM operations WHERE id=?', (op['id'],))[0]
         return {'phase': op['phase'], 'result': json.loads(op['result']) if op['result'] else {'rejected': True},
                 'command': original['command'], 'params': original['params']}
 
-    async def execute(self, request, preflight=False, *, actor=None):
+    async def execute(self, request, preflight=False, *, actor=None, recovery_run_id=None):
         command, params = request['command'], request['params']
         if command not in GPU_COMMANDS:
             raise PermissionError('GPU controller operation is not allowed')
@@ -435,9 +455,13 @@ class Controller:
         if (not isinstance(context, dict) or set(context) != {'run_id', 'call_id'}
                 or not isinstance(context['call_id'], str) or len(context['call_id']) > 256):
             raise PermissionError('GPU operation context is invalid')
-        run = self.service.store.one('SELECT r.agent_id,r.status,c.human_id FROM chat_runs r '
+        run = self.service.store.one('SELECT r.agent_id,r.status,r.conversation_id,c.human_id FROM chat_runs r '
                                      'JOIN conversations c ON c.id=r.conversation_id WHERE r.id=?', (context['run_id'],))
-        if not run or run['agent_id'] != request['agent_id'] or run['status'] not in {'running', 'reconciliation'}:
+        active = self.service.store.one('SELECT agent_id,conversation_id,status FROM chat_runs WHERE id=?',
+                                         (recovery_run_id,)) if recovery_run_id else run
+        if (not run or run['agent_id'] != request['agent_id'] or not active
+                or active['agent_id'] != run['agent_id'] or active['conversation_id'] != run['conversation_id']
+                or active['status'] not in ({'running'} if recovery_run_id else {'running', 'reconciliation'})):
             raise PermissionError('GPU request does not belong to this durable server-side agent execution')
         if actor is not None and run['human_id'] != actor['userid']:
             raise PermissionError('GPU execution does not belong to this human conversation owner')
@@ -570,15 +594,16 @@ class Controller:
                    'offering': {'session', 'domain_id', 'profile', 'cpus', 'memory', 'root_disk'},
                    'execute': {'session', 'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
                    'resume': {'session', 'operation_id'}, 'authorize': {'session', 'agent_id', 'command', 'params', 'context'},
-                   'result': {'session', 'operation_id', 'run_id'}}
+                   'result': {'session', 'operation_id', 'run_id'},
+                   'recover': {'session', 'operation_id', 'run_id', 'active_run_id'}}
         action = request.get('action')
         if action not in actions or set(request) != actions[action] | {'action'}:
             raise PermissionError('GPU controller request contains unauthorized operations or fields')
         if action == 'status':
             return await self.status(request['session'])
         async with self.lock:
-            if action == 'result':
-                return await self.owned_result(request)
+            if action in {'result', 'recover'}:
+                return await self.owned_result(request, recover=action == 'recover')
             if action == 'set_policy':
                 return await self.set_policy(request)
             if action == 'claim':
@@ -595,6 +620,6 @@ class Controller:
                         raise PermissionError('Only a saved pre-dispatch GPU plan may be resumed')
                     return await self.execute(json.loads(rows[0]['request']))
                 return await self.reconcile(rows[0])
-            actor = await self.human(request['session'], platform=False)
+            actor = await self.execution_actor(request)
             await self.service.authorize(actor, request['agent_id'])
             return await self.execute(request, preflight=action == 'authorize', actor=actor)

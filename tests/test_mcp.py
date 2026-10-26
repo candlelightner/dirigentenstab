@@ -75,8 +75,8 @@ async def test_explicit_assignments_inherit_only_narrower_access(environment):
     assert len(bindings) == 1 and bindings[0]['tools'] == ['search']
     await e.mcp.assign(e.root, APP_ROOT_AGENT, server, [])
     assert await e.mcp.bindings(e.child, 'leaf-agent') == []
-    with pytest.raises(PermissionError, match='cannot widen'):
-        await e.mcp.assign(e.child, 'middle-agent', server, ['search'])
+    await e.mcp.assign(e.child, 'middle-agent', server, ['search'])
+    assert await e.mcp.bindings(e.child, 'leaf-agent') == []
 
 
 async def test_server_registration_and_configuration_are_human_domain_scoped(environment):
@@ -212,13 +212,15 @@ def test_migration_preserves_existing_agents(environment):
     for column in ('compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window'):
         e.store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     e.store.execute('ALTER TABLE agents DROP COLUMN thinking')
+    e.store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
+    e.store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     e.store.execute('PRAGMA user_version=10')
     store = Store(str(e.store.path), str(e.key))
     assert {row['id']: row['credentials'] for row in store.all('SELECT id,credentials FROM agents')} == original
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 14
+    assert store.one('PRAGMA user_version')['user_version'] == 15
 
 
 @pytest.mark.parametrize('url', ['https://mcp.tavily.com/mcp', 'https://mcp.tavily.com/mcp/'])
@@ -383,3 +385,126 @@ async def test_discovery_rejects_oversized_catalogue_without_silent_truncation(e
     with pytest.raises(ValueError, match='MCP tool catalogue exceeds the size limit'):
         await e.mcp.discover(e.root, APP_ROOT_AGENT, server)
     assert e.store.all('SELECT * FROM mcp_assignments') == []
+
+
+def native_actor_clients(e):
+    """Native scope for accepted agent work; browser sessions are deliberately absent."""
+    revoked = set()
+    class Native:
+        def __init__(self, agent):
+            self.agent = agent
+        async def raw(self, command, params):
+            if self.agent['id'] in revoked:
+                raise PermissionError('Native credential revoked')
+            assert command == 'listDomains'
+            visible = {self.agent['domain_id']}
+            while children := {d['id'] for d in e.domains.values() if d.get('parentdomainid') in visible} - visible:
+                visible |= children
+            return {'domain': [d for d in e.domains.values() if d['id'] in visible
+                               and (not params.get('id') or d['id'] == params['id'])]}
+    async def client(agent):
+        return Native(agent)
+    e.service.cloud_client = client
+    return revoked
+
+
+async def test_provider_and_compaction_access_is_inherited_and_preserves_stored_selections(environment):
+    e = environment
+    native_actor_clients(e)
+    for name in ('main-provider', 'summary-provider'):
+        await e.service.save_provider(e.root, name, 'chat', 'http://localhost/v1', 'secret', provider_id=name)
+    await e.service.update_agent(e.root, APP_ROOT_AGENT, 'main-provider', 'main-model', '',
+                                 enabled_providers=['main-provider', 'summary-provider'])
+    await e.service.update_agent(e.root, 'middle-agent', 'main-provider', 'main-model', '',
+                                 enabled_providers=['main-provider', 'summary-provider'])
+    await e.service.update_agent(e.root, 'leaf-agent', 'main-provider', 'main-model', '',
+                                 compaction_provider_id='summary-provider', compaction_model='summary',
+                                 auto_compact_percent=80, enabled_providers=['main-provider', 'summary-provider'])
+    actor = await e.service.execution_identity('leaf-agent', 'human-root')
+    assert {p['id'] for p in await e.service.providers(actor)} == {'main-provider', 'summary-provider'}
+    await e.service.update_agent(e.root, APP_ROOT_AGENT, 'main-provider', 'main-model', '', enabled_providers=[])
+    assert await e.service.providers(actor) == []
+    # Saving an unchanged selection while its ancestor disables access retains that selection.
+    await e.service.update_agent(e.root, 'leaf-agent', 'main-provider', 'main-model', 'Updated prompt',
+                                 enabled_providers=['main-provider', 'summary-provider'])
+    assert e.service.selected_providers(await e.service.agent('leaf-agent')) == {'main-provider', 'summary-provider'}
+    await e.service.update_agent(e.root, APP_ROOT_AGENT, 'main-provider', 'main-model', '',
+                                 enabled_providers=['main-provider', 'summary-provider'])
+    assert {p['id'] for p in await e.service.providers(actor)} == {'main-provider', 'summary-provider'}
+
+
+async def test_agent_configuration_enforces_self_parent_and_central_authority(environment):
+    e = environment
+    revoked = native_actor_clients(e)
+    await e.service.save_provider(e.root, 'Local', 'chat', 'http://localhost/v1', '', provider_id='local')
+    await e.service.configure_agent('middle-agent', 'middle-agent', {'instructions': 'Self-edited prompt'})
+    assert (await e.service.agent('middle-agent'))['instructions'] == 'Self-edited prompt'
+    for settings in ({'model': 'new-model'}, {'enabled_providers': []}, {'enabled_mcp_servers': []}, {'thinking': 'high'}):
+        with pytest.raises(PermissionError, match='own system prompt'):
+            await e.service.configure_agent('middle-agent', 'middle-agent', settings)
+    await e.service.configure_agent('middle-agent', 'leaf-agent', {'provider_id': 'local', 'model': 'local-model'})
+    assert (await e.service.agent('leaf-agent'))['model'] == 'local-model'
+    actor = await e.service.execution_identity(APP_ROOT_AGENT, 'human-root')
+    with pytest.raises(PermissionError):
+        await e.service.save_provider(actor, 'Secret', 'chat', 'http://localhost/v1', 'credential')
+    with pytest.raises(PermissionError):
+        await e.mcp.save_server(actor, 'Secret', 'https://localhost/mcp', 'credential')
+    with pytest.raises(PermissionError):
+        await e.service.configure_agent('leaf-agent', 'middle-agent', {'instructions': 'Escape'})
+    revoked.add('leaf-agent')
+    with pytest.raises(PermissionError, match='revoked'):
+        await e.service.execution_identity('leaf-agent', 'human-root')
+
+
+async def test_agent_server_toggle_retains_tools_and_descendant_selections(environment):
+    e = environment
+    native_actor_clients(e)
+    server = await configured(e)
+    await e.mcp.set_enabled(e.root, APP_ROOT_AGENT, server, False)
+    assert await e.mcp.bindings(e.child, 'leaf-agent') == []
+    config = await e.mcp.configuration(e.child, 'leaf-agent')
+    assert config['servers'][0]['tools'] == ['search']
+    assert config['servers'][0]['agent_enabled'] is True
+    assert config['servers'][0]['server_allowed'] is False
+    await e.mcp.set_enabled(e.root, APP_ROOT_AGENT, server, True)
+    assert (await e.mcp.bindings(e.child, 'leaf-agent'))[0]['tools'] == ['search']
+    actor = await e.service.execution_identity('middle-agent', 'human-root')
+    with pytest.raises(PermissionError, match='ancestor'):
+        await e.mcp.set_enabled(actor, 'middle-agent', server, False)
+    await e.mcp.set_enabled(actor, 'leaf-agent', server, False)
+    assert e.mcp._tools('leaf-agent', server) == {'search'}
+    await e.mcp.set_enabled(actor, 'leaf-agent', server, True)
+    assert (await e.mcp.bindings(e.child, 'leaf-agent'))[0]['tools'] == ['search']
+
+
+async def test_inherited_changes_pause_current_native_descendants_only(environment):
+    e = environment
+    native_actor_clients(e)
+    calls = []
+    class Runtime:
+        async def pause_agents(self, ids):
+            calls.append(('pause', set(ids)))
+        async def resume_agents(self, ids):
+            calls.append(('resume', set(ids)))
+    e.service.runtime = Runtime()
+    # The native hierarchy can change independently of the hub's provisioning history.
+    e.domains['leaf']['parentdomainid'] = 'other'
+    e.domains['leaf']['level'] = 2
+    await e.service.update_agent(e.root, APP_ROOT_AGENT, None, '', 'New prompt', enabled_providers=[])
+    assert calls == [('pause', {APP_ROOT_AGENT, 'middle-agent'}), ('resume', {APP_ROOT_AGENT, 'middle-agent'})]
+
+
+async def test_agent_can_inspect_own_and_descendant_settings_without_exposing_credentials(environment):
+    e = environment
+    native_actor_clients(e)
+    server = await configured(e)
+    await e.service.save_provider(e.root, 'Local', 'chat', 'http://localhost/v1', 'provider-secret',
+                                  default_model='local-default', provider_id='local')
+    own = await e.service.configure_agent('middle-agent', 'middle-agent')
+    child = await e.service.configure_agent('middle-agent', 'leaf-agent')
+    assert own['agent']['id'] == 'middle-agent' and child['agent']['id'] == 'leaf-agent'
+    assert child['providers'][0]['id'] == 'local' and child['providers'][0]['default_model'] == 'local-default'
+    assert child['mcp_servers'][0]['id'] == server and child['mcp_servers'][0]['tools'] == ['search']
+    assert not any(secret in json.dumps(child) for secret in ('private-bearer-token', 'provider-secret', 'credentials', 'api_key'))
+    with pytest.raises(PermissionError):
+        await e.service.configure_agent('leaf-agent', 'middle-agent')

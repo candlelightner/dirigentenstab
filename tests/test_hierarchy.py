@@ -44,20 +44,9 @@ def test_varchar_limits_are_characters_not_utf8_bytes():
         validate_child(domain('ROOT', 0), 'é' * 254)
 
 
-def test_maximum_depth_uses_cloudstack_absolute_level_root_zero():
-    validate_child(domain('ROOT/' + '/'.join(['a'] * 9), 9), 'child', 10)
-    with pytest.raises(ValueError, match='10 levels below ROOT'):
-        validate_child(domain('ROOT/' + '/'.join(['a'] * 10), 10), 'child', 10)
-    validate_child(domain('ROOT', 0), 'Agents', 1)
-    with pytest.raises(ValueError, match='1 levels below ROOT'):
-        validate_child(domain('ROOT/Agents', 1), 'Research', 1)
-    validate_child(domain('ROOT/' + '/'.join(['a'] * 10), 10), 'child', 11)
-
-
-@pytest.mark.parametrize('value', [None, False, True, 0, -1, 10.0, '10'])
-def test_invalid_depth_configuration_fails_closed(value):
-    with pytest.raises(ValueError, match='positive integer'):
-        validate_child(domain('ROOT', 0), 'child', value)
+def test_native_paths_are_allowed_beyond_the_former_local_depth_cap():
+    validate_child(domain('ROOT/' + '/'.join(['a'] * 10), 10), 'child')
+    validate_child(domain('ROOT/' + '/'.join(['a'] * 50), 50), 'child')
 
 
 @pytest.mark.parametrize('parent', [

@@ -49,7 +49,7 @@ async def test_managed_config_unique_nonroot_credentials_and_hostkey_pin(guest):
     cloudinit = json.loads(config.split('\n', 1)[1])
     assert cloudinit['users'][0]['name'] == 'dirigent'
     assert not cloudinit['ssh_pwauth'] and cloudinit['disable_root']
-    assert 'sudo' not in cloudinit['users'][0]
+    assert cloudinit['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
     assert record['private_key'] != second['private_key']
     assert record['host_key'] != second['host_key'] and config != second_config
     assert record['private_key'].startswith(b'gAAAA')
@@ -71,7 +71,7 @@ async def test_backend_workspace_setup_only_initializes_the_new_guest_data_disk(
     assert not config['fs_setup'][0]['overwrite']
     assert config['mounts'] == [['LABEL=workspace', '/home/dirigent/workspace', 'ext4', 'defaults,nofail', '0', '2']]
     assert config['runcmd'] == [['chown', 'dirigent:dirigent', '/home/dirigent/workspace']]
-    assert 'sudo' not in config['users'][0]
+    assert config['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
 
 
 async def test_missing_hostkey_fails_closed_and_paths_never_escape_workspace(guest, tmp_path):
@@ -219,10 +219,37 @@ async def test_approved_large_asset_uses_pinned_sftp_without_raising_workspace_l
         assets.chmod(0o755)
 
 
-async def test_guest_admin_is_explicit_template_capability(guest):
+async def test_guest_admin_is_the_default_for_new_managed_guests(guest):
     plain, _ = await guest.prepare_vm_config('agent')
     approved, _ = await guest.prepare_vm_config('agent', guest_admin=True)
-    assert 'sudo' not in json.loads(plain.split('\n', 1)[1])['users'][0]
+    assert json.loads(plain.split('\n', 1)[1])['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
     configured = json.loads(approved.split('\n', 1)[1])
     assert configured['users'][0]['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
     assert configured['users'][0]['name'] != 'root' and configured['disable_root']
+
+
+async def test_new_guest_enrollment_adds_central_owner_public_key_without_private_key(guest):
+    owner = asyncssh.generate_private_key('ssh-ed25519')
+    public = owner.export_public_key().decode().strip()
+    guest.service.store.execute("INSERT INTO platform_settings VALUES('owner_ssh_public_key',?)", (public,))
+    config, _ = await guest.prepare_vm_config('agent')
+    user = json.loads(config.split('\n', 1)[1])['users'][0]
+    assert public in user['ssh_authorized_keys'] and len(user['ssh_authorized_keys']) == 2
+    assert user['sudo'] == ['ALL=(ALL) NOPASSWD:ALL']
+    assert owner.export_private_key().decode() not in config
+
+
+async def test_ancestor_guest_access_uses_the_acting_native_identity_and_existing_host_pin(guest):
+    _, record = await guest.prepare_vm_config('agent')
+    guest.persist_vm_access('agent', 'vm', record)
+    actors = []
+    async def execute(agent_id, command, params):
+        actors.append(agent_id)
+        assert command == 'listVirtualMachines' and params == {'id': 'vm'}
+        return {'virtualmachine': [guest.service.vm]} if agent_id == 'parent' else {}
+    guest.service.execute = execute
+    address, saved = await guest._target('parent', 'vm')
+    assert address == '10.50.0.2' and saved['owner_agent'] == 'agent' and saved['host_key'] == record['host_key']
+    with pytest.raises(PermissionError, match='not accessible'):
+        await guest._target('sibling', 'vm')
+    assert actors == ['parent', 'sibling']

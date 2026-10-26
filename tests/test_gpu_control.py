@@ -162,10 +162,16 @@ async def controller(tmp_path):
         human_type = 1
         gpu_local = False
         async def agent(self, aid):
-            value = store.one('SELECT * FROM agents WHERE id=?', (aid,))
+            value = store.one('SELECT * FROM agents WHERE id=? AND enabled=1', (aid,))
             if not value:
                 raise PermissionError('Unknown agent')
             return value
+        async def execution_identity(self, aid, human_id):
+            agent = await self.agent(aid)
+            result = await (await self.cloud_client(agent)).raw('listDomains', {'id': agent['domain_id']})
+            if not any(domain['id'] == agent['domain_id'] for domain in result.get('domain', [])):
+                raise PermissionError('Native authority revoked')
+            return {'_agent_id': aid, 'userid': human_id, 'domainid': agent['domain_id'], 'type': 2}
         async def cloud_client(self, agent):
             return Scoped(native, agent['domain_id'])
         async def authorize(self, identity, aid):
@@ -563,3 +569,77 @@ async def test_controller_result_is_bound_to_the_original_human_and_agent(contro
     with pytest.raises(PermissionError):
         await controller.dispatch({'action': 'result', 'session': 'human-session',
             'operation_id': operation_id(saved['context']), 'run_id': 'run-child'}, 10001)
+
+
+async def test_accepted_gpu_work_continues_without_a_human_session(controller):
+    controller.service.store.execute('DELETE FROM sessions')
+    payload = {**request('background'), 'session': None}
+    result = await controller.dispatch(payload, 10001)
+    assert result['virtualmachine']['state'] == 'Running'
+    response = await controller.dispatch({'action': 'result', 'session': None,
+        'operation_id': operation_id(payload['context']), 'run_id': payload['context']['run_id']}, 10001)
+    assert response['phase'] == 'completed'
+    with pytest.raises(PermissionError, match='human platform'):
+        await controller.dispatch({'action': 'set_policy', 'session': None, 'domain_id': MAIN,
+                                   'policy': policy(100)}, 10001)
+
+
+@pytest.mark.parametrize('revocation', ['disabled-agent', 'stopped-run', 'wrong-agent', 'untrusted-peer'])
+async def test_background_gpu_work_keeps_agent_run_and_socket_authority(controller, revocation):
+    controller.service.store.execute('DELETE FROM sessions')
+    payload = {**request('revoked-background'), 'session': None}
+    peer = 10001
+    if revocation == 'disabled-agent':
+        controller.service.store.execute('UPDATE agents SET enabled=0 WHERE id=?', (APP_ROOT_AGENT,))
+    elif revocation == 'stopped-run':
+        controller.service.store.execute("UPDATE chat_runs SET status='interrupted'")
+    elif revocation == 'wrong-agent':
+        payload['agent_id'] = 'child'
+    else:
+        peer = 12345
+    with pytest.raises(PermissionError):
+        await controller.dispatch(payload, peer)
+    assert not controller.host.calls and not controller.cloud.vms
+
+
+async def test_background_agent_explicitly_recovers_saved_preparation_without_status_replay(controller):
+    payload = {**request('background-preparation'), 'session': None}
+    controller.host.fail_once = True
+    with pytest.raises(RuntimeError):
+        await controller.dispatch(payload, 10001)
+    controller.service.store.execute('DELETE FROM sessions')
+    inspection = {'session': None, 'operation_id': operation_id(payload['context']), 'run_id': payload['context']['run_id']}
+    response = await controller.dispatch({'action': 'result', **inspection}, 10001)
+    assert response['phase'] == 'preparing' and not controller.cloud.vms
+    response = await controller.dispatch({'action': 'recover', 'active_run_id': payload['context']['run_id'], **inspection}, 10001)
+    assert response['phase'] == 'completed'
+    assert len(controller.host.items) == 1 and len(controller.cloud.vms) == 1
+
+
+@pytest.mark.parametrize('active_scope', ['same-conversation', 'stopped', 'different-conversation'])
+async def test_gpu_preparation_recovery_keeps_original_identity_and_requires_current_instruction(controller, active_scope):
+    payload = {**request('prior-instruction'), 'session': None}
+    controller.host.fail_once = True
+    with pytest.raises(RuntimeError):
+        await controller.dispatch(payload, 10001)
+    store = controller.service.store
+    original_run = payload['context']['run_id']
+    store.execute("UPDATE chat_runs SET status='interrupted' WHERE id=?", (original_run,))
+    conversation = 'conversation-' + APP_ROOT_AGENT
+    if active_scope == 'different-conversation':
+        conversation = 'different-conversation'
+        store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                      (conversation, APP_ROOT_AGENT, 'human', 'Other task', 1, store.seal([])))
+    store.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
+                  ('new-run', conversation, 'interrupted' if active_scope == 'stopped' else 'running',
+                   APP_ROOT_AGENT, 2, 2, store.seal([])))
+    recovery = {'action': 'recover', 'session': None, 'operation_id': operation_id(payload['context']),
+                'run_id': original_run, 'active_run_id': 'new-run'}
+    if active_scope == 'same-conversation':
+        result = await controller.dispatch(recovery, 10001)
+        assert result['phase'] == 'completed' and len(controller.cloud.vms) == 1
+        assert store.one('SELECT status FROM chat_runs WHERE id=?', (original_run,))['status'] == 'interrupted'
+    else:
+        with pytest.raises(PermissionError, match='active instruction'):
+            await controller.dispatch(recovery, 10001)
+        assert not controller.cloud.vms

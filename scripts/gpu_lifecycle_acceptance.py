@@ -168,18 +168,14 @@ async def acceptance(options):
             async with asyncio.timeout(3600):
                 while True:
                     run = app.store.one('SELECT * FROM chat_runs WHERE id=?', (state['operation_id'],))
-                    checkpoint = app.store.open(run['checkpoint']) if run['checkpoint'] else {}
-                    if run['status'] == 'interrupted' and checkpoint.get('resumable'):
-                        await page.get_by_role('button', name='Continue saved task', exact=True).click()
-                        await asyncio.sleep(2)
-                    elif run['status'] != 'running':
+                    if run['status'] != 'running':
                         break
                     await asyncio.sleep(1)
             state['status'] = run['status']
             save(state)
             await page.locator('.q-message').first.wait_for(timeout=60000)
             if run['status'] == 'completed':
-                await page.get_by_text('Completed', exact=True).wait_for(timeout=60000)
+                await page.locator('[data-operation-id="' + run['id'] + '"]').filter(has_text='Completed').wait_for(timeout=60000)
             for width, height, name in [(1440, 900, 'desktop'), (390, 844, 'mobile')]:
                 await page.set_viewport_size({'width': width, 'height': height})
                 if width == 390:

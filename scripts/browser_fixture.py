@@ -122,7 +122,9 @@ class FixtureCloud(Cloud):
 
     async def catalogue(self, *, refresh=False):
         return {'listVirtualMachines': {'name': 'listVirtualMachines', 'description': 'List authorized guest VMs',
-                                        'params': [], 'isasync': False, 'response': []}}
+                                        'params': [{'name': 'listall', 'type': 'boolean', 'required': False}], 'isasync': False, 'response': []},
+                **{name: {'name': name, 'params': [], 'isasync': False, 'response': []}
+                   for name in ('createDomain', 'createAccount', 'registerUserKeys')}}
 
 
 class FixtureService(Service):
@@ -157,7 +159,11 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'stop fixture' in prompt:
+    if 'background fixture' in prompt:
+        yield 'Background work accepted.'
+        await asyncio.sleep(2)
+        yield ' Background work completed.'
+    elif 'stop fixture' in prompt:
         yield 'Partial reply retained'
         await asyncio.sleep(60)
         yield 'This response should be stopped'
@@ -254,12 +260,9 @@ def main():
 
     MCP.discover = discover_mcp
     auth = Auth(service)
-    runtime_module.REQUESTS_PER_WINDOW = 2
-    runtime_module.TOOLS_PER_WINDOW = 2
-    runtime_module.AUTOMATIC_WINDOWS = 1
     runtime_module.build_model = lambda *args: FunctionModel(stream_function=fake_model)
     attach(app, auth, settings)
-    build_ui(service, auth)
+    app.on_startup(build_ui(service, auth).start)
     key_file, cert_file = certificate(args.state_dir)
     ui.run(host='127.0.0.1', port=args.port, title='Dirigentenstab browser fixture', reload=False, show=False,
            show_welcome_message=False, ssl_keyfile=key_file, ssl_certfile=cert_file)

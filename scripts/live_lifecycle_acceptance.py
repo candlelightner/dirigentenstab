@@ -65,8 +65,8 @@ async def perform(options):
                               'assert 6*7 == 42; print("DIRIGENTENSTAB_LIFECYCLE_OK=42"), run it with python3 and verify '
                               'exit code zero and that exact output. Verify the guest user is non-root. Then stop ONLY '
                               'this new disposable VM and report its ID and evidence. Do not modify any existing VM, '
-                              'domain, account or host configuration. If a budget window ends, continue saved progress '
-                              'rather than deploying again.')
+                              'domain, account or host configuration. Preserve saved progress after interruptions; '
+                              'inspect uncertain outcomes rather than deploying again.')
                     await page.get_by_label('Message', exact=True).fill(prompt)
                     await page.get_by_role('button', name='Send', exact=True).click()
                     for _ in range(60):
@@ -82,19 +82,13 @@ async def perform(options):
             if options.resume:
                 await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
                 await page.get_by_role('option', name=conversation['title'], exact=True).first.click()
-            continuations = 0
             deadline = time.monotonic() + 2000
             while time.monotonic() < deadline:
                 run = app.store.one('SELECT * FROM chat_runs WHERE id=?', (state['operation_id'],))
                 checkpoint = app.store.open(run['checkpoint']) if run['checkpoint'] else {}
                 if run['status'] == 'completed':
                     break
-                if run['status'] == 'interrupted' and checkpoint.get('resumable'):
-                    assert continuations < 3, 'Acceptance continuation bound reached; inspect saved progress'
-                    await page.get_by_role('button', name='Continue saved task', exact=True).click()
-                    continuations += 1
-                    await asyncio.sleep(2)
-                elif run['status'] != 'running':
+                if run['status'] != 'running':
                     raise AssertionError({k: run[k] for k in ('id', 'status', 'category', 'tool')})
                 await asyncio.sleep(1)
             else:
@@ -125,7 +119,7 @@ async def perform(options):
             await page.wait_for_function('window.socket?.connected && window.did_handshake')
             await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
             await page.get_by_role('option', name=conversation['title'], exact=True).first.click()
-            await page.get_by_text('Completed · Reference: ' + run['id'], exact=True).wait_for()
+            await page.locator('[data-operation-id="' + run['id'] + '"]').filter(has_text='Completed').wait_for()
             await page.set_viewport_size({'width': 390, 'height': 844})
             await page.wait_for_timeout(400)
             await page.screenshot(path=str(options.output / 'lifecycle-mobile.png'), full_page=True)

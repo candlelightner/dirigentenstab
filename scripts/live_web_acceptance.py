@@ -79,7 +79,7 @@ async def perform(options):
             title = app.store.one('SELECT title FROM conversations WHERE id=?', (subgroup['conversation_id'],))['title']
             await page.get_by_label('Conversation', exact=True).fill(title)
             await page.get_by_role('option', name=title, exact=True).click()
-            await page.get_by_text('Completed · Reference: ' + subgroup['id'], exact=True).wait_for()
+            await page.locator('[data-operation-id="' + subgroup['id'] + '"]').filter(has_text='Completed').wait_for()
             original_events = app.store.open(inventory['events'])
             original_counts = {target: next((int(e['summary'].split()[0]) for e in reversed(original_events)
                                if e['type'] == 'tool_result' and e.get('target') == target and
@@ -94,10 +94,10 @@ async def perform(options):
             receipt['inventory_run'] = inventory['id']
             subgroup, events = await send(
                 'Create a new subgroup named Sandbox under your own domain, provision its administrative agent, '
-                'and verify that the new agent can list its own CloudStack domain but cannot access or administer '
-                'unrelated domains. Do not create any VMs. Use create_subgroup with the exact name Sandbox, '
-                'resuming that same operation if it exists. Then use delegate to ask the new agent to listDomains '
-                'with its own credentials. Never attempt any other resource creation or modification.')
+                'and inspect its native domain and administrator account through your own CloudStack APIs. '
+                'Do not create any VMs. Use create_subgroup with the exact name Sandbox, '
+                'resuming that same operation if it exists. Never assign work to another agent or attempt '
+                'any other resource creation or modification.')
         assert subgroup['conversation_id'] == inventory['conversation_id'], 'Second-turn regression was not exercised'
         assert any(e['type'] == 'tool_call' and e['name'] == 'create_subgroup' for e in events)
         operation = app.store.one('SELECT * FROM provisioning WHERE parent_id=? AND name=?', (main['id'], 'Sandbox'))
@@ -135,7 +135,7 @@ async def perform(options):
             title = app.store.one('SELECT title FROM conversations WHERE id=?', (direct['conversation_id'],))['title']
             await page.get_by_label('Conversation', exact=True).fill(title)
             await page.get_by_role('option', name=title, exact=True).click()
-            await page.get_by_text('Completed · Reference: ' + direct['id'], exact=True).wait_for()
+            await page.locator('[data-operation-id="' + direct['id'] + '"]').filter(has_text='Completed').wait_for()
         else:
             direct, direct_events = await send('Use execute_api to list your own CloudStack domain. '
                                               'Discover and describe listDomains first if needed. This is read-only; do not create VMs.')
@@ -150,7 +150,7 @@ async def perform(options):
         conversation = app.store.one('SELECT title FROM conversations WHERE id=?', (direct['conversation_id'],))
         await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
         await page.get_by_role('option', name=conversation['title'], exact=True).click()
-        await page.get_by_text('Completed · Reference: ' + direct['id'], exact=True).wait_for()
+        await page.locator('[data-operation-id="' + direct['id'] + '"]').filter(has_text='Completed').wait_for()
         await page.set_viewport_size({'width': 390, 'height': 844})
         await page.wait_for_timeout(500)
         for selected in ('Main Agent', 'Sandbox'):
@@ -161,7 +161,7 @@ async def perform(options):
             await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_label('Conversation', exact=True).fill(conversation['title'])
         await page.get_by_role('option', name=conversation['title'], exact=True).click()
-        await page.get_by_text('Completed · Reference: ' + direct['id'], exact=True).wait_for()
+        await page.locator('[data-operation-id="' + direct['id'] + '"]').filter(has_text='Completed').wait_for()
         composer = await page.get_by_label('Message', exact=True).bounding_box()
         assert composer and composer['x'] < 60 and composer['y'] + composer['height'] <= 844
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')

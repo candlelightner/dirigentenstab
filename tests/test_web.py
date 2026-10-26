@@ -7,6 +7,23 @@ from nicegui.testing.user_simulation import user_simulation
 from dirigentenstab.web import build_ui, hierarchy_nodes, history_parts
 
 
+class AgentCapabilities:
+    class store:
+        @staticmethod
+        def all(*args):
+            return []
+
+    async def vm_overview(self, identity, agent_id):
+        return []
+
+    async def subgroup_capability(self, agent_id):
+        return True
+
+    async def provider_configuration(self, identity, agent_id):
+        providers = await self.providers(identity)
+        return {'providers': providers, 'selected': [row['id'] for row in providers], 'allowed': None}
+
+
 def test_tree_uses_cloudstack_parents_and_only_safe_agent_labels():
     data = {
         'domains': [{'id': 'root', 'name': 'ROOT'},
@@ -61,7 +78,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
                 raise PermissionError('Disabled CloudStack account')
             return {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
 
-    class Service:
+    class Service(AgentCapabilities):
         rotations = []
         updates = []
 
@@ -85,29 +102,43 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
             agent['thinking'] = thinking
 
     class Runtime:
+        async def start(self):
+            pass
+
         sent = []
         release = asyncio.Event()
         finished = asyncio.Event()
         fail = False
+        status = 'running'
+        rows = {}
+        restored = []
 
         async def conversations(self, identity, agent_id):
-            return [{'id': 'conversation', 'title': 'Example'}]
+            return [{'id': key, 'title': value['title']} for key, value in self.rows.items()]
 
-        async def chat(self, identity, agent_id, conversation_id, prompt, on_event):
+        async def restore(self, identity, conversation_id):
+            self.restored.append(conversation_id)
+            return self.rows[conversation_id]
+
+        async def submit(self, identity, agent_id, conversation_id, prompt):
             self.sent.append((identity['userid'], agent_id, prompt))
-            await self.release.wait()
-            if self.fail:
-                raise RuntimeError('Synthetic pending reply failed')
-            await on_event({'type': 'context_usage', 'context': {'estimated_tokens': 1234, 'context_window': 10000,
-                'response_reserve': 2000, 'usable_tokens': 8000, 'percent': 15.425, 'threshold_percent': 75,
-                'source': 'Approximate test usage'}})
-            await on_event({'type': 'compaction', 'status': 'Context compacted.', 'summary': 'PRIVATE SUMMARY CONTENT'})
-            await on_event({'type': 'text', 'text': 'Hello'})
-            await on_event({'type': 'tool_result', 'name': 'search_api', 'content': {'apis': 2}})
-            self.finished.set()
-            return {'conversation_id': 'conversation', 'output': 'Hello'}
+            conversation_id = conversation_id or f'conversation-{len(self.rows)}'
+            row = {'id': conversation_id, 'agent_id': agent_id, 'title': prompt, 'messages': [],
+                   'runs': [{'id': conversation_id, 'status': 'running', 'events': []}]}
+            self.rows[conversation_id] = row
+            async def finish():
+                await self.release.wait()
+                row['messages'] = [{'parts': [{'part_kind': 'text', 'content': 'Hello'}]}]
+                row['runs'][-1]['status'] = 'failed' if self.fail else 'completed'
+                self.finished.set()
+            asyncio.create_task(finish())
+            return {'conversation_id': conversation_id, 'operation_id': conversation_id, 'status': 'running'}
 
     auth, runtime, service = Auth(), Runtime(), Service()
+    from types import SimpleNamespace
+    service.store = SimpleNamespace(all=lambda *args: [dict(id=key, agent_id='agent', title=value['title'],
+        operation_id=key, status=value['runs'][-1]['status'], updated=1 if value['runs'][-1]['status'] == 'running' else 2)
+        for key, value in runtime.rows.items()])
     async with user_simulation() as user:
         build_ui(service, auth, runtime)
         login = await user.http_client.get('/login')
@@ -138,12 +169,12 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         user.find('Send').trigger('click')
         await user.should_see('thinking_indicator')
         runtime.release.set()
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(1.1)
         await user.should_see('Hello')
-        await user.should_see('Context: ~1,234 / 8,000 usable tokens (15.4%)')
-        await user.should_see('Context compacted.')
-        await user.should_not_see('PRIVATE SUMMARY CONTENT')
         await user.should_not_see('thinking_indicator')
+        restored_count = len(runtime.restored)
+        await asyncio.sleep(1.1)
+        assert len(runtime.restored) == restored_count, 'Idle polling must not decrypt unchanged history'
         assert runtime.sent == [('human', 'agent', 'Hello research')]
         user.find('Configure').click()
         await user.should_see('Rotate credentials')
@@ -168,7 +199,8 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         user.find('Send').click()
         await user.should_see('thinking_indicator')
         runtime.release.set()
-        await user.should_see('Failed ·')
+        await asyncio.sleep(1.1)
+        await user.should_see('Failed')
         await user.should_not_see('thinking_indicator')
         redirects = []
         monkeypatch.setattr(user.navigate, 'to', redirects.append)
@@ -224,7 +256,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
                 raise PermissionError('Session expired')
             return identity
 
-    class Service:
+    class Service(AgentCapabilities):
         async def hierarchy(self, current):
             return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent], 'users': []}
 
@@ -236,6 +268,9 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
             return []
 
     class Runtime:
+        async def start(self):
+            pass
+
         async def conversations(self, current, agent_id):
             return []
 
@@ -266,6 +301,9 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
                 raise ValueError('Invalid MCP endpoint')
             self.saved.append((name, url, token, server_id, enabled))
             return 'search'
+
+        async def set_enabled(self, current, agent_id, server_id, enabled):
+            assert isinstance(enabled, bool)
 
         async def assign(self, current, agent_id, server_id, tools):
             assert current == identity
@@ -389,7 +427,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
         async def identity(self, token):
             return identity
 
-    class Service:
+    class Service(AgentCapabilities):
         async def hierarchy(self, current):
             return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
 
@@ -406,6 +444,9 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
             agent.update(provider_id=provider_id, model=model, instructions=instructions, thinking=thinking)
 
     class Runtime:
+        async def start(self):
+            pass
+
         block = False
         started = asyncio.Event()
         release = asyncio.Event()
@@ -479,7 +520,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         async def identity(self, token):
             return identity
 
-    class Service:
+    class Service(AgentCapabilities):
         async def hierarchy(self, current):
             return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
 
@@ -491,6 +532,9 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
             return []
 
     class Runtime:
+        async def start(self):
+            pass
+
         status = 'running'
         task = None
         stopped = []
@@ -505,16 +549,8 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
                 'runs': [{'id': 'operation', 'status': self.status, 'events': [],
                           'budget': {'reason': 'stopped', 'resumable': self.status == 'interrupted'}}]}
 
-        async def chat(self, current, agent_id, conversation_id, prompt, on_event):
-            self.task = asyncio.current_task()
-            await on_event({'type': 'run_started', 'operation_id': 'operation', 'conversation_id': 'conversation'})
-            await on_event({'type': 'text', 'text': 'Partial reply retained'})
-            await on_event({'type': 'compaction', 'status': 'Compacting context…'})
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                self.status = final_status
-                raise
+        async def submit(self, current, agent_id, conversation_id, prompt):
+            return {'conversation_id': 'conversation', 'operation_id': 'operation', 'status': 'running'}
 
         async def stop(self, current, operation_id):
             assert current == identity and operation_id == 'operation'
@@ -536,24 +572,22 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         await user.open('/')
         user.find('agent_selector').trigger('update:modelValue', {'value': 0})
         await user.should_see('Configure')
-        await user.should_not_see('Stop agent')
+        await user.should_not_see('Stop conversation')
         if restored:
             user.find('Conversation').trigger('update:modelValue', {'value': 0})
         else:
             user.find('Message').type('Run a task')
             user.find('Send').click()
-        await user.should_see('Stop agent')
+        await user.should_see('Stop conversation')
         await user.should_see('Partial reply retained')
-        if not restored:
-            await user.should_see('Compacting context…')
-        user.find('Stop agent').click()
+        user.find('Stop conversation').click()
         if final_status == 'running':
             await user.should_see('Stop requested')
-            await user.should_see('Stop agent')
-            assert not next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
+            await user.should_see('Stop conversation')
+            assert next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
             return
-        await user.should_see('Requires reconciliation' if final_status == 'reconciliation' else 'Stopped')
-        await user.should_not_see('Stop agent')
+        await user.should_see('Blocked / paused' if final_status == 'reconciliation' else 'Stopped')
+        await user.should_not_see('Stop conversation')
         await user.should_not_see('thinking_indicator')
         await user.should_not_see('Compacting context…')
         await user.should_see('Partial reply retained')
@@ -561,8 +595,6 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         assert next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
         user.find('Message').type('Next task')
         assert next(iter(user.find(kind=ui.button, content='Send').elements)).enabled
-        if final_status == 'interrupted':
-            await user.should_see('Continue saved task')
 
 
 async def test_compaction_configuration_persists_and_context_meter_restores():
@@ -574,7 +606,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         async def identity(self, token):
             return identity
 
-    class Service:
+    class Service(AgentCapabilities):
         async def hierarchy(self, current):
             return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
 
@@ -588,6 +620,9 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
             agent.update(provider_id=provider_id, model=model, instructions=instructions, **settings)
 
     class Runtime:
+        async def start(self):
+            pass
+
         saved_context = {'estimated_tokens': 321, 'context_window': 2000, 'response_reserve': 500,
                          'usable_tokens': 1500, 'percent': 21.4, 'threshold_percent': 75,
                          'source': 'Saved approximate usage'}
@@ -661,3 +696,23 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         user.find('Conversation').trigger('update:modelValue', {'value': 0})
         await user.should_see('Context usage unavailable for this activity.')
         assert not user.notify.messages, user.notify.messages
+
+
+def test_hub_activity_only_includes_owner_visible_agents_and_latest_run():
+    import sqlite3
+    from dirigentenstab.web import conversation_activity
+
+    database = sqlite3.connect(':memory:')
+    database.row_factory = sqlite3.Row
+    database.executescript('CREATE TABLE conversations(id,agent_id,human_id,title);'
+                           'CREATE TABLE chat_runs(id,conversation_id,status,created,updated);'
+                           "INSERT INTO conversations VALUES('c','visible','owner','Owned task'),"
+                           "('hidden','hidden','owner','Hidden task'),('other','visible','other','Other owner');"
+                           "INSERT INTO chat_runs VALUES('old','c','running',1,1),('new','c','completed',2,3),"
+                           "('hidden','hidden','running',2,3),('other','other','running',2,3);")
+    class Store:
+        def all(self, sql, params):
+            return [dict(row) for row in database.execute(sql, params)]
+    assert conversation_activity(Store(), 'owner', ['visible']) == [
+        {'id': 'c', 'agent_id': 'visible', 'title': 'Owned task', 'operation_id': 'new', 'status': 'completed', 'updated': 3}]
+    assert conversation_activity(Store(), 'owner', []) == []

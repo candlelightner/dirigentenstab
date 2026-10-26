@@ -87,6 +87,17 @@ def history_parts(history):
             yield 'activity', event
 
 
+def conversation_activity(store, human_id, agent_ids):
+    if not agent_ids:
+        return []
+    placeholders = ','.join('?' for _ in agent_ids)
+    return store.all(
+        'SELECT c.id,c.agent_id,c.title,r.id AS operation_id,r.status,r.updated FROM conversations c JOIN chat_runs r '
+        'ON r.id=(SELECT id FROM chat_runs WHERE conversation_id=c.id ORDER BY created DESC LIMIT 1) '
+        f'WHERE c.human_id=? AND c.agent_id IN ({placeholders}) ORDER BY r.updated DESC',
+        (human_id, *agent_ids))
+
+
 def build_ui(service, auth, runtime=None):
     runtime = runtime or Runtime(service)
 
@@ -128,9 +139,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 current = await auth.identity(token)
                 if not current:
                     raise PermissionError('Session expired')
+                state['session_expired'] = False
                 return current
             except Exception:
-                ui.navigate.to('/login')
+                if not state.get('session_expired'):
+                    state['session_expired'] = True
+                    ui.navigate.to('/login')
                 raise PermissionError('Session expired') from None
 
         async def protect(action):
@@ -142,7 +156,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     error = diagnose(exc, agent_id=state['agent'])
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'resume_operation': None, 'active_operation': None}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'seen': {}, 'drafts': {}, 'mobile': False, 'details_expansion': None}
+        def viewport_changed(event):
+            mobile = event.args['width'] <= 600
+            if mobile and not state['mobile'] and state['details_expansion'] is not None:
+                state['details_expansion'].close()
+            state['mobile'] = mobile
+
+        ui.on('ds-viewport', viewport_changed)
         agents = {row['id']: row for row in data.get('agents', [])}
         dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
         dashboard_links = []
@@ -160,7 +181,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
-            ui.html('<form method="post" action="/auth/logout"><input type="hidden" name="csrf" value="'
+            ui.html('<form method="post" action="/auth/logout" onsubmit="window.socket?.disconnect()"><input type="hidden" name="csrf" value="'
                     + html.escape(identity['csrf'], quote=True)
                     + '"><button type="submit" class="border rounded px-3 py-1">Sign out</button></form>',
                     sanitize=False)
@@ -194,6 +215,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}
             .workspace.compact .agent-details{display:none}
             @media(max-width:600px){.workspace{padding:6px;gap:6px}.agent-details{padding:10px}
+            .conversation-stop{font-size:0;min-width:44px;padding:8px}.conversation-stop .q-icon{font-size:24px;margin:0}
             .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
         """)
@@ -206,6 +228,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if(el) { el.classList.toggle('compact',innerWidth<=600 && height<=600);
                     el.style.height=Math.max(100,height-(header?.getBoundingClientRect().height || 65))+'px'; } };
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
+                const report=()=>{if(window.did_handshake) emitEvent('ds-viewport',{width:innerWidth})};
+                window.addEventListener('resize',report);
                 fit(); setTimeout(fit,500); })();
         </script>""")
         # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
@@ -221,6 +245,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
                     tree = ui.tree(hierarchy_nodes(data)).classes('w-full').mark('hierarchy')
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
+                activity_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('hub_activity').style('white-space:pre-line;max-height:140px;overflow:auto')
                 providers_button = ui.button('Model providers', icon='settings').props('outline').classes('w-full') \
                     if identity.get('type') == 1 else None
                 platform_button = None
@@ -243,16 +268,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.row().classes('w-full items-center no-wrap gap-2'):
                     history_select = ui.select({}, label='Conversation', with_input=True).classes('flex-1 min-w-0')
                     new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
-                with ui.scroll_area().classes('messages'):
+                with ui.scroll_area().classes('messages') as transcript_scroll:
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
-                continue_button = ui.button('Continue saved task', icon='play_arrow').props('outline')
-                continue_button.set_visibility(False)
-                gpu_recover_button = ui.button('Check GPU recovery', icon='restore').props('outline')
-                gpu_recover_button.set_visibility(False)
                 budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
                 context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
                 compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
-                progress = ui.label('Ready').classes('text-xs text-stone-600').props('role=status aria-live=polite')
+                progress = ui.label('Ready').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
+                with progress:
+                    reference = ui.tooltip('')
                 with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
                         'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
                     ui.label('Thinking…')
@@ -263,13 +286,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
                         'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
                     send_button = ui.button('Send', icon='send').props('aria-label="Send"')
-                    stop_button = ui.button('Stop agent', icon='stop', color='negative',
-                                            on_click=lambda: protect(stop_agent)).props('outline')
+                    stop_button = ui.button('Stop conversation', icon='stop', color='negative',
+                                            on_click=lambda: protect(stop_agent)).props('outline aria-label="Stop conversation"').classes('conversation-stop')
                     stop_button.set_visibility(False)
                     send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
-                                                  bool(value and value.strip()) and not state['busy'] and not state['active_operation'])
+                                                  bool(value and value.strip()) and not state['submitting'])
 
         tool_cards = {}
+        selection_lock = asyncio.Lock()
 
         def activity(event):
             key = (event.get('operation_id'), event.get('call_id', event.get('name')))
@@ -312,23 +336,41 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 history_select.set_options({row['id']: row['title'] for row in rows}, value=state['conversation'])
 
         async def show_agent(agent_id, *, close_navigation=True):
-            if state['busy']:
-                ui.notify('Wait for the current reply to finish.')
-                return
-            current = await actor()
-            agent = await service.authorize(current, agent_id)
-            state.update(agent=agent_id, conversation=None, imported=False, resume_operation=None, active_operation=None)
+            state['requested_agent'] = agent_id
+            async with selection_lock:
+                if state['requested_agent'] != agent_id:
+                    return
+                agent_choice.disable()
+                tree.classes('pointer-events-none opacity-50').props('aria-disabled=true')
+                try:
+                    await render_agent(agent_id, close_navigation=close_navigation)
+                finally:
+                    agent_choice.enable()
+                    tree.classes(remove='pointer-events-none opacity-50').props(remove='aria-disabled')
+
+        async def render_agent(agent_id, *, close_navigation=True):
+            state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
+            prompt.disable()
+            try:
+                current = await actor()
+                agent = await service.authorize(current, agent_id)
+            finally:
+                prompt.enable()
+            prompt.set_value(state['drafts'].get((agent_id, None), ''))
+            state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, activity_token=None)
             stop_button.set_visibility(False)
             prompt.enable()
-            continue_button.set_visibility(False)
-            gpu_recover_button.set_visibility(False)
             budget_label.set_text('')
             context_label.set_text('')
             compaction_status.set_text('')
             transcript.clear()
             tool_cards.clear()
             progress.set_text('Ready')
-            agent_choice.set_value(agent_id)
+            state['updating_selector'] = True
+            try:
+                agent_choice.set_value(agent_id)
+            finally:
+                state['updating_selector'] = False
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
             if close_navigation:
@@ -336,14 +378,16 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
-                with ui.expansion(value=True).classes('w-full').props('header-class="px-0"').mark('agent_details') as expansion:
+                with ui.expansion(value=not state['mobile']).classes('w-full').props('header-class="px-0"').mark('agent_details') as expansion:
+                    state['details_expansion'] = expansion
+                    ui.timer(0.01, lambda: ui.run_javascript("emitEvent('ds-viewport',{width:innerWidth})"), once=True)
                     with expansion.add_slot('header'):
                         with ui.row().classes('w-full min-w-0 items-center gap-3'):
                             ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold break-words')
                             ui.badge('Domain administrator', color='primary')
                     with ui.row().classes('w-full items-center justify-end gap-3'):
                         ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
-                        if agent.get('can_provision'):
+                        if await service.subgroup_capability(agent_id):
                             ui.button('Create subgroup', icon='create_new_folder',
                                       on_click=lambda: protect(subgroup_dialog)).props('outline')
                     provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
@@ -364,6 +408,21 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                             ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
                                      'to use scripts/admin.py repair-provisioning.').classes('text-sm')
             await histories()
+            with expansion:
+                with ui.expansion('Virtual machines', icon='dns').classes('w-full'):
+                    try:
+                        vms = await service.vm_overview(current, agent_id)
+                        if not vms:
+                            ui.label('No virtual machines in this scope.').classes('text-sm')
+                        for vm in vms:
+                            ui.label(f"{vm.get('name', vm.get('id', 'VM'))} · {vm.get('state', 'Unknown')}").classes('font-medium')
+                            if vm.get('address'):
+                                target = (vm['username'] + '@' if vm.get('username') else '') + vm['address']
+                                ui.label(f"SSH: {target} · Port {vm.get('port', 22)}").classes('text-sm break-all')
+                            if vm.get('cloudstack_url'):
+                                ui.link('Open VM in CloudStack', vm['cloudstack_url'], new_tab=True).props('rel="noopener noreferrer"')
+                    except Exception as exc:
+                        ui.label(str(diagnose(exc, agent_id=agent_id))).classes('text-sm text-amber-900')
 
         async def refresh():
             current = await actor()
@@ -377,11 +436,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
         async def select_node(event):
-            if not event.value:
+            if selection_lock.locked() or not event.value:
                 return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
-                if identifier != state['agent']:
+                if identifier != state.get('requested_agent', state['agent']):
                     await show_agent(identifier)
                 else:
                     drawer.run_method('hide')
@@ -403,64 +462,98 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                       on_click=lambda _, aid=agent['id']: protect(lambda: show_agent(aid)))
 
         async def choose_agent(event):
-            if event.value and event.value != state['agent']:
+            if event.value and event.value != state.get('requested_agent', state['agent']):
                 await show_agent(event.value)
 
         async def choose_history(event):
-            if state['busy'] or not event.value or event.value == state['conversation']:
+            if not event.value or event.value == state['conversation']:
                 return
-            restored = await runtime.restore(await actor(), event.value)
+            prompt.disable()
+            try:
+                restored = await runtime.restore(await actor(), event.value)
+            finally:
+                prompt.enable()
             if restored['agent_id'] != state['agent']:
                 raise PermissionError('Conversation belongs to another agent')
-            state['resume_operation'] = None
+            state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
+            prompt.set_value(state['drafts'].get((state['agent'], restored['id']), ''))
+            await render_history(restored)
+
+        async def render_history(restored):
+            state['conversation'] = restored['id']
+            state['imported'] = bool(restored.get('imported'))
             state['active_operation'] = None
+            state['busy'] = False
             stop_button.set_visibility(False)
-            prompt.enable()
-            continue_button.set_visibility(False)
             budget_label.set_text('')
             context_label.set_text('')
             compaction_status.set_text('')
-            state['conversation'] = restored['id']
-            state['imported'] = bool(restored.get('imported'))
-            progress.set_text('Imported history is read-only. Sending starts a new conversation without '
-                              'forwarding this history to the model.' if state['imported'] else '')
-            transcript.clear()
-            tool_cards.clear()
+            progress.set_text('Imported history is read-only. Sending starts a new conversation.' if state['imported'] else 'Ready')
             if restored.get('runs'):
                 run = restored['runs'][-1]
                 state['active_operation'] = run['id'] if run['status'] == 'running' else None
-                stop_button.set_visibility(bool(state['active_operation']))
-                prompt.set_enabled(not state['active_operation'])
-                progress.set_text(f"{run['status'].capitalize()} · Reference: {run['id']}")
-                budget = run.get('budget')
-                state['resume_operation'] = run['id'] if budget and budget.get('resumable') else None
-                continue_button.set_visibility(bool(state['resume_operation']))
-                gpu_recover_button.set_visibility(run['status'] == 'reconciliation')
-                if budget:
-                    show_budget(budget)
-                    if budget.get('resumable'):
-                        progress.set_text(('Stopped' if budget.get('reason') == 'stopped' else
-                                           'Paused · ' + str(budget.get('reason')) + ' budget') + ' · Reference: ' + run['id'])
+                state['busy'] = bool(state['active_operation'])
+                stop_button.set_visibility(state['busy'])
+                reason = (run.get('budget') or {}).get('reason')
+                label = ('Blocked / paused' if run['status'] == 'reconciliation' else 'Stopped' if reason == 'stopped' else 'Blocked / paused' if run['status'] == 'interrupted'
+                         else run['status'].capitalize())
+                pause_reason = (run.get('budget') or {}).get('pause_reason')
+                progress.set_text(label + (' · ' + str(pause_reason) if pause_reason else ''))
+                progress.props(f'data-operation-id="{run["id"]}"')
+                reference.set_text('Reference: ' + run['id'])
+                if run.get('budget'):
+                    show_budget(run['budget'])
+                    if run['budget'].get('compactions'):
+                        compaction_status.set_text('Context compacted.')
+            transcript.clear()
+            tool_cards.clear()
             for kind, content in history_parts(restored):
                 activity(content) if kind == 'activity' else message(kind, content)
+            transcript_scroll.scroll_to(percent=1)
+            state['activity_token'] = None
+
+        async def poll_activity():
+            if client.is_deleted or not state['agent'] or state['submitting']:
+                return
+            agent_id, conversation_id = state['agent'], state['conversation']
+            try:
+                current = await actor()
+                rows = conversation_activity(service.store, current['userid'], list(agents))
+                summaries = []
+                for row in rows:
+                    if row['id'] == conversation_id:
+                        state['seen'][row['id']] = row['updated']
+                    unread = row['updated'] > state['seen'].get(row['id'], 0)
+                    label = 'Blocked / paused' if row['status'] in {'interrupted', 'reconciliation'} else row['status'].capitalize()
+                    summaries.append(f"{agent_label(agents[row['agent_id']])}: {row['title']} · {label}" + (' · unread' if unread else ''))
+                activity_status.set_text('\n'.join(summaries))
+                await histories()
+                selected = next((row for row in rows if row['id'] == conversation_id), None)
+                if selected:
+                    activity_token = (selected['operation_id'], selected['status'], selected['updated'])
+                    if activity_token != state['activity_token']:
+                        restored = await runtime.restore(current, conversation_id)
+                        if state['agent'] == agent_id and state['conversation'] == conversation_id:
+                            await render_history(restored)
+                            state['activity_token'] = activity_token
+            except Exception:
+                # Authentication redirects through actor; transient refresh failures retry next tick.
+                return
 
         async def new_conversation():
+            state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
+            prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
+            state.update(conversation=None, active_operation=None, busy=False, imported=False,
+                         activity_token=None)
+            stop_button.set_visibility(False)
+            budget_label.set_text('')
+            context_label.set_text('')
+            compaction_status.set_text('')
+            progress.set_text('Ready')
+            history_select.set_value(None)
+            transcript.clear()
+            tool_cards.clear()
             await actor()
-            if not state['busy']:
-                state['conversation'] = None
-                state['active_operation'] = None
-                stop_button.set_visibility(False)
-                prompt.enable()
-                state['imported'] = False
-                state['resume_operation'] = None
-                continue_button.set_visibility(False)
-                gpu_recover_button.set_visibility(False)
-                budget_label.set_text('')
-                context_label.set_text('')
-                compaction_status.set_text('')
-                progress.set_text('')
-                history_select.set_value(None)
-                transcript.clear()
 
         def show_context(context):
             estimate = context.get('estimated_tokens')
@@ -483,42 +576,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         def show_budget(budget):
             if budget.get('context'):
                 show_context(budget['context'])
-            budget_label.set_text(f"Requests: {budget.get('requests', 0)} · Tools: {budget.get('tool_calls', 0)} · "
-                                  f"Windows: {budget.get('windows', 0)} · Reused: {budget.get('cache_hits', 0)} · "
-                                  f"Window limits: {budget.get('requests_per_window', 20)} requests / "
-                                  f"{budget.get('tools_per_window', 30)} tools")
-
-        async def check_gpu_recovery():
-            if state['busy'] or not state['conversation']:
-                return
-            current = await actor()
-            restored = await runtime.restore(current, state['conversation'])
-            run = restored['runs'][-1]
-            await runtime.reconcile_gpu(service, current, run['id'])
-            state['resume_operation'] = run['id']
-            continue_button.set_visibility(True)
-            gpu_recover_button.set_visibility(False)
-            progress.set_text('GPU result verified. Continue saved task without repeating its completed action.')
-
-        def stopped_run(run):
-            state['active_operation'] = None
-            state['busy'] = False
-            compaction_status.set_text('')
-            stop_button.set_visibility(False)
-            reconciliation = run['status'] == 'reconciliation'
-            progress.set_text(('Requires reconciliation · inspect unfinished remote actions' if reconciliation else
-                               'Stopped' if run['status'] == 'interrupted' else run['status'].capitalize())
-                              + ' · Reference: ' + run['id'])
-            budget = run.get('budget') or {}
-            state['resume_operation'] = run['id'] if budget.get('resumable') else None
-            continue_button.set_visibility(bool(state['resume_operation']))
-            gpu_recover_button.set_visibility(reconciliation)
-            prompt.enable()
-            send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
-            new_button.enable()
-            history_select.enable()
-            agent_choice.enable()
-            continue_button.enable()
+            budget_label.set_text(f"Requests: {budget.get('requests', 0)} · Tools: {budget.get('tool_calls', 0)}")
 
         async def stop_agent():
             operation_id = state['active_operation']
@@ -531,131 +589,33 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if state['active_operation'] != operation_id:
                     return
                 if result['status'] == 'running':
-                    progress.set_text('Stop requested · waiting for active work to finish · Reference: ' + operation_id)
+                    progress.set_text('Stop requested · waiting for active work to finish')
                     return
                 restored = await runtime.restore(current, state['conversation'])
                 if state['active_operation'] == operation_id:
-                    run = next((run for run in restored.get('runs', []) if run['id'] == operation_id),
-                               {'id': operation_id, 'status': result['status']})
-                    stopped_run(run)
-                    transcript.clear()
-                    tool_cards.clear()
-                    for kind, content in history_parts(restored):
-                        activity(content) if kind == 'activity' else message(kind, content)
+                    await render_history(restored)
             finally:
                 stop_button.enable()
 
-        async def send(resume=False):
-            text = prompt.value.strip() if prompt.value else ''
-            if state['busy'] or state['active_operation'] or not state['agent'] or (not resume and not text):
+        async def send():
+            text = (prompt.value or '').strip()
+            if state['submitting'] or not state['agent'] or not text:
                 return
-            # Claim the submission before the first await; rapid clicks cannot start two mutations.
-            state['busy'] = True
+            state['submitting'] = True
+            agent_id, conversation_id = state['agent'], state['conversation']
             try:
                 current = await actor()
-                agent_id = state['agent']
                 await service.authorize(current, agent_id)
-            except BaseException:
-                state['busy'] = False
-                raise
-            if state['imported']:
-                transcript.clear()
-            state['busy'] = True
-            send_button.disable()
-            prompt.disable()
-            new_button.disable()
-            history_select.disable()
-            agent_choice.disable()
-            continue_button.set_visibility(False)
-            continue_button.disable()
-            gpu_recover_button.set_visibility(False)
-            if not resume:
-                message('human', text)
-                prompt.set_value('')
-            with transcript:
-                with ui.chat_message(name='Agent').classes('w-full max-w-full'):
-                    answer = ui.markdown('', extras=['tables', 'fenced-code-blocks'], sanitize=True).classes('markdown w-full')
-            progress.set_text('Agent is working…')
-            compaction_status.set_text('')
-            chunks = []
-
-            async def event_received(event):
-                if client.is_deleted:
-                    return
-                if event.get('budget'):
-                    show_budget(event['budget'])
-                if event.get('type') == 'context_usage':
-                    show_context(event['context'])
-                elif event.get('type') == 'compaction':
-                    compaction_status.set_text(event['status'])
-                    if event.get('context'):
-                        show_context(event['context'])
-                elif event.get('type') == 'run_started':
-                    state['conversation'] = event['conversation_id']
-                    state['active_operation'] = event['operation_id']
-                    stop_button.set_visibility(True)
-                    progress.set_text('Running · Reference: ' + event['operation_id'])
-                elif event.get('type') == 'text':
-                    chunks.append(event.get('text', ''))
-                    answer.set_content(''.join(chunks))
-                elif event.get('type') == 'budget_checkpoint':
-                    progress.set_text('Checkpoint saved; continuing next bounded window · Reference: ' + event['operation_id'])
-                elif event.get('type') in {'tool_call', 'tool_result'}:
-                    activity(event)
-
-            try:
-                result = (await runtime.resume(current, state['resume_operation'], event_received) if resume else
-                          await runtime.chat(current, agent_id, state['conversation'], text, event_received))
-                if client.is_deleted:
-                    return
-                state['active_operation'] = None
-                stop_button.set_visibility(False)
-                state['conversation'] = result['conversation_id']
-                state['imported'] = False
-                answer.set_content(result['output'])
-                state['resume_operation'] = result['operation_id'] if result.get('status') == 'paused' and result.get('resumable', True) else None
-                continue_button.set_visibility(bool(state['resume_operation']))
-                progress.set_text('Paused · Completed activity saved · Reference: ' + result['operation_id']
-                                  if result.get('status') == 'paused' else
-                                  'Requires reconciliation' if result.get('status') == 'reconciliation' else 'Completed')
-                await histories()
-                await refresh()
-            except asyncio.CancelledError:
-                if client.is_deleted:
-                    return
-                compaction_status.set_text('')
-                progress.set_text('Stopped · activity saved; unfinished remote actions may need reconciliation.')
-                if state['conversation']:
-                    restored = await runtime.restore(current, state['conversation'])
-                    if restored.get('runs'):
-                        stopped_run(restored['runs'][-1])
-            except Exception as exc:
-                if client.is_deleted:
-                    return
-                state['active_operation'] = None
-                stop_button.set_visibility(False)
-                error = diagnose(exc, agent_id=agent_id)
-                progress.set_text(('Requires reconciliation · ' if error.reconciliation else 'Failed · ') + str(error))
-                await histories()
-                if state['conversation']:
-                    restored = await runtime.restore(current, state['conversation'])
-                    latest = restored.get('runs', [])[-1:]
-                    if latest and (latest[0].get('budget') or {}).get('resumable'):
-                        state['resume_operation'] = latest[0]['id']
-                        continue_button.set_visibility(True)
-                    gpu_recover_button.set_visibility(bool(latest and latest[0]['status'] == 'reconciliation'))
-                raise error from None
+                result = await runtime.submit(current, agent_id, conversation_id, text)
+                if state['agent'] == agent_id and state['conversation'] == conversation_id:
+                    prompt.set_value('')
+                    state['drafts'].pop((agent_id, conversation_id), None)
+                    state['conversation'] = result['conversation_id']
+                    state['activity_token'] = None
+                    await render_history(await runtime.restore(current, result['conversation_id']))
+                    await histories()
             finally:
-                state['busy'] = False
-                state['active_operation'] = None
-                if not client.is_deleted:
-                    stop_button.set_visibility(False)
-                    send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
-                    prompt.enable()
-                    new_button.enable()
-                    history_select.enable()
-                    agent_choice.enable()
-                    continue_button.enable()
+                state['submitting'] = False
 
         async def mcp_dialog(agent_id):
             from .mcp import MCP
@@ -679,6 +639,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     enabled = ui.checkbox('Server enabled', value=True)
                 else:
                     ui.label('Server endpoints are managed by administrators of the main agent domain.').classes('text-sm')
+                agent_enabled = ui.checkbox('Enable server for this agent', value=True)
                 ui.label('Available tools').classes('font-semibold')
                 tool_list = ui.column().classes('w-full shrink-0 max-h-64 overflow-y-auto gap-2')
                 inherited = ui.label('').classes('text-sm whitespace-pre-wrap')
@@ -714,6 +675,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         token.set_value('')
                         clear_token.set_value(False)
                         enabled.set_value(bool(row.get('enabled', True)))
+                    agent_enabled.set_value(row.get('agent_enabled', True))
+                    agent_enabled.set_enabled(bool(row) and row.get('server_allowed', True))
                     allowed = row.get('allowed_tools')
                     inherited.set_text('Ancestor allows: ' + (', '.join(allowed) or 'no tools')
                                        if allowed is not None else 'Select only the external tools this agent needs.')
@@ -797,6 +760,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     remember()
                     names = sorted(choices[server_id])
                     await integration.assign(await actor(), agent_id, server_id, names)
+                    await integration.set_enabled(await actor(), agent_id, server_id, bool(agent_enabled.value))
+                    servers[server_id]['agent_enabled'] = bool(agent_enabled.value)
                     servers[server_id]['tools'] = names
                     if selected.value == server_id:
                         feedback.set_text('Assigned tools saved for this agent.')
@@ -818,6 +783,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             options = {p['id']: p['name'] for p in await service.providers(current)}
             with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-4'):
                 ui.label('Configure ' + agent['name']).classes('text-xl font-semibold')
+                provider_access = await service.provider_configuration(current, agent['id'])
+                enabled_providers = ui.select(options, label='Enabled providers', multiple=True,
+                    value=provider_access['selected']).classes('w-full')
+                if provider_access['allowed'] is not None:
+                    ui.label('Ancestor access limits currently available providers. Saved selections are retained.').classes('text-sm text-stone-600')
                 provider = ui.select(options, label='Model provider', value=agent.get('provider_id')).classes('w-full')
                 original_model = agent.get('model', '')
                 model = ui.select([original_model] if original_model else [], label='Model ID', value=original_model or None,
@@ -831,7 +801,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 thinking = ui.select(thinking_options, value=thinking_choice, label='Thinking level').classes('w-full')
                 thinking.disable()
                 thinking_source = ui.label('Checking model support…').classes('text-sm').props('role=status')
-                ui.label('Applies to the next invocation; an active reply keeps its current settings.').classes('text-sm text-stone-600')
+                ui.label('Active conversations pause while settings change, then resume with the new settings.').classes('text-sm text-stone-600')
 
                 def thinking_changed(event):
                     nonlocal thinking_choice
@@ -987,11 +957,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ui.label('Custom instructions for this agent, applied on its next model call.').classes('text-sm text-stone-600')
                 ui.button('MCP tools', icon='extension',
                           on_click=lambda: protect(lambda: mcp_dialog(agent['id']))).props('outline')
-                can_provision = ui.checkbox('Allow subordinate agent creation', value=bool(agent.get('can_provision'))) \
-                    if current.get('type') == 1 else None
 
                 async def save():
-                    options = {'can_provision': can_provision.value} if can_provision is not None else {}
+                    options = {'enabled_providers': enabled_providers.value}
                     if automatic.value and (type(auto_percent.value) not in {int, float}
                                             or not 1 <= auto_percent.value <= 99 or int(auto_percent.value) != auto_percent.value):
                         raise ValueError('Automatic compaction must be a whole percentage from 1 to 99, or disabled')
@@ -1006,9 +974,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                    context_window=int(window_override.value) if window_override.value is not None else None)
                     await service.update_agent(await actor(), agent['id'], provider.value,
                                                (model.value or '').strip(), instructions.value or '', thinking=thinking.value, **options)
-                    dialog.close()
                     await refresh()
+                    selected_conversation = state['conversation']
+                    selected_draft = prompt.value or ''
                     await show_agent(agent['id'])
+                    if selected_conversation:
+                        await render_history(await runtime.restore(await actor(), selected_conversation))
+                        prompt.set_value(selected_draft)
+                    dialog.close()
 
                 async def rotate():
                     await service.rotate_credentials(await actor(), agent['id'])
@@ -1159,8 +1132,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ui.label('Platform settings').classes('text-xl font-semibold')
                 url = ui.input('CloudStack Dashboard URL', value=service.dashboard_url(current)).classes('w-full')
                 ui.label('Browser-accessible private URL. CloudStack uses its own login; blank hides the link.').classes('text-sm')
+                owner_key = ui.textarea('Owner SSH public key', value=service.owner_ssh_key(current)).classes('w-full')
+                ui.label('Added alongside agent access to compatible new managed VMs.').classes('text-sm')
                 async def save():
                     actor_identity = await actor()
+                    await service.save_owner_ssh_key(actor_identity, owner_key.value or '')
                     service.save_dashboard_url(actor_identity, url.value or '')
                     value = service.dashboard_url(actor_identity)
                     for link in dashboard_links:
@@ -1249,25 +1225,26 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 tree.collapse()
             tree.update()
 
+        ui.timer(1.0, poll_activity)
         search.on_value_change(filter_tree)
-        main = next((a for a in agents.values() if a.get('is_main')), None)
-        if main:
-            await show_agent(main['id'], close_navigation=False)
-
         tree.on_select(lambda e: protect(lambda: select_node(e)))
-        agent_choice.on_value_change(lambda e: protect(lambda: choose_agent(e)))
+        agent_choice.on_value_change(lambda e: None if state.get('updating_selector') else protect(lambda: choose_agent(e)))
         history_select.on_value_change(lambda e: protect(lambda: choose_history(e)))
         refresh_button.on_click(lambda: protect(refresh))
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
-        continue_button.on_click(lambda: protect(lambda: send(resume=True)))
-        gpu_recover_button.on_click(lambda: protect(check_gpu_recovery))
         if providers_button is not None:
             providers_button.on_click(lambda: protect(provider_dialog))
         if platform_button is not None:
             platform_button.on_click(lambda: protect(platform_dialog))
         if gpu_button is not None:
             gpu_button.on_click(lambda: protect(gpu_dialog))
+
+        main = next((a for a in agents.values() if a.get('is_main')), None)
+        if main:
+            await show_agent(main['id'], close_navigation=False)
+
+    return runtime
 
 
 def main():
@@ -1278,7 +1255,7 @@ def main():
     service = Service(Store(settings.database, settings.key_file), settings)
     auth = Auth(service)
     attach(app, auth, settings)
-    build_ui(service, auth)
+    app.on_startup(build_ui(service, auth).start)
     tls = {}
     if os.getenv('APP_TLS_CERT') or os.getenv('APP_TLS_KEY'):
         tls = {'ssl_certfile': os.environ['APP_TLS_CERT'], 'ssl_keyfile': os.environ['APP_TLS_KEY']}

@@ -22,6 +22,8 @@ class MCP:
         self.store = service.store
 
     async def _can_manage_servers(self, identity):
+        if identity.get('_agent_id'):
+            return False
         try:
             await self.service.authorize(identity, APP_ROOT_AGENT)
             return True
@@ -60,7 +62,16 @@ class MCP:
                              (agent_id, server_id))
         return set(json.loads(row['tools'])) if row else set()
 
+    def selected_servers(self, agent):
+        return set(json.loads(agent['enabled_mcp_servers'])) if agent.get('enabled_mcp_servers') is not None else {
+            row['id'] for row in self.store.all('SELECT id FROM mcp_servers')}
+
+    def server_enabled(self, chain, server_id):
+        return all(server_id in self.selected_servers(agent) for agent in chain)
+
     def _effective(self, chain, server_id):
+        if not self.server_enabled(chain, server_id):
+            return set()
         tools = self._tools(chain[0]['id'], server_id)
         for agent in chain[1:]:
             tools &= self._tools(agent['id'], server_id)
@@ -72,11 +83,15 @@ class MCP:
         servers = self.store.all('SELECT id,name,url,enabled,version FROM mcp_servers ORDER BY name,id')
         chain = await self._chain(agent) if servers else []
         return {'can_manage_servers': can_manage, 'servers': [
-            {**server, 'tools': sorted(self._tools(agent_id, server['id'])),
+            {**server, 'agent_enabled': server['id'] in self.selected_servers(agent),
+             'server_allowed': self.server_enabled(chain[:-1], server['id']),
+             'tools': sorted(self._tools(agent_id, server['id'])),
              'allowed_tools': sorted(self._effective(chain[:-1], server['id'])) if len(chain) > 1 else None}
             for server in servers]}
 
     async def save_server(self, identity, name, url, token=None, server_id=None, enabled=True):
+        if identity.get('_agent_id'):
+            raise PermissionError('MCP endpoint configuration requires a human administrator')
         await self.service.authorize(identity, APP_ROOT_AGENT)
         if not isinstance(name, str) or not name.strip() or len(name) > 100 or not name.isprintable():
             raise ValueError('Use a printable MCP server name of 1–100 characters')
@@ -100,10 +115,11 @@ class MCP:
         if secret:
             self.service._remember('Bearer ' + secret)
         server_id = server_id or str(uuid.uuid4())
-        self.store.execute('INSERT INTO mcp_servers(id,name,url,token,enabled) VALUES(?,?,?,?,?) '
-                           'ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,'
-                           'token=excluded.token,enabled=excluded.enabled,version=mcp_servers.version+1',
-                           (server_id, name.strip(), url, encrypted, enabled))
+        async with self.service.configuration_change([row['id'] for row in self.store.all('SELECT id FROM agents')]):
+            self.store.execute('INSERT INTO mcp_servers(id,name,url,token,enabled) VALUES(?,?,?,?,?) '
+                               'ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,'
+                               'token=excluded.token,enabled=excluded.enabled,version=mcp_servers.version+1',
+                               (server_id, name.strip(), url, encrypted, enabled))
         self.store.audit(identity['userid'], 'configure-mcp-server', server_id)
         return server_id
 
@@ -141,7 +157,7 @@ class MCP:
         self.store.audit(identity['userid'], 'discover-mcp-tools', agent_id + '/' + server_id)
         return [tools[name] for name in sorted(tools)]
 
-    async def assign(self, identity, agent_id, server_id, tools):
+    async def validate_assignment(self, identity, agent_id, server_id, tools):
         agent = await self.service.authorize(identity, agent_id)
         if (not isinstance(tools, list) or len(tools) > 100
                 or any(not isinstance(name, str) or not TOOL_NAME.fullmatch(name) for name in tools)):
@@ -149,12 +165,44 @@ class MCP:
         if not self.store.one('SELECT id FROM mcp_servers WHERE id=?', (server_id,)):
             raise ValueError('MCP server is unavailable')
         chain = await self._chain(agent)
-        if len(chain) > 1 and not set(tools) <= self._effective(chain[:-1], server_id):
+        if len(chain) > 1 and not set(tools) - self._tools(agent_id, server_id) <= self._effective(chain[:-1], server_id):
             raise PermissionError('MCP assignments cannot widen ancestor access')
-        self.store.execute('INSERT INTO mcp_assignments VALUES(?,?,?) '
-                           'ON CONFLICT(agent_id,server_id) DO UPDATE SET tools=excluded.tools',
-                           (agent_id, server_id, json.dumps(sorted(set(tools)))))
+        if identity.get('_agent_id'):
+            actor_id = identity['_agent_id']
+            if actor_id == agent_id or actor_id not in {member['id'] for member in chain[:-1]}:
+                raise PermissionError('Only an ancestor agent may change enabled MCP tools')
+            actor_chain = await self._chain(await self.service.agent(actor_id))
+            if not set(tools) - self._tools(agent_id, server_id) <= self._effective(actor_chain, server_id):
+                raise PermissionError('MCP assignments cannot widen actor access')
+
+    async def assign(self, identity, agent_id, server_id, tools):
+        await self.validate_assignment(identity, agent_id, server_id, tools)
+        async with self.service.configuration_change(await self.service.affected_agents(agent_id)):
+            self.store.execute('INSERT INTO mcp_assignments VALUES(?,?,?) '
+                               'ON CONFLICT(agent_id,server_id) DO UPDATE SET tools=excluded.tools',
+                               (agent_id, server_id, json.dumps(sorted(set(tools)))))
         self.store.audit(identity['userid'], 'assign-mcp-tools', agent_id + '/' + server_id)
+
+    async def set_enabled(self, identity, agent_id, server_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError('Invalid MCP enabled flag')
+        agent = await self.service.authorize(identity, agent_id)
+        chain = await self._chain(agent)
+        if not self.store.one('SELECT id FROM mcp_servers WHERE id=?', (server_id,)):
+            raise ValueError('MCP server is unavailable')
+        actor_id = identity.get('_agent_id')
+        if actor_id and (actor_id == agent_id or actor_id not in {member['id'] for member in chain[:-1]}):
+            raise PermissionError('Only an ancestor agent may change enabled MCP servers')
+        selected = self.selected_servers(agent)
+        if enabled and server_id not in selected and not self.server_enabled(chain[:-1], server_id):
+            raise PermissionError('MCP selections cannot widen ancestor access')
+        if enabled:
+            selected.add(server_id)
+        else:
+            selected.discard(server_id)
+        async with self.service.configuration_change(await self.service.affected_agents(agent_id)):
+            self.store.execute('UPDATE agents SET enabled_mcp_servers=? WHERE id=?', (json.dumps(sorted(selected)), agent_id))
+        self.store.audit(identity['userid'], 'enable-mcp-server' if enabled else 'disable-mcp-server', agent_id + '/' + server_id)
 
     async def bindings(self, identity, agent_id):
         agent = await self.service.authorize(identity, agent_id)

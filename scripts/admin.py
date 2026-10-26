@@ -24,8 +24,7 @@ def service():
                          str(root / env.get('MASTER_KEY_PATH', 'secrets/master_key'))),
                    Settings(env['CLOUDSTACK_URL'], env['PUBLIC_ORIGIN'], cmk='/usr/local/bin/cmk',
                             cloudstack_ui_url=env.get('CLOUDSTACK_UI_URL', ''),
-                            guest_assets=volume['Mountpoint'] + '/guest-assets',
-                            max_hierarchy_depth=int(env.get('MAX_HIERARCHY_DEPTH', '10'))))
+                            guest_assets=volume['Mountpoint'] + '/guest-assets'))
 
 
 async def perform(options, app, login=None):
