@@ -19,6 +19,10 @@ class AgentCapabilities:
     async def subgroup_capability(self, agent_id):
         return True
 
+    async def owner_ssh_key_access(self, agent):
+        return {'selected': bool(agent.get('owner_ssh_key_enabled', True)),
+                'allowed': True}
+
     async def provider_configuration(self, identity, agent_id):
         providers = await self.providers(identity)
         return {'providers': providers, 'selected': [row['id'] for row in providers], 'allowed': None}
@@ -100,6 +104,8 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
             self.updates.append((identity['userid'], agent_id, instructions))
             agent['instructions'] = instructions
             agent['thinking'] = thinking
+            if 'owner_ssh_key_enabled' in compaction:
+                agent['owner_ssh_key_enabled'] = compaction['owner_ssh_key_enabled']
 
     class Runtime:
         async def start(self):
@@ -178,6 +184,9 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         assert runtime.sent == [('human', 'agent', 'Hello research')]
         user.find('Configure').click()
         await user.should_see('Rotate credentials')
+        owner_access = next(iter(user.find(kind=ui.checkbox, content='Access owner SSH public key').elements))
+        assert owner_access.value is True and owner_access.enabled
+        user.find('Access owner SSH public key').click()
         user.find('System prompt').clear().type('Explain research in German.')
         before_save = auth.calls
         user.find('Save').click()
@@ -186,6 +195,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         assert auth.calls > before_save
         user.find('Configure').click()
         await user.should_see('Explain research in German.')
+        assert not next(iter(user.find(kind=ui.checkbox, content='Access owner SSH public key').elements)).value
         user.find('Rotate credentials').click()
         await asyncio.sleep(0.1)
         assert service.rotations == [('human', 'agent')]

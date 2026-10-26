@@ -787,6 +787,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             options = {p['id']: p['name'] for p in await service.providers(current)}
             with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-4'):
                 ui.label('Configure ' + agent['name']).classes('text-xl font-semibold')
+                key_access = await service.owner_ssh_key_access(agent)
+                owner_key_enabled = ui.checkbox('Access owner SSH public key', value=key_access['selected'] and key_access['allowed'])
+                if not key_access['allowed']:
+                    owner_key_enabled.disable()
+                    ui.label('Disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
                 provider_access = await service.provider_configuration(current, agent['id'])
                 enabled_providers = ui.select(options, label='Enabled providers', multiple=True,
                     value=provider_access['selected']).classes('w-full')
@@ -964,6 +969,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 async def save():
                     options = {'enabled_providers': enabled_providers.value}
+                    if key_access['allowed']:
+                        options['owner_ssh_key_enabled'] = owner_key_enabled.value
                     if automatic.value and (type(auto_percent.value) not in {int, float}
                                             or not 1 <= auto_percent.value <= 99 or int(auto_percent.value) != auto_percent.value):
                         raise ValueError('Automatic compaction must be a whole percentage from 1 to 99, or disabled')

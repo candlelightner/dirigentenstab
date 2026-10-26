@@ -745,11 +745,12 @@ class Runtime:
 
         @agent.tool_plain(sequential=True)
         async def configure_agent(target_agent_id: str, settings: dict | None = None) -> dict:
-            """Inspect safe current settings and allowed provider/MCP IDs by omitting settings; edit your own prompt or a descendant.
+            """Inspect settings, provider/MCP IDs and the owner's SSH public key when access is enabled; omit settings to read.
 
             Settings keys: instructions, provider_id, model, thinking, compaction_provider_id, compaction_model,
             auto_compact_percent, context_window, enabled_providers (provider IDs), enabled_mcp_servers (server IDs),
-            mcp_tools (map of server ID to tool names). Your own edits may only set instructions. Never assign work.
+            mcp_tools (map of server ID to tool names), owner_ssh_key_enabled (boolean).
+            Edit your own prompt or a descendant; your own edits may only set instructions. Never assign work.
             """
             return await invoke(self.service.configure_agent, agent_id, target_agent_id, settings)
 

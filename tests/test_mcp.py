@@ -214,13 +214,15 @@ def test_migration_preserves_existing_agents(environment):
     e.store.execute('ALTER TABLE agents DROP COLUMN thinking')
     e.store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     e.store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    e.store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     e.store.execute('PRAGMA user_version=10')
     store = Store(str(e.store.path), str(e.key))
     assert {row['id']: row['credentials'] for row in store.all('SELECT id,credentials FROM agents')} == original
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 15
+    assert store.one('PRAGMA user_version')['user_version'] == 16
+    assert all(row['owner_ssh_key_enabled'] == 1 for row in store.all('SELECT * FROM agents'))
 
 
 @pytest.mark.parametrize('url', ['https://mcp.tavily.com/mcp', 'https://mcp.tavily.com/mcp/'])
@@ -508,3 +510,45 @@ async def test_agent_can_inspect_own_and_descendant_settings_without_exposing_cr
     assert not any(secret in json.dumps(child) for secret in ('private-bearer-token', 'provider-secret', 'credentials', 'api_key'))
     with pytest.raises(PermissionError):
         await e.service.configure_agent('leaf-agent', 'middle-agent')
+
+
+async def test_owner_public_key_visibility_defaults_on_inherits_denial_and_requires_parent_configuration(environment):
+    import asyncssh
+
+    e = environment
+    native_actor_clients(e)
+    key = asyncssh.generate_private_key('ssh-ed25519')
+    public = key.export_public_key().decode().strip()
+    await e.service.save_owner_ssh_key(e.root, public)
+    assert all(row['owner_ssh_key_enabled'] == 1 for row in e.store.all('SELECT * FROM agents'))
+    own = await e.service.configure_agent('leaf-agent', 'leaf-agent')
+    assert own['owner_ssh_public_key'] == public
+    assert own['owner_ssh_key_access'] == {'selected': True, 'allowed': True, 'enabled': True}
+    assert key.export_private_key().decode() not in json.dumps(own)
+
+    await e.service.update_agent(e.root, 'middle-agent', None, '', '', owner_ssh_key_enabled=False)
+    denied = await e.service.configure_agent('leaf-agent', 'leaf-agent')
+    assert denied['owner_ssh_public_key'] is None
+    assert public not in json.dumps(denied)
+    assert denied['owner_ssh_key_access'] == {'selected': True, 'allowed': False, 'enabled': False}
+    # Saving other settings retains the child's selection without overriding inherited denial.
+    await e.service.update_agent(e.root, 'leaf-agent', None, '', 'Updated prompt')
+    assert (await e.service.agent('leaf-agent'))['owner_ssh_key_enabled'] == 1
+    with pytest.raises(PermissionError, match='ancestor access'):
+        await e.service.update_agent(e.root, 'leaf-agent', None, '', '', owner_ssh_key_enabled=True)
+    with pytest.raises(PermissionError, match='ancestor access'):
+        await e.service.configure_agent('middle-agent', 'leaf-agent', {'owner_ssh_key_enabled': True})
+    for enabled in (False, True):
+        with pytest.raises(PermissionError, match='own system prompt'):
+            await e.service.configure_agent('leaf-agent', 'leaf-agent', {'owner_ssh_key_enabled': enabled})
+    with pytest.raises(PermissionError):
+        await e.service.configure_agent('other-agent', 'leaf-agent', {'owner_ssh_key_enabled': False})
+    with pytest.raises(ValueError, match='boolean'):
+        await e.service.update_agent(e.root, 'leaf-agent', None, '', '', owner_ssh_key_enabled='yes')
+
+    await e.service.update_agent(e.root, 'middle-agent', None, '', '', owner_ssh_key_enabled=True)
+    assert (await e.service.configure_agent('leaf-agent', 'leaf-agent'))['owner_ssh_public_key'] == public
+    await e.service.configure_agent('middle-agent', 'leaf-agent', {'owner_ssh_key_enabled': False})
+    assert (await e.service.configure_agent('leaf-agent', 'leaf-agent'))['owner_ssh_public_key'] is None
+    await e.service.configure_agent('middle-agent', 'leaf-agent', {'owner_ssh_key_enabled': True})
+    assert (await e.service.configure_agent('middle-agent', 'leaf-agent'))['owner_ssh_public_key'] == public

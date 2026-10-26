@@ -559,6 +559,12 @@ class Service:
             if paused:
                 await runtime.resume_agents(new_ids)
 
+    async def owner_ssh_key_access(self, agent):
+        chain = await self.agent_chain(agent)
+        allowed = all(member['owner_ssh_key_enabled'] for member in chain[:-1])
+        selected = bool(agent['owner_ssh_key_enabled'])
+        return {'selected': selected, 'allowed': allowed, 'enabled': selected and allowed}
+
     def owner_ssh_key(self, identity):
         if identity.get('_agent_id') or identity.get('type') != 1:
             raise PermissionError('Owner SSH configuration requires a human platform administrator')
@@ -604,14 +610,18 @@ class Service:
             from .mcp import MCP
             providers = await self.provider_configuration(identity, target_id)
             mcp = await MCP(self).configuration(identity, target_id)
+            key_access = await self.owner_ssh_key_access(target)
+            owner_key = (self.store.one("SELECT value FROM platform_settings WHERE name='owner_ssh_public_key'")
+                         if key_access['enabled'] else None)
             return {'agent': {key: target[key] for key in ('id', 'name', 'provider_id', 'model', 'instructions',
                     'thinking', 'compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window')},
                     'enabled_providers': providers['selected'], 'allowed_providers': providers['allowed'],
-                    'providers': providers['providers'], 'mcp_servers': mcp['servers']}
+                    'providers': providers['providers'], 'mcp_servers': mcp['servers'],
+                    'owner_ssh_key_access': key_access, 'owner_ssh_public_key': owner_key['value'] if owner_key else None}
         if not isinstance(settings, dict) or not settings:
             raise ValueError('Supply agent settings')
         allowed = {'provider_id', 'model', 'instructions', 'thinking', 'compaction_provider_id',
-                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'mcp_tools'}
+                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'mcp_tools', 'owner_ssh_key_enabled'}
         if set(settings) - allowed:
             raise ValueError('Unsupported agent setting')
         if actor_id == target_id and set(settings) != {'instructions'}:
@@ -662,7 +672,7 @@ class Service:
 
     async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None,
                            *, thinking=None, compaction_provider_id=_UNSET, compaction_model=_UNSET,
-                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET):
+                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, owner_ssh_key_enabled=_UNSET):
         agent = await self.authorize(identity, agent_id)
         if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
             raise ValueError('Provider missing')
@@ -700,11 +710,16 @@ class Service:
         chain = await self.agent_chain(agent)
         actor_id = identity.get('_agent_id')
         if actor_id == agent_id and (provider_id != agent['provider_id'] or model != agent['model'] or
-                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or any(
+                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or owner_ssh_key_enabled is not _UNSET or any(
                     value is not _UNSET for value in (compaction_provider_id, compaction_model, auto_compact_percent, context_window))):
             raise PermissionError('An agent may only edit its own system prompt')
         if actor_id and actor_id != agent_id and actor_id not in {member['id'] for member in chain[:-1]}:
             raise PermissionError('Only an ancestor agent may configure descendants')
+        if owner_ssh_key_enabled is not _UNSET:
+            if type(owner_ssh_key_enabled) is not bool:
+                raise ValueError('Owner SSH public key access must be a boolean')
+            if owner_ssh_key_enabled and not all(member['owner_ssh_key_enabled'] for member in chain[:-1]):
+                raise PermissionError('Owner SSH public key access cannot widen ancestor access')
         selection = self.selected_providers(agent) if enabled_providers is _UNSET else enabled_providers
         if not isinstance(selection, (set, list)) or any(not isinstance(item, str) for item in selection):
             raise ValueError('Enabled providers must be a list of provider IDs')
@@ -737,11 +752,12 @@ class Service:
         async with self.configuration_change(affected):
             self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking),'
                                'compaction_provider_id=?,compaction_model=?,auto_compact_percent=?,context_window=?,'
-                               'enabled_providers=?,enabled_mcp_servers=? WHERE id=?',
+                               'enabled_providers=?,enabled_mcp_servers=?,owner_ssh_key_enabled=? WHERE id=?',
                                (provider_id or None, model, instructions, thinking, compaction['compaction_provider_id'],
                                 compaction['compaction_model'], percentage, window,
                                 json.dumps(sorted(selection)) if enabled_providers is not _UNSET else agent.get('enabled_providers'),
-                                json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'), agent_id))
+                                json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'),
+                                agent['owner_ssh_key_enabled'] if owner_ssh_key_enabled is _UNSET else owner_ssh_key_enabled, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, call, user_id, name):
