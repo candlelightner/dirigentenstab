@@ -64,15 +64,23 @@ async def login(page, url):
     await page.get_by_label('Username', exact=True).fill('alice')
     await page.get_by_label('Password', exact=True).fill('browser-fixture-password')
     await page.get_by_role('button', name='Sign in', exact=True).click()
-    await page.get_by_text('Main Agent', exact=True).last.wait_for()
+    await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Main Agent', exact=True).wait_for()
     await page.wait_for_function('window.socket?.connected && window.did_handshake')
 
 
+async def select_agent(page, name):
+    search = page.get_by_label('Search agents and domains', exact=True)
+    if not await search.is_visible():
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+    await search.fill(name)
+    await page.locator('.q-tree').get_by_text(name, exact=True).click()
+    await search.wait_for(state='hidden')
+    await page.get_by_role('button', name='Agent details', exact=True).get_by_text(name, exact=True).wait_for()
+
+
 async def open_configuration(page):
-    header = page.locator('.agent-details .q-expansion-item__container > .q-item').first
-    if await header.get_attribute('aria-expanded') == 'false':
-        await header.click()
-    await page.get_by_role('button', name='Configure', exact=True).click()
+    await page.get_by_role('button', name='Agent details', exact=True).click()
+    await page.locator('.agent-details').get_by_role('button', name='Configure', exact=True).click()
 
 
 async def test_browser_secure_login_direct_chat_history_provider_and_logout(browser_app):
@@ -88,9 +96,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await login(page, url)
         cookie = next(cookie for cookie in await context.cookies() if cookie['name'] == 'ds_session')
         assert cookie['httpOnly'] and cookie['secure'] and cookie['sameSite'] == 'Strict'
-        await page.get_by_label('Agent', exact=True).fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await page.get_by_label('Message', exact=True).fill('Inspect the research VM')
         await page.get_by_role('button', name='Send', exact=True).click()
         output = 'Infrastructure checked. The research VM is running.'
@@ -155,17 +161,11 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         assert await page.get_by_role('button', name='Send', exact=True).is_disabled()
         assert (await message.bounding_box())['x'] < 60
         for name in ('Team 11 Level 3', 'Team 2 Level 3'):
-            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-            search = page.get_by_label('Search agents and domains', exact=True)
-            await search.fill(name)
-            await page.wait_for_timeout(350)  # Quasar's branch expansion transition.
             try:
-                await page.locator('.q-tree').get_by_text(name, exact=True).click(timeout=10000)
+                await select_agent(page, name)
             except Exception:
                 await page.screenshot(path=str(state / 'selection-failure.png'), full_page=True)
                 raise
-            await search.wait_for(state='hidden')
-            await page.locator('.agent-details').get_by_text(name, exact=True).wait_for()
             assert (await message.bounding_box())['x'] < 60
             assert await page.evaluate('window.scrollY === 0')
         await open_configuration(page)
@@ -184,9 +184,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await page.get_by_role('dialog').wait_for(state='hidden')
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await page.get_by_label('Agent', exact=True).fill('Team 2 Level 3')
-        await page.get_by_role('option', name='Team 2 Level 3', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Team 2 Level 3', exact=True).wait_for()
+        await select_agent(page, 'Team 2 Level 3')
         await open_configuration(page)
         await page.get_by_label('Model ID', exact=True).wait_for()
         await playwright.expect(page.get_by_label('Model ID', exact=True)).to_have_value('custom-private-model')
@@ -219,7 +217,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         assert box and box['y'] + box['height'] <= 480
         await page.screenshot(path=str(state / 'mobile-visual-keyboard.png'), full_page=True)
         await page.evaluate("delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'))")
-        await page.locator('.agent-details').wait_for()
+        await page.get_by_role('button', name='Agent details', exact=True).wait_for()
         await open_configuration(page)
         await page.get_by_label('Model ID', exact=True).wait_for()
         await page.evaluate('''() => {
@@ -367,9 +365,6 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
         await login(page, url)
-        selector = page.get_by_label('Agent', exact=True)
-        await selector.fill('Main Agent')
-        await page.get_by_role('option', name='Main Agent', exact=True).click()
         await open_configuration(page)
         owner_access = page.get_by_role('checkbox', name='Access owner SSH public key', exact=True)
         await playwright.expect(owner_access).to_be_checked()
@@ -410,8 +405,6 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await page.set_viewport_size({'width': 390, 'height': 844})
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await selector.fill('Main Agent')
-        await page.get_by_role('option', name='Main Agent', exact=True).click()
         await open_configuration(page)
         await playwright.expect(page.get_by_label('System prompt', exact=True)).to_have_value(prompt)
         await playwright.expect(owner_access).not_to_be_checked()
@@ -434,9 +427,7 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await page.get_by_role('button', name='Close MCP tools', exact=True).click()
         await page.get_by_role('button', name='Cancel', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await open_configuration(page)
         await playwright.expect(owner_access).to_be_disabled()
         await playwright.expect(owner_access).not_to_be_checked()
@@ -447,15 +438,14 @@ async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app)
         await browser.close()
 
 
-async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(browser_app):
+async def test_browser_header_agent_details_and_sidebar_selection_on_desktop_and_mobile(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
         await login(page, url)
-        selector = page.get_by_label('Agent', exact=True)
         details = page.locator('.agent-details')
-        header = details.locator('.q-expansion-item__container > .q-item').first
+        opener = page.locator('.q-header').get_by_role('button', name='Agent details', exact=True)
         configure = details.get_by_role('button', name='Configure', exact=True)
         subgroup = details.get_by_role('button', name='Create subgroup', exact=True)
         for width, height in [(1440, 900), (390, 844)]:
@@ -464,14 +454,15 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
                 await page.locator('.q-drawer--mobile').wait_for(state='attached')
             toggle = page.locator('.q-header').get_by_role('button', name='Open agent hierarchy', exact=True)
             await playwright.expect(toggle).to_be_visible()
-            await playwright.expect(page.locator('.q-header').get_by_label('Agent', exact=True)).to_be_visible()
-            assert await page.get_by_text('Dirigentenstab', exact=True).count() == 0
+            await playwright.expect(opener).to_be_visible()
+            assert await page.get_by_label('Agent', exact=True).count() == 0
             assert await page.get_by_label('Chat directly with an agent', exact=True).count() == 0
+            assert await page.locator('.workspace .agent-details').count() == 0
             controls = page.locator('.conversation-controls')
             assert await controls.get_by_label('Conversation', exact=True).is_visible()
             assert await controls.get_by_role('button', name='New conversation', exact=True).is_visible()
             assert await controls.evaluate('el => el.parentElement.firstElementChild === el')
-            assert await details.evaluate('el => el.previousElementSibling.classList.contains("conversation-controls")')
+            assert await page.locator('.conversation').evaluate('el => el.previousElementSibling.classList.contains("conversation-controls")')
             run_details = page.locator('.run-details')
             await playwright.expect(run_details.locator('.q-item').first).to_have_attribute('aria-expanded', 'false')
             assert await run_details.evaluate('el => el.previousElementSibling.classList.contains("composer")')
@@ -482,65 +473,44 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             await toggle.focus()
             await toggle.press('Enter')
             await playwright.expect(search).to_be_visible()
-            await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
-            await search.wait_for(state='hidden')
-            await selector.fill('Research')
-            await page.get_by_role('option', name='Research Admin', exact=True).click()
-            await header.get_by_text('Research Admin', exact=True).wait_for()
-            if width <= 600:
-                await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
-                await header.click()
+            await select_agent(page, 'Research Admin')
+            await details.wait_for(state='hidden')
+            await opener.click()
             await configure.wait_for()
             await subgroup.wait_for()
+            await details.get_by_text('Domain administrator', exact=True).wait_for()
             await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for()
-            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
             await details.get_by_text('Domain details', exact=True).click()
-            account = details.get_by_text('Administrator account: research-account', exact=True)
-            try:
-                await account.wait_for()
-            except Exception:
-                await page.screenshot(path=str(state / 'account-expansion-failure.png'), full_page=True)
-                print('Expansion width:', width, await header.get_attribute('aria-expanded'))
-                raise
-            expanded_height = (await details.bounding_box())['height']
-            await header.click()
-            await configure.wait_for(state='hidden')
-            await subgroup.wait_for(state='hidden')
-            await account.wait_for(state='hidden')
-            await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for(state='hidden')
-            await details.get_by_text('Domain details', exact=True).wait_for(state='hidden')
-            await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
-            assert await header.get_by_text('Research Admin', exact=True).is_visible()
-            assert await header.get_by_text('Domain administrator', exact=True).is_visible()
-            assert (await details.bounding_box())['height'] < expanded_height
-            assert await details.get_by_role('button').count() == 1
-            await header.focus()
-            await header.press('Enter')
-            await configure.wait_for()
-            await account.wait_for()
-            await configure.click()
+            await details.get_by_text('Administrator account: research-account', exact=True).wait_for()
+            await details.get_by_text('Virtual machines', exact=True).click()
+            await details.get_by_text('research-vm · Running', exact=True).scroll_into_view_if_needed()
+            menu_box = await page.locator('.agent-details-menu').bounding_box()
+            assert menu_box and 0 <= menu_box['x'] <= width - menu_box['width']
+            assert 0 <= menu_box['y'] <= height - menu_box['height']
+            await page.screenshot(path=str(state / f'header-agent-details-open-{width}.png'), full_page=True)
+            await details.get_by_role('button', name='Close agent details', exact=True).click()
+            await details.wait_for(state='hidden')
+            await open_configuration(page)
             await page.get_by_label('System prompt', exact=True).wait_for()
+            await details.wait_for(state='hidden')
             await page.get_by_role('button', name='Cancel', exact=True).click()
             await page.get_by_role('dialog').wait_for(state='hidden')
-            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
+            await opener.click()
             await subgroup.click()
             await page.get_by_text('Create subgroup under Research Admin', exact=True).wait_for()
+            await details.wait_for(state='hidden')
             await page.get_by_role('button', name='Cancel', exact=True).click()
             await page.get_by_role('dialog').wait_for(state='hidden')
-            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
-            await header.focus()
-            await header.press('Space')
-            await configure.wait_for(state='hidden')
-            await page.screenshot(path=str(state / f'agent-details-collapsed-{width}.png'), full_page=True)
-            await selector.fill('Main Agent')
-            await page.get_by_role('option', name='Main Agent', exact=True).click()
-            await header.get_by_text('Main Agent', exact=True).wait_for()
-            if width <= 600:
-                await playwright.expect(header).to_have_attribute('aria-expanded', 'false')
-                await header.click()
+            await opener.click()
+            await details.wait_for()
+            await page.keyboard.press('Escape')
+            await details.wait_for(state='hidden')
+            await page.screenshot(path=str(state / f'header-agent-details-closed-{width}.png'), full_page=True)
+            await select_agent(page, 'Main Agent')
+            await opener.click()
             await configure.wait_for()
-            await playwright.expect(header).to_have_attribute('aria-expanded', 'true')
-            assert await header.get_by_text('Main Agent', exact=True).is_visible()
+            await details.get_by_role('button', name='Close agent details', exact=True).click()
+            await details.wait_for(state='hidden')
             assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert await run_details.evaluate('el => el.getBoundingClientRect().bottom <= innerHeight')
         await browser.close()
@@ -554,10 +524,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
         await login(page, url)
-        agent = page.get_by_label('Agent', exact=True)
-        await agent.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await open_configuration(page)
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         thinking = page.get_by_label('Thinking level', exact=True)
@@ -569,9 +536,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         assert store.one("SELECT thinking FROM agents WHERE id='research'")['thinking'] == 'max'
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await agent.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await open_configuration(page)
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         await thinking.click()
@@ -605,9 +570,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         assert not await indicator.is_visible()
-        await agent.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await page.get_by_label('Conversation', exact=True).fill('thinking indicator')
         await page.get_by_role('option', name='thinking indicator', exact=True).click()
         await page.get_by_text('Pending response complete.', exact=True).wait_for()
@@ -624,10 +587,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
         await login(page, url)
-        selector = page.get_by_label('Agent', exact=True)
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         store = Store(str(state / 'browser.db'), str(state / 'master'))
         for restored in (False, True):
             title = 'stop fixture restored' if restored else 'stop fixture current'
@@ -638,9 +598,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
             if restored:
                 await page.reload()
                 await page.wait_for_function('window.socket?.connected && window.did_handshake')
-                await selector.fill('Research')
-                await page.get_by_role('option', name='Research Admin', exact=True).click()
-                await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+                await select_agent(page, 'Research Admin')
                 await page.get_by_label('Conversation', exact=True).fill(title)
                 await page.get_by_role('option', name=title, exact=True).click()
                 await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
@@ -669,10 +627,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
         await login(page, url)
-        selector = page.get_by_label('Agent', exact=True)
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await open_configuration(page)
         await page.get_by_text('Context compaction', exact=True).click()
         await page.get_by_text('Provider model API (context_window).', exact=False).wait_for()
@@ -699,9 +654,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
                             'auto_compact_percent': 75, 'context_window': 65536}
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await open_configuration(page)
         await page.get_by_text('Manual context-window override.', exact=False).wait_for()
         assert await model.input_value() == 'second-model'
@@ -730,9 +683,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         assert tool_budget['usable_tokens'] == 57344
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
-        await page.locator('.agent-details').get_by_text('Research Admin', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
         await playwright.expect(meter).not_to_be_visible()
@@ -746,8 +697,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?', (store.seal(checkpoint), run['id']))
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await selector.fill('Research')
-        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await select_agent(page, 'Research Admin')
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
         await page.get_by_text('Run details', exact=True).click()

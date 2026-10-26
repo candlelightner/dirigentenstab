@@ -155,28 +155,27 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         await user.should_see('Select an agent to begin')
         await user.should_not_see('Chat directly with an agent')
         toggle = next(iter(user.find('hierarchy_toggle').elements))
-        selector = next(iter(user.find('agent_selector').elements))
+        heading = next(iter(user.find('agent_details_toggle').elements))
         assert isinstance(toggle.parent_slot.parent, ui.header)
-        assert isinstance(selector.parent_slot.parent, ui.header)
-        assert selector.props['label'] == 'Agent'
+        assert isinstance(heading.parent_slot.parent, ui.header)
+        assert heading.props['aria-label'] == 'Agent details'
+        assert not heading.enabled
+        await user.should_not_see('agent_selector')
         assert toggle.props['aria-label'] == 'Open agent hierarchy'
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await asyncio.sleep(0.1)
         assert auth.calls >= 2, user.notify.messages
         assert not user.notify.messages, user.notify.messages
         await user.should_see('Administrator account: cloud-account')
-        expansion = next(iter(user.find('agent_details').elements))
-        assert expansion.value is True
-        header = list(expansion.slots['header'].children[0].descendants())
-        assert {element.text for element in header if isinstance(element, (ui.label, ui.badge))} == {
+        details = next(iter(user.find('agent_details').elements))
+        assert heading.text == 'Research agent' and heading.enabled
+        menu = next(element for element in details.ancestors() if isinstance(element, ui.menu))
+        assert menu.value is False
+        labels = list(details.default_slot.children[0].descendants())
+        assert {element.text for element in labels if isinstance(element, (ui.label, ui.badge))} == {
             'Research agent', 'Domain administrator'}
-        assert not any(isinstance(element, ui.button) for element in header)
-        body = list(expansion.default_slot.children[0].descendants())
-        assert {element.text for element in body if isinstance(element, ui.button)} == {'Configure', 'Create subgroup'}
-        user.find('agent_details').trigger('update:modelValue', False)
-        assert expansion.value is False
-        user.find('agent_details').trigger('update:modelValue', True)
-        assert expansion.value is True
+        actions = list(details.default_slot.children[1].descendants())
+        assert {element.text for element in actions if isinstance(element, ui.button)} == {'Configure', 'Create subgroup'}
         user.find('Message').type('Hello research')
         user.find('Send').click()
         user.find('Send').trigger('click')
@@ -347,7 +346,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         build_ui(Service(), auth, Runtime())
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
         user.find('Configure').click()
         await user.should_see('System prompt')
@@ -496,7 +495,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
         build_ui(Service(), Auth(), runtime)
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
         user.find('Configure').click()
         await user.should_see('Model API effort.supported_levels')
@@ -587,7 +586,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         build_ui(Service(), Auth(), runtime)
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
         await user.should_not_see('Stop conversation')
         if restored:
@@ -671,7 +670,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         build_ui(Service(), Auth(), runtime)
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
         user.find('Configure').click()
         await user.should_see('Provider API context_window.')
@@ -776,7 +775,7 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
         build_ui(Service(), Auth(), runtime)
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        user.find('agent_selector').trigger('update:modelValue', {'value': 0})
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
         await user.should_see('Configure')
         selector = next(iter(user.find(kind=ui.select, content='Conversation').elements))
         assert list(selector.options) == ['second', 'first']
