@@ -814,7 +814,45 @@ class Runtime:
                                                        self.service.store.seal([]), self.service.store.seal(state)))
             run = self.service.store.one('SELECT * FROM chat_runs WHERE id=?', (operation_id,))
             self._launch(run, on_event)
+            if not row:
+                asyncio.create_task(self._summarize_title(conversation_id, prompt))
         return {'conversation_id': conversation_id, 'operation_id': operation_id, 'status': 'running'}
+
+    async def _summarize_title(self, conversation_id, prompt):
+        if not hasattr(self.service, 'summary_settings'):
+            return
+        try:
+            settings = self.service.summary_settings()
+        except Exception:
+            return
+        provider_id = settings.get('provider_id')
+        if not provider_id:
+            return
+        provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (provider_id,))
+        if not provider:
+            return
+        model_id = settings.get('model') or provider.get('default_model')
+        if not model_id:
+            return
+        try:
+            from .service import DEFAULT_SUMMARY_PROMPT
+            instructions = settings.get('prompt') or DEFAULT_SUMMARY_PROMPT
+            model = build_model(provider, model_id, self.service.store)
+            agent = Agent(model, retries=0,
+                          model_settings={'max_tokens': 120, 'timeout': 30},
+                          instructions=instructions)
+            async with asyncio.timeout(30):
+                try:
+                    async with agent.run_stream(prompt, usage_limits=UsageLimits(request_limit=1, tool_calls_limit=0)) as result:
+                        raw_output = await result.get_output()
+                except Exception:
+                    run_result = await agent.run(prompt, usage_limits=UsageLimits(request_limit=1, tool_calls_limit=0))
+                    raw_output = run_result.output
+            title = self.service.redact(raw_output.strip()).splitlines()[0].strip().strip('"\':')[:80] if isinstance(raw_output, str) and raw_output.strip() else ''
+            if title:
+                self.service.store.execute('UPDATE conversations SET title=? WHERE id=?', (title, conversation_id))
+        except Exception:
+            return
 
     async def chat(self, identity, agent_id, conversation_id, prompt, on_event=None):
         accepted = await self.submit(identity, agent_id, conversation_id, prompt, on_event)

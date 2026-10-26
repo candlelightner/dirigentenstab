@@ -112,8 +112,10 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await page.get_by_role('option', name='Inspect the research VM', exact=True).click()
         await page.get_by_text(output, exact=True).wait_for()
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Model providers', exact=True).click()
         await page.get_by_label('Base URL (including /v1)', exact=True).wait_for()
+        await page.get_by_label('Summary model provider', exact=True).wait_for()
         await page.get_by_role('button', name='Close', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
         await page.evaluate('window.scrollTo(0, 0)')
@@ -126,6 +128,10 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         await page.screenshot(path=str(state / 'mobile.png'), full_page=True)
         assert not errors
+        assert await page.locator('.q-header').get_by_role('button', name='Sign out').count() == 0
+        assert await page.locator('[data-mark="hub_activity"]').count() == 0
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Sign out', exact=True).click()
         await page.get_by_role('button', name='Sign in', exact=True).wait_for()
         assert not any(cookie['name'] == 'ds_session' for cookie in await context.cookies())
@@ -307,6 +313,7 @@ async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(bro
         await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await link.wait_for()
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Platform settings', exact=True).click()
         await page.get_by_label('CloudStack Dashboard URL', exact=True).fill('https://another.tailnet.invalid/client')
         await page.get_by_role('button', name='Save', exact=True).click()
@@ -326,6 +333,7 @@ async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
         await login(page, url)
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='GPU policies', exact=True).click()
         await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
         await page.get_by_role('option', name='ROOT', exact=True).click()
@@ -345,6 +353,7 @@ async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
             await page.locator('.q-drawer--mobile').wait_for(state='attached')
             await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='GPU policies', exact=True).click()
         await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
         await page.get_by_role('option', name='ROOT', exact=True).click()
@@ -792,7 +801,6 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
         await page.locator('.thinking-indicator').wait_for(state='hidden')
         assert run('stop fixture second independent conversation')['status'] == 'running'
-        await page.get_by_text('Blocked / paused', exact=False).wait_for()
         assert await conversation_options() == options_before_stop
         await choose('stop fixture second independent conversation')
         await send('Inspect resources after interrupting this conversation')
@@ -804,6 +812,7 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for(state='hidden')
         await send('background fixture survives logout')
         await page.get_by_text('Background work accepted.', exact=True).wait_for()
+        await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Sign out', exact=True).click()
         await page.get_by_role('button', name='Sign in', exact=True).wait_for()
         for _ in range(100):

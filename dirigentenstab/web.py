@@ -156,7 +156,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     error = diagnose(exc, agent_id=state['agent'])
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'seen': {}, 'drafts': {}}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}}
         agents = {row['id']: row for row in data.get('agents', [])}
         dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
         dashboard_links = []
@@ -181,10 +181,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
-            ui.html('<form method="post" action="/auth/logout" onsubmit="window.socket?.disconnect()"><input type="hidden" name="csrf" value="'
-                    + html.escape(identity['csrf'], quote=True)
-                    + '"><button type="submit" class="border rounded px-3 py-1">Sign out</button></form>',
-                    sanitize=False)
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
@@ -248,15 +244,23 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
                     tree = ui.tree(hierarchy_nodes(data)).classes('w-full').mark('hierarchy')
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
-                activity_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('hub_activity').style('white-space:pre-line;max-height:140px;overflow:auto')
-                providers_button = ui.button('Model providers', icon='settings').props('outline').classes('w-full') \
-                    if identity.get('type') == 1 else None
-                platform_button = None
-                gpu_button = None
                 if identity.get('type') == 1:
                     dashboard_link('dashboard-mobile w-full text-teal-900')
-                    platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('outline').classes('w-full')
-                    gpu_button = ui.button('GPU policies', icon='memory').props('outline').classes('w-full')
+                with ui.button('Settings', icon='settings').props('outline aria-haspopup="menu"').classes('w-full').mark('settings_button'):
+                    with ui.menu().classes('bg-white p-2 min-w-[200px]').mark('settings_menu') as settings_menu:
+                        with ui.column().classes('gap-1 p-0 w-full'):
+                            if identity.get('type') == 1:
+                                providers_button = ui.button('Model providers', icon='settings').props('flat no-caps align=left').classes('w-full')
+                                platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('flat no-caps align=left').classes('w-full')
+                                gpu_button = ui.button('GPU policies', icon='memory').props('flat no-caps align=left').classes('w-full')
+                            else:
+                                providers_button = None
+                                platform_button = None
+                                gpu_button = None
+                            ui.html('<form method="post" action="/auth/logout" class="w-full" onsubmit="window.socket?.disconnect()"><input type="hidden" name="csrf" value="'
+                                    + html.escape(identity['csrf'], quote=True)
+                                    + '"><button type="submit" class="w-full text-left px-3 py-2 rounded hover:bg-stone-100">Sign out</button></form>',
+                                    sanitize=False)
         with ui.column().classes('workspace'):
             with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2'):
                 history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
@@ -581,16 +585,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent_id, conversation_id = state['agent'], state['conversation']
             try:
                 current = await actor()
-                rows = conversation_activity(service.store, current['userid'], list(agents))
-                summaries = []
-                for row in rows:
-                    if row['id'] == conversation_id:
-                        state['seen'][row['id']] = row['updated']
-                    unread = row['updated'] > state['seen'].get(row['id'], 0)
-                    label = 'Blocked / paused' if row['status'] in {'interrupted', 'reconciliation'} else row['status'].capitalize()
-                    summaries.append(f"{agent_label(agents[row['agent_id']])}: {row['title']} · {label}" + (' · unread' if unread else ''))
-                activity_status.set_text('\n'.join(summaries))
                 await histories()
+                rows = conversation_activity(service.store, current['userid'], list(agents))
                 selected = next((row for row in rows if row['id'] == conversation_id), None)
                 if selected:
                     activity_token = (selected['operation_id'], selected['status'], selected['updated'])
@@ -1273,6 +1269,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     providers.update({p['id']: p for p in updated})
                     existing.set_options({'': 'New provider', **{k: p['name'] for k, p in providers.items()}},
                                          value=provider_id)
+                    summary_provider.set_options({'': 'Disabled', **{k: p['name'] for k, p in providers.items()}},
+                                                 value=summary_provider.value)
                     test_status.set_text('Provider saved. Run the tool-calling test before assigning it to an agent.')
                     return provider_id
 
@@ -1298,6 +1296,51 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.button('Save', on_click=lambda: protect(save))
                     ui.button('Discover models', on_click=lambda: protect(discover)).props('outline')
                     ui.button('Test tool calling', on_click=lambda: protect(test)).props('outline')
+                ui.separator().classes('my-1')
+                ui.label('Summary model').classes('text-lg font-semibold')
+                ui.label('Globally select a model to name chats after the first message.').classes('text-sm text-stone-600')
+                summary = service.summary_settings(current)
+                summary_provider = ui.select({'': 'Disabled', **{k: p['name'] for k, p in providers.items()}},
+                                             value=summary['provider_id'] or '', label='Summary model provider').classes('w-full')
+                saved_summary_model = summary['model']
+                summary_model = ui.select([saved_summary_model] if saved_summary_model else [],
+                                          value=saved_summary_model or None, label='Summary model ID',
+                                          with_input=True, new_value_mode='add-unique').classes('w-full')
+                summary_model_status = ui.label('').classes('text-sm').props('role=status')
+                summary_prompt = ui.textarea('Summary prompt', value=summary['prompt']).props('maxlength=16000 rows=2 autogrow').classes('w-full')
+
+                async def load_summary_models():
+                    selected_provider = summary_provider.value
+                    if not selected_provider:
+                        summary_model_status.set_text('Summary model disabled. Chats will retain the initial prompt excerpt.')
+                        return
+                    summary_model.props('loading')
+                    try:
+                        choices = await runtime.models(await actor(), selected_provider)
+                        if summary_provider.value == selected_provider:
+                            selected_model = summary_model.value
+                            summary_model.set_options(list(dict.fromkeys(([selected_model] if selected_model else []) + choices)),
+                                                      value=selected_model)
+                            summary_model_status.set_text(f'{len(choices)} models available. Custom IDs can be entered.' if choices
+                                                          else 'No models discovered. Enter a custom Model ID and press Enter.')
+                    except Exception as exc:
+                        if summary_provider.value == selected_provider:
+                            error = diagnose(exc, tool='discover_summary_models')
+                            summary_model_status.set_text(str(error) + ' Enter a model ID manually.')
+                    finally:
+                        if summary_provider.value == selected_provider:
+                            summary_model.props(remove='loading')
+
+                async def save_summary():
+                    current_actor = await actor()
+                    service.save_summary_settings(current_actor, summary_provider.value, summary_model.value or '', summary_prompt.value or '')
+                    summary_model_status.set_text('Summary model settings saved.')
+
+                summary_provider.on_value_change(lambda: protect(load_summary_models))
+                ui.timer(0.01, lambda: protect(load_summary_models), once=True)
+                with ui.row().classes('w-full gap-2 flex-wrap items-center'):
+                    ui.button('Save summary model', on_click=lambda: protect(save_summary)).props('outline')
+                    ui.space()
                     ui.button('Close', on_click=dialog.close).props('flat')
             dialog.open()
 
@@ -1309,6 +1352,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 tree.collapse()
             tree.update()
 
+        async def open_dialog(dialog_fn):
+            settings_menu.close()
+            await dialog_fn()
+
         ui.timer(1.0, poll_activity)
         search.on_value_change(filter_tree)
         tree.on_select(lambda e: protect(lambda: select_node(e)))
@@ -1317,11 +1364,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
         if providers_button is not None:
-            providers_button.on_click(lambda: protect(provider_dialog))
+            providers_button.on_click(lambda: protect(lambda: open_dialog(provider_dialog)))
         if platform_button is not None:
-            platform_button.on_click(lambda: protect(platform_dialog))
+            platform_button.on_click(lambda: protect(lambda: open_dialog(platform_dialog)))
         if gpu_button is not None:
-            gpu_button.on_click(lambda: protect(gpu_dialog))
+            gpu_button.on_click(lambda: protect(lambda: open_dialog(gpu_dialog)))
 
         main = next((a for a in agents.values() if a.get('is_main')), None)
         if main:

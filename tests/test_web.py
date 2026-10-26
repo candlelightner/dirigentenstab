@@ -161,6 +161,11 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         assert isinstance(heading.parent_slot.parent, ui.header)
         assert heading.props['aria-label'] == 'Agent details'
         assert not heading.enabled
+        assert not any('Sign out' in getattr(child, 'content', '') or getattr(child, 'text', '') == 'Sign out'
+                       for child in toggle.parent_slot.parent.descendants())
+        await user.should_not_see('hub_activity')
+        settings_button = next(iter(user.find('settings_button').elements))
+        assert settings_button.text == 'Settings'
         await user.should_not_see('agent_selector')
         assert toggle.props['aria-label'] == 'Open agent hierarchy'
         user.find('hierarchy').trigger('update:selected', 'agent:agent')

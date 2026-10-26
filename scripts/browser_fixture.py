@@ -159,7 +159,9 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'heartbeat fixture' in prompt:
+    if 'Summarize the user request' in str(info.instructions):
+        yield 'Summarized Chat Title'
+    elif 'heartbeat fixture' in prompt:
         loop = asyncio.get_running_loop()
         deadline, index = loop.time() + 40, 0
         while loop.time() < deadline:

@@ -19,6 +19,7 @@ from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 
 _UNSET = object()
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
+DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
 
 
 def first(response, key):
@@ -145,9 +146,17 @@ class Service:
             domains = []
         domain = next((d for d in domains if d['id'] == agent['domain_id']), {'id': agent['domain_id']})
         try:
-            catalogue = await cloud.catalogue(refresh=True)
+            catalogue = await cloud.catalogue(refresh=True) if hasattr(cloud, 'catalogue') else {}
         except CloudError:
             catalogue = {}
+        owner_key = None
+        if hasattr(self.store, 'one') and agent.get('owner_ssh_key_enabled', 1):
+            try:
+                if (await self.owner_ssh_key_access(agent))['enabled']:
+                    row = self.store.one("SELECT value FROM platform_settings WHERE name='owner_ssh_public_key'")
+                    owner_key = row['value'] if row and row['value'] else None
+            except Exception:
+                owner_key = None
         return {'agent': {'id': agent['id'], 'name': agent['name'], 'role': 'CloudStack account'},
                 'managed_agents': [{key: member[key] for key in ('id', 'name', 'domain_id')}
                                    for member in self.store.all('SELECT id,name,domain_id FROM agents WHERE enabled=1')
@@ -161,6 +170,7 @@ class Service:
                 'approved_guest_assets': await self.guest_assets(agent['id']),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'configure_agent'],
+                'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
 
     async def guest_assets(self, agent_id):
@@ -181,6 +191,37 @@ class Service:
         self.store.execute("INSERT INTO platform_settings VALUES('cloudstack_ui_url',?) "
                            'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (value,))
         self.store.audit(identity['userid'], 'configure-cloudstack-dashboard')
+
+    def summary_settings(self, identity=None):
+        if identity is not None and (identity.get('_agent_id') or identity.get('type') != 1):
+            raise PermissionError('Platform administrator required')
+        rows = {r['name']: r['value'] for r in self.store.all(
+            "SELECT name,value FROM platform_settings WHERE name IN ('summary_provider_id','summary_model','summary_prompt')"
+        )}
+        return {
+            'provider_id': rows.get('summary_provider_id') or None,
+            'model': rows.get('summary_model', ''),
+            'prompt': rows.get('summary_prompt') or DEFAULT_SUMMARY_PROMPT,
+        }
+
+    def save_summary_settings(self, identity, provider_id, model, prompt):
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Platform administrator required')
+        provider_id = (provider_id or '').strip()
+        if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
+            raise ValueError('Provider missing')
+        if not isinstance(model, str) or len(model) > 300:
+            raise ValueError('Invalid model name')
+        if not isinstance(prompt, str) or len(prompt) > 16000:
+            raise ValueError('Invalid prompt')
+        model = (model or '').strip() if provider_id else ''
+        prompt = (prompt or '').strip() or DEFAULT_SUMMARY_PROMPT
+        for name, value in (('summary_provider_id', provider_id),
+                            ('summary_model', model),
+                            ('summary_prompt', prompt)):
+            self.store.execute('INSERT INTO platform_settings VALUES(?,?) '
+                               'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name, value))
+        self.store.audit(identity['userid'], 'configure-summary-model')
 
     async def gpu_admin(self, identity, action='status', **payload):
         if identity.get('type') != 1:
