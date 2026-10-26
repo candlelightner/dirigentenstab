@@ -32,7 +32,33 @@ The tests start a temporary HTTPS NiceGUI server on a loopback port and drive it
 
 The CloudStack transport, model and remote MCP tool discovery are fixtures in this test mode. `scripts/browser_fixture.py` refuses to start unless `DIRIGENTENSTAB_BROWSER_FIXTURE=1` is explicitly set. It creates a temporary database, synthetic credentials and a temporary TLS certificate. It does not access an existing CloudStack installation, hypervisor or model provider. Browser tests assert that synthetic infrastructure/provider keys and VM passwords are absent from browser content.
 
-`.github/workflows/browser.yaml` installs Chromium explicitly and uploads desktop/mobile screenshots and the fixture's server log. A development environment without the optional Playwright package reports browser tests as skipped; the dedicated browser CI job must run them.
+`.github/workflows/browser.yaml` runs inside the prebuilt test runner container with Chromium and Firefox pre-installed, and uploads desktop/mobile screenshots and the fixture's server log. A development environment without the optional Playwright package reports browser tests as skipped; the dedicated browser CI job must run them.
+
+## Prebuilt CI test runner
+
+CI workflows (`.github/workflows/ci.yaml` and `.github/workflows/browser.yaml`) execute inside a pinned, immutable container image on GitHub Container Registry:
+
+```yaml
+container:
+  image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-8e89f79303a87df7@sha256:17f9208d340e3628961fecbf5a5c406626c475cf2731c19eed33ac85cb8aab84
+```
+
+- **Image composition**: `Dockerfile.test-runner` bakes Python 3.12, CloudMonkey 6.6.0, locked dependencies, and Playwright Chromium and Firefox browser binaries (`/ms-playwright`) into `/opt/venv`.
+- **Manifest & invalidation**: `scripts/test_runner.py` computes a sha256 manifest of `Dockerfile.test-runner`, `requirements.lock`, and `pyproject.toml` dependencies/requires-python (excluding application `[project].version` bumps). Any modification triggers `.github/workflows/test-runner.yaml` to build, verify offline, and publish a new immutable tag to GHCR.
+- **Workflow preparation**: Each CI job runs `python scripts/test_runner.py prepare`. This verifies that installed packages and workflow image pins match the computed manifest, then executes an offline editable installation (`pip install --no-deps --no-build-isolation --no-index -e .`) and `pip check` without network access.
+- **Security rebuilds**: `.github/workflows/test-runner.yaml` provides a manual `workflow_dispatch` trigger with `security_rebuild=true` to refresh base OS packages without dependency changes.
+
+### CI performance comparison
+
+Prebaking packages and browser binaries removes network download flakiness, package repository outages, and apt lock contention.
+
+| Run / Workflow | Setup time | Test execution | Total duration |
+|---|---|---|---|
+| **Baseline CI `test` (run 40387629637)** | 15s (`pip install -r requirements.lock`) | 42s | 67s |
+| **Prebuilt CI `test` (run 40396100649)** | 3s in-container (31s cold runner image pull) | 43s | 82s |
+| **Baseline Browser `chromium` (run 40385222474)** | 311s (`playwright install` timeout / apt lock) | 0s (aborted) | 318s (failed) |
+| **Baseline Browser `chromium` (run 40387629632)** | 42s (`pip` + `playwright install`) | 163s | 210s |
+| **Prebuilt Browser `chromium` (run 40396100615)** | 4s in-container (30s cold runner image pull) | 227s | 268s |
 
 ## Native acceptance
 
