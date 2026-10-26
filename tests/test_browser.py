@@ -1009,6 +1009,7 @@ async def test_compute_offering_requests_mobile_approve_deny_and_inheritance(bro
         await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await select_agent(page, 'Research Admin')
         await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
         await page.get_by_role('button', name='New conversation', exact=True).click()
         await page.get_by_label('Message', exact=True).fill('offering fixture')

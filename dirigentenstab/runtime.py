@@ -778,7 +778,8 @@ class Runtime:
 
             Settings keys: instructions, provider_id, model, thinking, compaction_provider_id, compaction_model,
             auto_compact_percent, context_window, enabled_providers (provider IDs), enabled_mcp_servers (server IDs),
-            mcp_tools (map of server ID to tool names), owner_ssh_key_enabled (boolean).
+            mcp_tools (map of server ID to tool names), owner_ssh_key_enabled (boolean),
+            compute_offering_requests_enabled (boolean).
             Edit your own prompt or a descendant; your own edits may only set instructions. Never assign work.
             """
             return await invoke(self.service.configure_agent, agent_id, target_agent_id, settings)
