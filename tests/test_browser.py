@@ -555,6 +555,39 @@ async def test_browser_header_agent_details_and_sidebar_selection_on_desktop_and
         await browser.close()
 
 
+async def test_browser_global_admin_separate_entry_and_configuration(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        for width, height in [(1440, 900), (390, 844)]:
+            await page.set_viewport_size({'width': width, 'height': height})
+            if width <= 900:
+                await page.locator('.q-drawer--mobile').wait_for(state='attached')
+            search = page.get_by_label('Search agents and domains', exact=True)
+            if not await search.is_visible():
+                await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            await search.fill('')
+            global_node = page.locator('.q-tree').get_by_text('Global Admin', exact=True)
+            main_node = page.locator('.q-tree').get_by_text('Main Agent', exact=True)
+            await playwright.expect(global_node).to_be_visible()
+            global_box, main_box = await global_node.bounding_box(), await main_node.bounding_box()
+            assert global_box and main_box and global_box['y'] < main_box['y']
+            await global_node.click()
+            await search.wait_for(state='hidden')
+            await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Global Admin', exact=True).wait_for()
+            await page.get_by_role('button', name='Agent details', exact=True).click()
+            await page.locator('.agent-details').get_by_text('Root administrator', exact=True).wait_for()
+            await page.locator('.agent-details').get_by_role('button', name='Configure', exact=True).click()
+            await page.get_by_label('System prompt', exact=True).wait_for()
+            await page.get_by_role('button', name='Cancel', exact=True).click()
+            await page.get_by_role('dialog').wait_for(state='hidden')
+            await select_agent(page, 'Main Agent')
+            assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await browser.close()
+
+
 async def test_browser_thinking_settings_follow_model_metadata_and_pending_animation(browser_app):
     from dirigentenstab.store import Store
 

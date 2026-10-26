@@ -24,6 +24,16 @@ users. There is no new hub account or registration system.
 ## Hierarchy and infrastructure permissions
 
 - Retain a main admin agent and clearly defined CloudStack subgroup domains.
+- Provide a separate Global Admin above the existing sidebar hierarchy, with its
+  own dedicated native CloudStack root administrator account and encrypted key.
+  Preserve Main Agent, its domain hierarchy, configuration and conversations.
+  Only the human root administrator can open/configure Global Admin; other
+  agents cannot access it. Global Admin uses the same agent settings and starts
+  with all central providers, MCP servers/tools and owner SSH access enabled.
+  Explicit selections persist on subsequent setup. Main Agent's inherited
+  external-service settings remain independent; new Global Admin subgroups
+  inherit Global Admin's settings. Native root authority permits administering
+  CloudStack-wide resources, including public service offerings.
 - Creating a subgroup also creates its admin agent, visible in the hub hierarchy.
 - Agents may create subgroups autonomously by default, unless that capability
   has been disabled. Creation does not require a separate human approval.

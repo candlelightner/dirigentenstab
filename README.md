@@ -19,9 +19,13 @@ sudo docker compose up -d
 sudo ./setup.sh --verify
 ```
 
-The default application address is **https://localhost:3000**, bound to **127.0.0.1:3000**. Choose a free port in `.env` when another service uses 3000. Setup creates a local TLS certificate, a separate encryption master key, a persistent Docker volume, and a dedicated CloudStack domain administrator agent. Use the CloudStack human administrator identity to sign in. There is no public registration.
+The default application address is **https://localhost:3000**, bound to **127.0.0.1:3000**. Choose a free port in `.env` when another service uses 3000. Setup creates a local TLS certificate, a separate encryption master key, a persistent Docker volume, a dedicated CloudStack domain administrator Main Agent, and a separate Global Admin with its own native root administrator account. Use the CloudStack human administrator identity to sign in. There is no public registration.
 
 For an existing CloudStack installation, use `sudo ./setup.sh --install --existing`; provide the private endpoint and a root-private administrator API credential file as described in [installation](docs/INSTALLATION.md). This path does not install or reconfigure the hypervisor.
+
+Existing installations can add Global Admin without rotating Main Agent keys or changing its history:
+`sudo .venv/bin/python scripts/admin.py provision-global-admin` (authenticate as the human CloudStack root administrator).
+Global Admin appears above the existing tree and initially copies Main Agent's model/thinking/compaction settings while enabling all central provider, MCP server/tool and owner SSH access. Save individual settings to narrow these defaults; running provisioning again preserves them. Native APIs, including `createServiceOffering` and `updateServiceOffering` with `domainid=public`, run with the selected agent's own identity. Host GPU policies remain enforced.
 
 Configure a provider in the web UI, run **Test tool calling**, and assign its model to an agent. OpenAI-compatible Chat Completions and Responses are supported. Local inference is a separate service; see the [tested llama.cpp example](docs/LOCAL_INFERENCE.md). No commercial API is required.
 

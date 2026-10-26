@@ -164,3 +164,29 @@ async def test_domain_cycles_and_inconsistent_depths_fail_closed(environment):
     environment.domains['zero']['level'] = 3
     with pytest.raises(PermissionError, match='levels are inconsistent'):
         await check_vm_policy(environment.service, environment.agent, {'serviceofferingid': 'gpu'})
+
+
+async def test_global_gpu_quota_reader_uses_own_root_identity_outside_main():
+    from dirigentenstab.limits import GLOBAL_ADMIN_AGENT, _domain_chain
+    calls = []
+    root = {'id': GLOBAL_ADMIN_AGENT, 'domain_id': 'native-root'}
+
+    class Cloud:
+        async def raw(self, command, params):
+            calls.append((command, params))
+            domains = {'elsewhere': {'id': 'elsewhere', 'level': 1},
+                       'native-root': {'id': 'native-root', 'level': 0}}
+            return {'domain': [domains[params['id']]]}
+
+    class Service:
+        async def agent(self, agent_id):
+            assert agent_id == GLOBAL_ADMIN_AGENT
+            return root
+
+        async def cloud_client(self, agent):
+            assert agent is root
+            return Cloud()
+
+    assert (await _domain_chain(Service(), 'elsewhere', root))[0]['id'] == 'elsewhere'
+    assert (await _domain_chain(Service(), 'native-root', root))[0]['level'] == 0
+    assert len(calls) == 2

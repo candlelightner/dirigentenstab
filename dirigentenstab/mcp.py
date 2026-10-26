@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic_ai.mcp import MCPServerStreamableHTTP
 
-from .limits import APP_ROOT_AGENT
+from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, ancestry_reader_id
 from .settings import endpoint
 
 
@@ -31,9 +31,10 @@ class MCP:
             return False
 
     async def _chain(self, agent):
-        root = await self.service.agent(APP_ROOT_AGENT)
-        if agent['id'] == root['id']:
-            return [root]
+        if agent['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:
+            return [agent]
+        root = await self.service.agent(ancestry_reader_id(self.service, agent))
+        # This reader verifies ancestry only; execution uses the acting agent's keys.
         cloud = await self.service.cloud_client(root)
         chain, seen, previous_level = [], set(), None
         domain_id = agent['domain_id']
@@ -51,7 +52,7 @@ class MCP:
             if not member:
                 break
             chain.append(member)
-            if member['id'] == root['id']:
+            if member['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:
                 return list(reversed(chain))
             previous_level = domain['level']
             domain_id = domain.get('parentdomainid')
@@ -60,7 +61,7 @@ class MCP:
     def _tools(self, agent_id, server_id):
         row = self.store.one('SELECT tools FROM mcp_assignments WHERE agent_id=? AND server_id=?',
                              (agent_id, server_id))
-        return set(json.loads(row['tools'])) if row else set()
+        return set(json.loads(row['tools'])) if row else ({'*'} if agent_id == GLOBAL_ADMIN_AGENT else set())
 
     def selected_servers(self, agent):
         return set(json.loads(agent['enabled_mcp_servers'])) if agent.get('enabled_mcp_servers') is not None else {
@@ -74,7 +75,8 @@ class MCP:
             return set()
         tools = self._tools(chain[0]['id'], server_id)
         for agent in chain[1:]:
-            tools &= self._tools(agent['id'], server_id)
+            selected = self._tools(agent['id'], server_id)
+            tools = selected if '*' in tools else tools if '*' in selected else tools & selected
         return tools
 
     async def configuration(self, identity, agent_id):
@@ -86,7 +88,8 @@ class MCP:
             {**server, 'agent_enabled': server['id'] in self.selected_servers(agent),
              'server_allowed': self.server_enabled(chain[:-1], server['id']),
              'tools': sorted(self._tools(agent_id, server['id'])),
-             'allowed_tools': sorted(self._effective(chain[:-1], server['id'])) if len(chain) > 1 else None}
+             'allowed_tools': (None if len(chain) == 1 or '*' in self._effective(chain[:-1], server['id'])
+                               else sorted(self._effective(chain[:-1], server['id'])))}
             for server in servers]}
 
     async def save_server(self, identity, name, url, token=None, server_id=None, enabled=True):
@@ -153,7 +156,7 @@ class MCP:
         tools = {tool.name: {'name': tool.name, 'description': self.service.redact(tool.description or '')[:1000]}
                  for tool in catalogue if TOOL_NAME.fullmatch(tool.name)
                  and self.service.redact(tool.name) == tool.name
-                 and (ceiling is None or tool.name in ceiling)}
+                 and (ceiling is None or '*' in ceiling or tool.name in ceiling)}
         self.store.audit(identity['userid'], 'discover-mcp-tools', agent_id + '/' + server_id)
         return [tools[name] for name in sorted(tools)]
 
@@ -165,14 +168,16 @@ class MCP:
         if not self.store.one('SELECT id FROM mcp_servers WHERE id=?', (server_id,)):
             raise ValueError('MCP server is unavailable')
         chain = await self._chain(agent)
-        if len(chain) > 1 and not set(tools) - self._tools(agent_id, server_id) <= self._effective(chain[:-1], server_id):
+        if (len(chain) > 1 and '*' not in self._effective(chain[:-1], server_id)
+                and not set(tools) - self._tools(agent_id, server_id) <= self._effective(chain[:-1], server_id)):
             raise PermissionError('MCP assignments cannot widen ancestor access')
         if identity.get('_agent_id'):
             actor_id = identity['_agent_id']
-            if actor_id == agent_id or actor_id not in {member['id'] for member in chain[:-1]}:
+            if actor_id == agent_id or (actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]}):
                 raise PermissionError('Only an ancestor agent may change enabled MCP tools')
             actor_chain = await self._chain(await self.service.agent(actor_id))
-            if not set(tools) - self._tools(agent_id, server_id) <= self._effective(actor_chain, server_id):
+            if ('*' not in self._effective(actor_chain, server_id)
+                    and not set(tools) - self._tools(agent_id, server_id) <= self._effective(actor_chain, server_id)):
                 raise PermissionError('MCP assignments cannot widen actor access')
 
     async def assign(self, identity, agent_id, server_id, tools):
@@ -191,11 +196,14 @@ class MCP:
         if not self.store.one('SELECT id FROM mcp_servers WHERE id=?', (server_id,)):
             raise ValueError('MCP server is unavailable')
         actor_id = identity.get('_agent_id')
-        if actor_id and (actor_id == agent_id or actor_id not in {member['id'] for member in chain[:-1]}):
+        if actor_id and (actor_id == agent_id or (actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]})):
             raise PermissionError('Only an ancestor agent may change enabled MCP servers')
         selected = self.selected_servers(agent)
-        if enabled and server_id not in selected and not self.server_enabled(chain[:-1], server_id):
-            raise PermissionError('MCP selections cannot widen ancestor access')
+        if enabled and server_id not in selected:
+            if not self.server_enabled(chain[:-1], server_id):
+                raise PermissionError('MCP selections cannot widen ancestor access')
+            if actor_id and not self.server_enabled(await self._chain(await self.service.agent(actor_id)), server_id):
+                raise PermissionError('MCP selections cannot widen actor access')
         if enabled:
             selected.add(server_id)
         else:
@@ -215,6 +223,7 @@ class MCP:
 
     async def check(self, identity, agent_id, server_id, tool, version):
         server = next((row for row in await self.bindings(identity, agent_id) if row['id'] == server_id), None)
-        if not server or tool not in server['tools'] or server['version'] != version:
+        if (not server or not TOOL_NAME.fullmatch(tool) or
+                '*' not in server['tools'] and tool not in server['tools'] or server['version'] != version):
             raise PermissionError('MCP tool assignment or server configuration changed')
         return server

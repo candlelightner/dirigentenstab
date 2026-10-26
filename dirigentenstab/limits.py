@@ -1,6 +1,7 @@
 """GPU preflight checks; CloudStack retains atomic quota accounting and permissions."""
 
 APP_ROOT_AGENT = '00000000000000000000000000000001'
+GLOBAL_ADMIN_AGENT = '00000000000000000000000000000002'
 VM_POLICY_COMMANDS = frozenset({'deployVirtualMachine', 'startVirtualMachine', 'rebootVirtualMachine', 'scaleVirtualMachine',
                                 'restoreVirtualMachine', 'recoverVirtualMachine', 'changeServiceForVirtualMachine'})
 
@@ -25,8 +26,27 @@ def _one(response, key, object_id):
     return next((value for value in response.get(key, []) if value.get('id') == object_id), None)
 
 
-async def _domain_chain(service, domain_id):
-    root = await service.agent(APP_ROOT_AGENT)
+def ancestry_reader_id(service, agent):
+    root_id = APP_ROOT_AGENT
+    if agent['id'] == GLOBAL_ADMIN_AGENT:
+        root_id = GLOBAL_ADMIN_AGENT
+    elif hasattr(service, 'store'):
+        member = agent['id']
+        seen = set()
+        while member not in seen:
+            seen.add(member)
+            op = service.store.one('SELECT parent_id FROM provisioning WHERE id=?', (member,))
+            if not op or not op['parent_id']:
+                break
+            member = op['parent_id']
+            if member in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:
+                root_id = member
+                break
+    return root_id
+
+
+async def _domain_chain(service, domain_id, agent):
+    root = await service.agent(ancestry_reader_id(service, agent))
     reader = await service.cloud_client(root)
     chain, seen = [], set()
     while domain_id:
@@ -81,7 +101,7 @@ async def check_vm_policy(service, agent, params, *, command='deployVirtualMachi
     # Verify caller visibility before the trusted reader accesses ancestor-only information.
     if not _one(await cloud.raw('listDomains', {'id': target_domain, 'listall': True}), 'domain', target_domain):
         raise PermissionError('VM owner domain is outside this agent’s scope')
-    chain = await _domain_chain(service, target_domain)
+    chain = await _domain_chain(service, target_domain, agent)
     if restriction and not set(restriction).intersection(domain['id'] for domain in chain):
         raise PermissionError('Compute offering is restricted to another CloudStack domain')
     if not units:

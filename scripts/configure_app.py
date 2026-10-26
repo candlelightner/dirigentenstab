@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from dotenv import dotenv_values
 
+from dirigentenstab.limits import GLOBAL_ADMIN_AGENT
 from dirigentenstab.service import Service
 from dirigentenstab.settings import Settings
 from dirigentenstab.store import Store
@@ -100,7 +101,7 @@ def configure(args):
     settings.cmk = '/usr/local/bin/cmk'
     store = Store(settings.database, settings.key_file)
     service = Service(store, settings)
-    if not store.one('SELECT id FROM agents'):
+    if not store.one('SELECT id FROM agents WHERE id=?', (GLOBAL_ADMIN_AGENT,)):
         credentials_file = args.credentials_file or values.get('CLOUDSTACK_BOOTSTRAP_CREDENTIALS_FILE')
         if not credentials_file:
             raise SystemExit('Provide a root-private CloudStack administrator API credential JSON file.')

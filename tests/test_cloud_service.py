@@ -1150,3 +1150,99 @@ async def test_owner_ssh_configuration_accepts_public_keys_only_and_vm_overview_
     assert machines[0]['cloudstack_url'] == 'https://cloud.invalid/client/#/vm/vm'
     assert calls == [('listVirtualMachines', {'listall': True})]
     assert 'private' not in str(machines)
+
+
+@pytest.mark.parametrize('wrong_native_type', [False, True])
+async def test_global_admin_provisions_dedicated_root_account_and_preserves_existing_settings(store, wrong_native_type):
+    from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
+    add_parent(store)
+    store.execute('UPDATE agents SET id=? WHERE id=?', (APP_ROOT_AGENT, 'parent'))
+    main_before = store.one('SELECT * FROM agents WHERE id=?', (APP_ROOT_AGENT,))
+    cloud = ProvisioningCloud()
+    cloud.domains.append({'id': 'native-root', 'name': 'ROOT', 'level': 0})
+    original_raw = cloud.raw
+
+    async def raw(command, params=None):
+        if command == 'listCapabilities':
+            return {'capability': {'cloudstackversion': '4.23.0.0'}}
+        if command == 'listDomains' and (params or {}).get('id') == 'native-root':
+            return {'domain': cloud.domains[:1]}
+        response = await original_raw(command, params)
+        if wrong_native_type and command == 'listAccounts' and (params or {}).get('id') == 'child-account':
+            return {'account': [{**account, 'accounttype': 2} for account in response['account']]}
+        return response
+
+    cloud.raw = raw
+    service = provisioning_service(store, cloud)
+    root = cloud.domains[0]
+    if wrong_native_type:
+        with pytest.raises(PermissionError, match='native root administrator authority'):
+            await service.provision_global_admin(cloud=cloud, root=root)
+        assert not store.one('SELECT id FROM agents WHERE id=?', (GLOBAL_ADMIN_AGENT,))
+        assert store.one('SELECT * FROM agents WHERE id=?', (APP_ROOT_AGENT,)) == main_before
+        return
+    result = await service.provision_global_admin(cloud=cloud, root=root)
+    assert result['id'] == GLOBAL_ADMIN_AGENT
+    agent = await service.agent(GLOBAL_ADMIN_AGENT)
+    assert agent['domain_id'] == 'native-root' and agent['account_id'] != main_before['account_id']
+    assert agent['provider_id'] == main_before['provider_id'] and agent['model'] == main_before['model']
+    assert agent['enabled_providers'] is None and agent['enabled_mcp_servers'] is None
+    assert agent['owner_ssh_key_enabled'] == 1
+    assert store.open(agent['credentials']) != store.open(main_before['credentials'])
+    assert not any(command == 'createDomain' for command, _ in cloud.calls)
+    creation = next(params for command, params in cloud.calls if command == 'createAccount')
+    assert creation['accounttype'] == 1 and creation['domainid'] == 'native-root'
+    assert store.one('SELECT * FROM agents WHERE id=?', (APP_ROOT_AGENT,)) == main_before
+    store.execute('UPDATE agents SET enabled_providers=?,owner_ssh_key_enabled=0,model=? WHERE id=?',
+                  ('[]', 'custom', GLOBAL_ADMIN_AGENT))
+    before = store.one('SELECT * FROM agents WHERE id=?', (GLOBAL_ADMIN_AGENT,))
+    calls = len(cloud.calls)
+    await service.provision_global_admin(cloud=cloud, root=root)
+    assert store.one('SELECT * FROM agents WHERE id=?', (GLOBAL_ADMIN_AGENT,)) == before
+    assert len(cloud.calls) == calls
+
+
+@pytest.mark.parametrize('identity', [{'_agent_id': 'main', 'type': 2}, {'type': 2}])
+async def test_global_admin_authorization_rejects_nonroot_before_cloud_requests(store, identity):
+    from dirigentenstab.limits import GLOBAL_ADMIN_AGENT
+    add_parent(store)
+    store.execute('UPDATE agents SET id=? WHERE id=?', (GLOBAL_ADMIN_AGENT, 'parent'))
+    service = Service(store, SimpleNamespace())
+    with pytest.raises(PermissionError, match='requires a root administrator'):
+        await service.authorize(identity, GLOBAL_ADMIN_AGENT)
+
+
+async def test_global_admin_provisioning_requires_human_root(store):
+    service = Service(store, SimpleNamespace())
+    for identity in ({'type': 2}, {'type': 1, '_agent_id': 'root'}, None):
+        with pytest.raises(PermissionError, match='human root administrator'):
+            await service.provision_global_admin(identity)
+    assert not store.all('SELECT id FROM provisioning')
+
+
+async def test_global_admin_uses_own_identity_for_native_root_offering_metadata_and_execution(store):
+    from dirigentenstab.limits import GLOBAL_ADMIN_AGENT
+    add_parent(store)
+    store.execute('UPDATE agents SET id=? WHERE id=?', (GLOBAL_ADMIN_AGENT, 'parent'))
+    service = Service(store, SimpleNamespace(max_output=65536))
+    calls = []
+    catalogue = {name: {'name': name, 'params': [{'name': 'domainid', 'type': 'string'}]}
+                 for name in ('listVgpuProfiles', 'createServiceOffering', 'updateServiceOffering')}
+
+    class NativeRoot:
+        async def catalogue(self, **kwargs):
+            return catalogue
+
+        async def execute(self, command, params):
+            calls.append((command, params))
+            return {'success': True}
+
+    async def cloud_client(agent):
+        assert agent['id'] == GLOBAL_ADMIN_AGENT
+        return NativeRoot()
+
+    service.cloud_client = cloud_client
+    assert (await service.describe_api(GLOBAL_ADMIN_AGENT, 'createServiceOffering'))['params'][0]['name'] == 'domainid'
+    assert (await service.search_api(GLOBAL_ADMIN_AGENT, 'Vgpu'))[0]['name'] == 'listVgpuProfiles'
+    assert await service.execute(GLOBAL_ADMIN_AGENT, 'createServiceOffering', {'domainid': 'public'}) == {'success': True}
+    assert calls == [('createServiceOffering', {'domainid': 'public'})]

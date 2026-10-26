@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from cryptography.fernet import Fernet
 
-from dirigentenstab.limits import APP_ROOT_AGENT
+from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from dirigentenstab.mcp import MCP
 from dirigentenstab.service import Service
 from dirigentenstab.store import Store
@@ -554,3 +554,120 @@ async def test_owner_public_key_visibility_defaults_on_inherits_denial_and_requi
     assert (await e.service.configure_agent('leaf-agent', 'leaf-agent'))['owner_ssh_public_key'] is None
     await e.service.configure_agent('middle-agent', 'leaf-agent', {'owner_ssh_key_enabled': True})
     assert (await e.service.configure_agent('middle-agent', 'leaf-agent'))['owner_ssh_public_key'] == public
+
+
+async def test_global_default_tools_and_explicit_disables(environment, remote_catalogue):
+    e = environment
+    e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                    (GLOBAL_ADMIN_AGENT, 'Global Admin', 'native-root', 'global-account', 'global-user', e.store.seal({})))
+    e.domains['native-root'] = {'id': 'native-root', 'name': 'ROOT', 'level': 0}
+    e.root['domains'].add('native-root')
+    native_actor_clients(e)
+    server = await e.mcp.save_server(e.root, 'Search', 'https://search.example/mcp')
+    binding = (await e.mcp.bindings(e.root, GLOBAL_ADMIN_AGENT))[0]
+    assert binding['tools'] == ['*']
+    assert await e.mcp.discover(e.root, GLOBAL_ADMIN_AGENT, server)
+    await e.mcp.check(e.root, GLOBAL_ADMIN_AGENT, server, 'tavily_search', binding['version'])
+    with pytest.raises(PermissionError):
+        await e.mcp.check(e.root, GLOBAL_ADMIN_AGENT, server, '*', binding['version'])
+    assert await e.mcp.bindings(e.root, APP_ROOT_AGENT) == []
+    await e.mcp.assign(e.root, GLOBAL_ADMIN_AGENT, server, [])
+    assert await e.mcp.bindings(e.root, GLOBAL_ADMIN_AGENT) == []
+    await e.mcp.assign(e.root, GLOBAL_ADMIN_AGENT, server, ['tavily_search'])
+    assert (await e.mcp.bindings(e.root, GLOBAL_ADMIN_AGENT))[0]['tools'] == ['tavily_search']
+    await e.mcp.set_enabled(e.root, GLOBAL_ADMIN_AGENT, server, False)
+    assert await e.mcp.bindings(e.root, GLOBAL_ADMIN_AGENT) == []
+    await e.mcp.set_enabled(e.root, GLOBAL_ADMIN_AGENT, server, True)
+    assert (await e.mcp.bindings(e.root, GLOBAL_ADMIN_AGENT))[0]['tools'] == ['tavily_search']
+
+
+async def test_global_chain_preserves_main_inheritance_and_other_native_branches(environment):
+    e = environment
+    e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                    (GLOBAL_ADMIN_AGENT, 'Global Admin', 'native-root', 'global-account', 'global-user', e.store.seal({})))
+    e.domains['native-root'] = {'id': 'native-root', 'name': 'ROOT', 'level': 0}
+    e.store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) VALUES(?,?,?,?,?,?)',
+                    ('other-agent', GLOBAL_ADMIN_AGENT, 'Other', '', '', 0))
+    native_actor_clients(e)
+    assert [a['id'] for a in await e.service.agent_chain(await e.service.agent(GLOBAL_ADMIN_AGENT))] == [GLOBAL_ADMIN_AGENT]
+    assert [a['id'] for a in await e.service.agent_chain(await e.service.agent('leaf-agent'))] == [
+        APP_ROOT_AGENT, 'middle-agent', 'leaf-agent']
+    assert [a['id'] for a in await e.service.agent_chain(await e.service.agent('other-agent'))] == [
+        GLOBAL_ADMIN_AGENT, 'other-agent']
+    restricted = e.service.cloud_client
+    async def without_global(agent):
+        assert agent['id'] != GLOBAL_ADMIN_AGENT
+        return await restricted(agent)
+    e.service.cloud_client = without_global
+    assert [a['id'] for a in await e.service.agent_chain(await e.service.agent('leaf-agent'))] == [
+        APP_ROOT_AGENT, 'middle-agent', 'leaf-agent']
+
+
+@pytest.mark.parametrize('main_disabled', [False, True])
+async def test_global_child_does_not_probe_main_native_scope(environment, main_disabled):
+    from dirigentenstab.cloud import CloudError
+
+    e = environment
+    e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                    (GLOBAL_ADMIN_AGENT, 'Global Admin', 'native-root', 'global-account', 'global-user', e.store.seal({})))
+    e.domains['native-root'] = {'id': 'native-root', 'name': 'ROOT', 'level': 0}
+    e.store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) VALUES(?,?,?,?,?,?)',
+                    ('other-agent', GLOBAL_ADMIN_AGENT, 'Other', '', '', 0))
+    if main_disabled:
+        e.store.execute('UPDATE agents SET enabled=0 WHERE id=?', (APP_ROOT_AGENT,))
+    native_actor_clients(e)
+    native_client = e.service.cloud_client
+
+    async def client(agent):
+        if agent['id'] == APP_ROOT_AGENT:
+            raise CloudError('Permission denied outside Main domain')
+        return await native_client(agent)
+
+    e.service.cloud_client = client
+    assert [a['id'] for a in await e.service.agent_chain(await e.service.agent('other-agent'))] == [
+        GLOBAL_ADMIN_AGENT, 'other-agent']
+
+
+async def test_global_cannot_enable_server_outside_own_selection(environment):
+    e = environment
+    e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                    (GLOBAL_ADMIN_AGENT, 'Global Admin', 'native-root', 'global-account', 'global-user', e.store.seal({})))
+    e.domains['native-root'] = {'id': 'native-root', 'name': 'ROOT', 'level': 0}
+    e.root['domains'].add('native-root')
+    native_actor_clients(e)
+    server = await e.mcp.save_server(e.root, 'Search', 'https://search.example/mcp')
+    await e.mcp.set_enabled(e.root, APP_ROOT_AGENT, server, False)
+    await e.mcp.set_enabled(e.root, GLOBAL_ADMIN_AGENT, server, False)
+    actor = await e.service.execution_identity(GLOBAL_ADMIN_AGENT, 'human-root')
+    with pytest.raises(PermissionError, match='actor access'):
+        await e.mcp.set_enabled(actor, APP_ROOT_AGENT, server, True)
+    assert server not in e.mcp.selected_servers(await e.service.agent(APP_ROOT_AGENT))
+    await e.mcp.set_enabled(e.root, GLOBAL_ADMIN_AGENT, server, True)
+    await e.mcp.set_enabled(actor, APP_ROOT_AGENT, server, True)
+    assert server in e.mcp.selected_servers(await e.service.agent(APP_ROOT_AGENT))
+
+
+async def test_global_settings_updates_cannot_widen_own_allowances(environment):
+    e = environment
+    e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                    (GLOBAL_ADMIN_AGENT, 'Global Admin', 'native-root', 'global-account', 'global-user', e.store.seal({})))
+    e.domains['native-root'] = {'id': 'native-root', 'name': 'ROOT', 'level': 0}
+    e.root['domains'].add('native-root')
+    native_actor_clients(e)
+    server = await e.mcp.save_server(e.root, 'Search', 'https://search.example/mcp')
+    for agent_id in (APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT):
+        await e.service.update_agent(e.root, agent_id, None, '', '',
+                                     owner_ssh_key_enabled=False, enabled_mcp_servers=[])
+    actor = await e.service.execution_identity(GLOBAL_ADMIN_AGENT, 'human-root')
+    with pytest.raises(PermissionError, match='access'):
+        await e.service.update_agent(actor, APP_ROOT_AGENT, None, '', '', owner_ssh_key_enabled=True)
+    with pytest.raises(PermissionError, match='access'):
+        await e.service.update_agent(actor, APP_ROOT_AGENT, None, '', '', enabled_mcp_servers=[server])
+    main = await e.service.agent(APP_ROOT_AGENT)
+    assert main['owner_ssh_key_enabled'] == 0 and json.loads(main['enabled_mcp_servers']) == []
+    await e.service.update_agent(e.root, GLOBAL_ADMIN_AGENT, None, '', '',
+                                 owner_ssh_key_enabled=True, enabled_mcp_servers=[server])
+    await e.service.update_agent(actor, APP_ROOT_AGENT, None, '', '',
+                                 owner_ssh_key_enabled=True, enabled_mcp_servers=[server])
+    main = await e.service.agent(APP_ROOT_AGENT)
+    assert main['owner_ssh_key_enabled'] == 1 and json.loads(main['enabled_mcp_servers']) == [server]
