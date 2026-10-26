@@ -195,8 +195,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
+            .messages .q-scrollarea__container{overflow-x:hidden!important}
+            .messages .q-scrollarea__content{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box}
+            .messages .q-message,.messages .q-message-container,.messages .q-message-container>div,.messages .q-message-text,.messages .q-message-text-content,.messages .q-expansion-item{max-width:100%;min-width:0;overflow-wrap:anywhere}
             .composer{width:100%;flex-shrink:0;align-items:end;flex-wrap:nowrap}
             .composer textarea{max-height:120px;overflow:auto!important}
+            .composer .q-field__control{min-height:44px}
+            .composer .q-btn{width:44px;min-width:44px;min-height:44px;padding:0}
             .thinking-dot{width:5px;height:5px;border-radius:50%;background:currentColor;animation:thinking-pulse 1s infinite alternate}
             @keyframes thinking-pulse{from{opacity:.25}to{opacity:1;transform:translateY(-2px)}}
             @media(prefers-reduced-motion:reduce){.thinking-dot{animation:none}}
@@ -217,7 +222,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .dashboard-mobile{display:none;min-height:44px}
             @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}
             @media(max-width:600px){.workspace{padding:6px;gap:6px}
-            .conversation-stop{font-size:0;min-width:44px;padding:8px}.conversation-stop .q-icon{font-size:24px;margin:0}
             .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
         """)
@@ -257,12 +261,22 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2'):
                 history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
                 new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
-            with ui.card().classes('conversation'):
+                with ui.button(icon='info_outline').props(
+                        'flat round aria-label="Run details" aria-haspopup="menu"').mark('run_details_toggle'):
+                    with ui.menu().props('anchor="bottom right" self="top right"').classes(
+                            'run-details-menu bg-white p-4').mark('run_details_menu').style(
+                                'width:min(360px,calc(100vw - 24px));max-width:calc(100vw - 24px)') as run_details_menu:
+                        with ui.column().classes('run-details w-full gap-2').mark('run_details'):
+                            run_details_fallback = ui.label('No run details yet.').classes('text-xs text-stone-500')
+                            status_label = ui.label('').classes('text-xs text-stone-600 run-status').props('role=status')
+                            with status_label:
+                                reference = ui.tooltip('')
+                            budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
+                            context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
+                            compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
+            with ui.card().classes('conversation') as conversation_card:
                 with ui.scroll_area().classes('messages') as transcript_scroll:
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
-                progress = ui.label('Select an agent to begin').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
-                with progress:
-                    reference = ui.tooltip('')
                 with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
                         'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
                     ui.label('Thinking…')
@@ -271,17 +285,30 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                             ui.element('span').classes('thinking-dot').style(f'animation-delay:{dot * .15}s')
                 with ui.row().classes('composer gap-2'):
                     prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
-                        'outlined autogrow rows=1 maxlength=16000').classes('flex-1 min-w-0')
-                    send_button = ui.button('Send', icon='send').props('aria-label="Send"')
-                    stop_button = ui.button('Stop conversation', icon='stop', color='negative',
-                                            on_click=lambda: protect(stop_agent)).props('outline aria-label="Stop conversation"').classes('conversation-stop')
-                    stop_button.set_visibility(False)
-                    send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
-                                                  bool(value and value.strip()) and not state['submitting'])
-                with ui.expansion('Run details', value=False).classes('run-details w-full shrink-0').mark('run_details'):
-                    budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
-                    context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
-                    compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
+                        'outlined autogrow rows=1 maxlength=16000 dense').classes('flex-1 min-w-0')
+                    send_button = ui.button(icon='send').props('aria-label="Send"').mark('Send')
+                    stop_button = ui.button(icon='stop', color='negative',
+                                            on_click=lambda: protect(stop_agent)).props('outline aria-label="Stop conversation"').mark('Stop conversation')
+
+        def sync_run_details():
+            status_label.set_visibility(bool(status_label.text))
+            budget_label.set_visibility(bool(budget_label.text))
+            context_label.set_visibility(bool(context_label.text))
+            compaction_status.set_visibility(bool(compaction_status.text))
+            run_details_fallback.set_visibility(not bool(
+                status_label.text or budget_label.text or context_label.text or compaction_status.text
+            ))
+
+        def sync_composer():
+            has_text = bool((prompt.value or '').strip())
+            show_stop = bool(state['busy']) and not has_text
+            stop_button.set_visibility(show_stop)
+            send_button.set_visibility(not show_stop)
+            send_button.set_enabled(has_text and not state['submitting'])
+
+        prompt.on_value_change(lambda _: sync_composer())
+        sync_composer()
+        sync_run_details()
 
         tool_cards = {}
         selection_lock = asyncio.Lock()
@@ -335,6 +362,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if state['requested_agent'] != agent_id:
                     return
                 details_menu.close()
+                run_details_menu.close()
                 agent_heading.disable()
                 tree.classes('pointer-events-none opacity-50').props('aria-disabled=true')
                 try:
@@ -353,14 +381,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 prompt.enable()
             prompt.set_value(state['drafts'].get((agent_id, None), ''))
             state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, activity_token=None)
-            stop_button.set_visibility(False)
+            sync_composer()
             prompt.enable()
+            conversation_card.props(remove='data-operation-id')
+            status_label.set_text('')
+            status_label.props(remove='data-operation-id')
+            reference.set_text('')
             budget_label.set_text('')
             context_label.set_text('')
             compaction_status.set_text('')
+            sync_run_details()
             transcript.clear()
             tool_cards.clear()
-            progress.set_text('Ready')
             agent_heading.set_text(agent_label(agents.get(agent_id, agent)))
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
@@ -472,27 +504,33 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             state['imported'] = bool(restored.get('imported'))
             state['active_operation'] = None
             state['busy'] = False
-            stop_button.set_visibility(False)
+            conversation_card.props(remove='data-operation-id')
+            status_label.set_text('')
+            status_label.props(remove='data-operation-id')
+            reference.set_text('')
             budget_label.set_text('')
             context_label.set_text('')
             compaction_status.set_text('')
-            progress.set_text('Imported history is read-only. Sending starts a new conversation.' if state['imported'] else 'Ready')
             if restored.get('runs'):
                 run = restored['runs'][-1]
                 state['active_operation'] = run['id'] if run['status'] == 'running' else None
                 state['busy'] = bool(state['active_operation'])
-                stop_button.set_visibility(state['busy'])
                 reason = (run.get('budget') or {}).get('reason')
                 label = ('Blocked / paused' if run['status'] == 'reconciliation' else 'Stopped' if reason == 'stopped' else 'Blocked / paused' if run['status'] == 'interrupted'
                          else run['status'].capitalize())
                 pause_reason = (run.get('budget') or {}).get('pause_reason')
-                progress.set_text(label + (' · ' + str(pause_reason) if pause_reason else ''))
-                progress.props(f'data-operation-id="{run["id"]}"')
+                status_label.set_text(label + (' · ' + str(pause_reason) if pause_reason else ''))
+                status_label.props(f'data-operation-id="{run["id"]}"')
+                conversation_card.props(f'data-operation-id="{run["id"]}"')
                 reference.set_text('Reference: ' + run['id'])
                 if run.get('budget'):
                     show_budget(run['budget'])
                     if run['budget'].get('compactions'):
                         compaction_status.set_text('Context compacted.')
+            elif state['imported']:
+                status_label.set_text('Imported history is read-only. Sending starts a new conversation.')
+            sync_composer()
+            sync_run_details()
             transcript.clear()
             tool_cards.clear()
             for kind, content in history_parts(restored):
@@ -533,11 +571,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
             state.update(conversation=None, active_operation=None, busy=False, imported=False,
                          activity_token=None)
-            stop_button.set_visibility(False)
+            sync_composer()
+            conversation_card.props(remove='data-operation-id')
+            status_label.set_text('')
+            status_label.props(remove='data-operation-id')
+            reference.set_text('')
             budget_label.set_text('')
             context_label.set_text('')
             compaction_status.set_text('')
-            progress.set_text('Ready')
+            sync_run_details()
             history_select.set_value(None)
             transcript.clear()
             tool_cards.clear()
@@ -551,6 +593,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     or usable is not None and (type(usable) is not int or usable <= 0)
                     or usable and (type(window) is not int or type(reserve) is not int)):
                 context_label.set_text('Context usage unavailable for this activity.')
+                sync_run_details()
                 return
             if usable:
                 usage = f'Context: ~{estimate:,} / {usable:,} usable tokens ({100 * estimate / usable:.1f}%)'
@@ -560,11 +603,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if context.get('threshold_percent') is not None:
                 usage += f" · Auto-compact at {context['threshold_percent']}%"
             context_label.set_text(usage + (' · ' + context['source'] if context.get('source') else ''))
+            sync_run_details()
 
         def show_budget(budget):
             if budget.get('context'):
                 show_context(budget['context'])
             budget_label.set_text(f"Requests: {budget.get('requests', 0)} · Tools: {budget.get('tool_calls', 0)}")
+            sync_run_details()
 
         async def stop_agent():
             operation_id = state['active_operation']
@@ -577,7 +622,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if state['active_operation'] != operation_id:
                     return
                 if result['status'] == 'running':
-                    progress.set_text('Stop requested · waiting for active work to finish')
+                    status_label.set_text('Stop requested · waiting for active work to finish')
+                    sync_run_details()
                     return
                 restored = await runtime.restore(current, state['conversation'])
                 if state['active_operation'] == operation_id:
@@ -590,6 +636,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if state['submitting'] or not state['agent'] or not text:
                 return
             state['submitting'] = True
+            sync_composer()
             agent_id, conversation_id = state['agent'], state['conversation']
             try:
                 current = await actor()
@@ -604,6 +651,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     await histories()
             finally:
                 state['submitting'] = False
+                sync_composer()
 
         async def mcp_dialog(agent_id):
             from .mcp import MCP
@@ -990,7 +1038,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     details_menu.close()
                     agent_heading.set_text('Select an agent')
                     agent_heading.disable()
-                    progress.set_text('Agent access revoked')
+                    status_label.set_text('Agent access revoked')
+                    sync_run_details()
                     transcript.clear()
                     details.clear()
                     await refresh()
