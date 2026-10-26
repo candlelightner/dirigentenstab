@@ -6,6 +6,7 @@ import json
 import socket
 import struct
 from .diagnostics import OperationError
+from .cloud import CloudError
 
 GPU_CONTEXT = ContextVar('gpu_context', default=None)
 GPU_COMMANDS = frozenset({'deployVirtualMachine', 'startVirtualMachine', 'stopVirtualMachine',
@@ -76,6 +77,9 @@ async def helper_call(settings, action, **payload):
         if result.get('reconciliation'):
             raise OperationError('gpu', result['error'], (payload.get('context') or {}).get('run_id', 'gpu'),
                                  reconciliation=True)
+        if result.get('cloudstack'):
+            raise CloudError(result['error'], rejected=result.get('rejected') is True,
+                             operation_id=result.get('operation_id'), public_detail=result.get('public_detail'))
         raise PermissionError(result['error']) if result.get('denied') else RuntimeError(result['error'])
     return result['result']
 

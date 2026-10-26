@@ -1,5 +1,7 @@
 import asyncio
 import copy
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.fernet import Fernet
@@ -8,9 +10,12 @@ from dirigentenstab.gpu import FLAGS, effective_policy, operation_id, validate_p
 from dirigentenstab.gpu_control import Controller, Journal
 from dirigentenstab.limits import APP_ROOT_AGENT
 from dirigentenstab.store import Store
+from dirigentenstab.cloud import CloudError
+from dirigentenstab.diagnostics import OperationError
 
 ROOT, MAIN, CHILD, OTHER = 'root-domain', 'main-domain', 'child-domain', 'other-domain'
 P8, P24, P2 = 'nvidia-51', 'nvidia-53', 'nvidia-47'
+SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 
 
 def policy(maximum=3, **overrides):
@@ -226,6 +231,99 @@ def request(call, command='deployVirtualMachine', agent=APP_ROOT_AGENT, **params
         params = {'templateid': 'base', 'serviceofferingid': 'o8', 'zoneid': 'zone', **params}
     return {'action': 'execute', 'session': 'human-session', 'agent_id': agent, 'command': command, 'params': params,
             'context': {'run_id': 'run-'+agent, 'call_id': call}}
+
+
+@pytest.fixture
+async def gpu_socket(controller, tmp_path, monkeypatch):
+    from dirigentenstab import gpu
+
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    from gpu_helper import connection
+
+    unpack = gpu.struct.unpack
+    def root_peer(format, data):
+        values = unpack(format, data)
+        return (values[0], 0, values[2]) if format == '3i' else values
+    monkeypatch.setattr(gpu.struct, 'unpack', root_peer)
+    path = str(tmp_path / 's')
+    async with await asyncio.start_unix_server(lambda r, w: connection(controller, r, w), path=path,
+                                               limit=65537):
+        yield SimpleNamespace(gpu_helper_socket=path)
+
+
+@pytest.mark.parametrize('changed', [False, True])
+async def test_definitive_gpu_rejection_crosses_socket_and_releases_operation_block(controller, gpu_socket,
+                                                                                 monkeypatch, changed, caplog):
+    from dirigentenstab.gpu import helper_call
+
+    if not changed:
+        identifier = '00000000-0000-0000-0000-000000000100'
+        await controller.host.create(identifier, P8)
+        controller.journal.write('INSERT INTO pools VALUES(?,?,?)', (identifier, MAIN, P8))
+        await controller.cloud.raw('discoverGpuDevices')
+    original = controller.service.execute
+    reason = 'rootdisksize override (20 GB) is smaller than template size (25 GB)'
+
+    async def rejected(aid, command, params, **options):
+        controller.service.store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?,?,?)',
+            (controller.service.gpu_deployment_id, aid, 'rejected-vm', controller.service.store.seal(params),
+             None, 'rejected', 1))
+        raise CloudError('private-payload', rejected=True, public_detail=reason)
+    monkeypatch.setattr(controller.service, 'execute', rejected)
+    payload = request('native-rejection')
+    with pytest.raises(CloudError) as failure:
+        await helper_call(gpu_socket, payload.pop('action'), **payload)
+    assert failure.value.rejected and failure.value.public_detail == reason
+    assert reason in str(failure.value) and 'private-payload' not in str(failure.value) + caplog.text
+    receipt = controller.journal.rows('SELECT phase,changed FROM operations')[0]
+    assert receipt == {'phase': 'failed', 'changed': int(changed)}
+    assert not controller.cloud.vms and len(controller.host.items) == 1
+    before = list(controller.host.calls)
+    monkeypatch.setattr(controller.service, 'execute', original)
+    corrected = request('corrected-deployment', templateid='smaller-base')
+    result = await helper_call(gpu_socket, corrected.pop('action'), **corrected)
+    assert result['virtualmachine']['state'] == 'Running' and controller.host.calls == before
+
+
+@pytest.mark.parametrize('failure', ['transport', 'async-job', 'poll-denial'])
+async def test_uncertain_gpu_dispatch_stays_blocked_across_socket(controller, gpu_socket, monkeypatch, failure):
+    from dirigentenstab.gpu import helper_call
+
+    calls = []
+    async def uncertain(aid, command, params, **options):
+        calls.append(command)
+        controller.service.store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?,?,?)',
+            (controller.service.gpu_deployment_id, aid, 'pending-vm', controller.service.store.seal(params),
+             None, 'dispatched', 1))
+        if failure == 'transport':
+            raise RuntimeError('Native dispatch interrupted')
+        raise CloudError('Native outcome needs review', rejected=failure == 'poll-denial',
+                         public_detail='Polling denied' if failure == 'poll-denial' else 'No destination found')
+    monkeypatch.setattr(controller.service, 'execute', uncertain)
+    payload = request('uncertain-dispatch')
+    with pytest.raises(OperationError) as error:
+        await helper_call(gpu_socket, payload.pop('action'), **payload)
+    assert error.value.reconciliation
+    assert controller.journal.rows('SELECT phase FROM operations')[0]['phase'] == 'reconciliation'
+    with pytest.raises(RuntimeError, match='Another GPU operation requires reconciliation'):
+        await controller.dispatch(request('do-not-repeat'), 10001)
+    assert calls == ['deployVirtualMachine']
+
+
+async def test_gpu_rediscovery_rejection_after_success_does_not_close_dispatch_failed(controller, gpu_socket, monkeypatch):
+    from dirigentenstab.gpu import helper_call
+
+    original = controller.cloud.raw
+    async def rediscovery(command, params=None):
+        if command == 'discoverGpuDevices' and controller.cloud.vms:
+            raise CloudError('Native discovery denied', rejected=True)
+        return await original(command, params)
+    monkeypatch.setattr(controller.cloud, 'raw', rediscovery)
+    payload = request('post-dispatch-discovery')
+    with pytest.raises(OperationError) as error:
+        await helper_call(gpu_socket, payload.pop('action'), **payload)
+    assert error.value.reconciliation and len(controller.cloud.vms) == 1
+    assert controller.journal.rows('SELECT phase FROM operations')[0]['phase'] == 'reconciliation'
 
 
 def test_policy_ancestors_only_narrow_and_missing_fields_deny():

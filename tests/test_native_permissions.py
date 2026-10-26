@@ -4,8 +4,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from dirigentenstab.cloud import Cloud, CloudError
+from dirigentenstab.cloud import Cloud, CloudError, redact
 from dirigentenstab.diagnostics import diagnose
+
+
+@pytest.mark.parametrize('name', ['estimated_tokens', 'usable_tokens'])
+def test_context_token_metrics_preserve_only_nonnegative_integers(name):
+    assert redact({name: 123, 'access_token': 456, name + '_secret': 789}) == {
+        name: 123, 'access_token': '[redacted]', name + '_secret': '[redacted]'}
+    assert redact({name: 0}) == {name: 0}
+    for value in ('private-token', -1, 1.5, True, None):
+        assert redact({name: value}) == {name: '[redacted]'}
 
 
 @pytest.mark.parametrize('output,returncode', [('json', 1), ('text', 1), ('json', 0), ('wrapped', 0)])

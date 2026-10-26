@@ -11,7 +11,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
-from .cloud import validate
+from .cloud import CloudError, validate
 from .gpu import GPU_COMMANDS, effective_policy, narrows, operation_id, validate_policy
 from .limits import APP_ROOT_AGENT, gpu_count
 
@@ -534,7 +534,17 @@ class Controller:
             self.journal.phase(identifier, 'dispatching')
             self.service.gpu_deployment_id = identifier if command == 'deployVirtualMachine' else None
             self.service.gpu_local = True
-            result = await self.service.execute(agent['id'], command, params, managed=command == 'deployVirtualMachine')
+            try:
+                result = await self.service.execute(agent['id'], command, params, managed=command == 'deployVirtualMachine')
+            except CloudError as exc:
+                deployment = (self.service.store.one('SELECT phase FROM vm_deployments WHERE id=? AND agent_id=?',
+                                                     (identifier, agent['id']))
+                              if command == 'deployVirtualMachine' else None)
+                # A polling denial may follow VM submission; only the durable rejection proves no deploy occurred.
+                if exc.rejected and (command != 'deployVirtualMachine' or deployment and deployment['phase'] == 'rejected'):
+                    self.journal.phase(identifier, 'failed', {'rejected': True,
+                                       'description': exc.public_detail or 'CloudStack rejected the operation.'})
+                raise
             await self.cloud.raw('discoverGpuDevices', {'id': self.host_id})
             self.journal.phase(identifier, 'completed', result)
             return result

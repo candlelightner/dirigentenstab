@@ -24,7 +24,7 @@ class CloudError(RuntimeError):
 AUTH_PARAMS = frozenset({'apikey', 'secretkey', 'signature', 'signatureversion', 'sessionkey',
                          'command', 'response'})
 SENSITIVE_FIELD = re.compile(r'(?i)(password|secret|private.?key|api.?key|sessionkey|cookie|token|userdata)')
-TOKEN_COUNT = re.compile(r'^(?:input|output|cache_write|cache_read|input_audio|cache_audio_read|output_audio|prompt_cache_hit|prompt_cache_miss|reasoning)_tokens$')
+TOKEN_COUNT = re.compile(r'^(?:input|output|cache_write|cache_read|input_audio|cache_audio_read|output_audio|prompt_cache_hit|prompt_cache_miss|reasoning|estimated|usable)_tokens$')
 NAME = re.compile(r'^[a-z][a-zA-Z0-9]{1,80}$')
 PARAM_NAME = re.compile(r'^[a-z][a-z0-9]*(?:\[\d{1,3}\]\.[a-z][a-z0-9]*)?$')
 

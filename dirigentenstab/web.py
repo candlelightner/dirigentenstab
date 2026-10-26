@@ -463,14 +463,17 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 transcript.clear()
 
         def show_context(context):
-            estimate = context.get('estimated_tokens', 0)
+            estimate = context.get('estimated_tokens')
             usable = context.get('usable_tokens')
+            window, reserve = context.get('context_window'), context.get('response_reserve')
+            if (type(estimate) is not int or estimate < 0
+                    or usable is not None and (type(usable) is not int or usable <= 0)
+                    or usable and (type(window) is not int or type(reserve) is not int)):
+                context_label.set_text('Context usage unavailable for this activity.')
+                return
             if usable:
-                percent = context.get('percent')
-                usage = f'Context: ~{estimate:,} / {usable:,} usable tokens'
-                if percent is not None:
-                    usage += f' ({percent:.1f}%)'
-                usage += f" · Window {context['context_window']:,} − response reserve {context['response_reserve']:,}"
+                usage = f'Context: ~{estimate:,} / {usable:,} usable tokens ({100 * estimate / usable:.1f}%)'
+                usage += f' · Window {window:,} − response reserve {reserve:,}'
             else:
                 usage = f'Context: ~{estimate:,} tokens · model context limit unavailable'
             if context.get('threshold_percent') is not None:
@@ -577,6 +580,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             chunks = []
 
             async def event_received(event):
+                if client.is_deleted:
+                    return
                 if event.get('budget'):
                     show_budget(event['budget'])
                 if event.get('type') == 'context_usage':
@@ -601,6 +606,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             try:
                 result = (await runtime.resume(current, state['resume_operation'], event_received) if resume else
                           await runtime.chat(current, agent_id, state['conversation'], text, event_received))
+                if client.is_deleted:
+                    return
                 state['active_operation'] = None
                 stop_button.set_visibility(False)
                 state['conversation'] = result['conversation_id']
@@ -614,6 +621,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 await histories()
                 await refresh()
             except asyncio.CancelledError:
+                if client.is_deleted:
+                    return
                 compaction_status.set_text('')
                 progress.set_text('Stopped · activity saved; unfinished remote actions may need reconciliation.')
                 if state['conversation']:
@@ -621,6 +630,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     if restored.get('runs'):
                         stopped_run(restored['runs'][-1])
             except Exception as exc:
+                if client.is_deleted:
+                    return
                 state['active_operation'] = None
                 stop_button.set_visibility(False)
                 error = diagnose(exc, agent_id=agent_id)
@@ -637,13 +648,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             finally:
                 state['busy'] = False
                 state['active_operation'] = None
-                stop_button.set_visibility(False)
-                send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
-                prompt.enable()
-                new_button.enable()
-                history_select.enable()
-                agent_choice.enable()
-                continue_button.enable()
+                if not client.is_deleted:
+                    stop_button.set_visibility(False)
+                    send_button.set_enabled(bool(prompt.value and prompt.value.strip()))
+                    prompt.enable()
+                    new_button.enable()
+                    history_select.enable()
+                    agent_choice.enable()
+                    continue_button.enable()
 
         async def mcp_dialog(agent_id):
             from .mcp import MCP
