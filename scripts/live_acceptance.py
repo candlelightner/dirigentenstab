@@ -25,8 +25,7 @@ def prepare():
     volume = json.loads(subprocess.check_output(['docker', 'volume', 'inspect', 'dirigentenstab_data']))[0]
     data = Path(volume['Mountpoint'])
     settings = Settings(env['CLOUDSTACK_URL'], env['PUBLIC_ORIGIN'], cmk='/usr/local/bin/cmk',
-                        workspace=str(data / 'transfers'), ssh_networks=env.get('SSH_NETWORKS', '10.253.80.0/24'),
-                        ssh_source_cidr=env.get('SSH_SOURCE_CIDR', '10.253.80.1/32'))
+                        workspace=str(data / 'transfers'), ssh_networks=env.get('SSH_NETWORKS', '10.253.80.0/24'))
     store = Store(str(data / 'dirigentenstab.db'), str(ROOT / env.get('MASTER_KEY_PATH', 'secrets/master_key')))
     return Service(store, settings), json.loads(Path('/var/lib/dirigentenstab/setup/zone.json').read_text())
 

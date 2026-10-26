@@ -95,8 +95,7 @@ def context():
     key = key if key.is_absolute() else ROOT / key
     settings = Settings(values['CLOUDSTACK_URL'], values['PUBLIC_ORIGIN'],
                         database=str(data / 'dirigentenstab.db'), key_file=str(key),
-                        ssh_networks=values.get('SSH_NETWORKS', '10.253.80.0/24'),
-                        ssh_source_cidr=values.get('SSH_SOURCE_CIDR', '10.253.80.1/32'))
+                        ssh_networks=values.get('SSH_NETWORKS', '10.253.80.0/24'))
     store = Store(settings.database, settings.key_file)
     return Service(store, settings), key
 

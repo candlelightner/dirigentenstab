@@ -22,6 +22,7 @@ from dotenv import dotenv_values
 from dirigentenstab.service import Service
 from dirigentenstab.settings import Settings
 from dirigentenstab.store import Store
+from network_config import load_network
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,8 +45,11 @@ def configure(args):
     settings = Settings(api, origin)
     if urlsplit(origin).scheme != 'https':
         raise SystemExit('PUBLIC_ORIGIN must use HTTPS. See docs/INSTALLATION.md.')
+    network = load_network(env_path)
     for net in json.loads(subprocess.check_output(['ip', '-json', 'route'])):
-        if net.get('dst') == '172.30.253.0/24' and not net.get('dev', '').startswith('br-'):
+        if (net.get('dst') != 'default' and net.get('dst')
+                and ipaddress.ip_network(net['dst']).overlaps(ipaddress.ip_network(network['APP_NETWORK']))
+                and not net.get('dev', '').startswith('br-')):
             raise SystemExit('Application Docker subnet conflicts with an existing route.')
     port = int(values.get('BIND_PORT', 3000))
     try:

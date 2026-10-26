@@ -683,11 +683,14 @@ async def test_managed_gpu_lifecycle_uses_authenticated_controller_and_native_ca
 
 @pytest.mark.parametrize('failure', ['transport', 'async-job', 'http-rejection'])
 @pytest.mark.parametrize('guest_admin', [None, 0, 1])
-async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_identity(store, failure, guest_admin):
+@pytest.mark.parametrize('groups', [{}, {'securitygroupids': 'explicit-group'},
+                                   {'securitygroupnames': 'explicit-name'}])
+async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_identity(store, failure, guest_admin, groups):
     add_parent(store)
     template = '00000000-0000-0000-0000-000000000001'
     params = {'templateid': template, 'zoneid': '00000000-0000-0000-0000-000000000002',
               'serviceofferingid': '00000000-0000-0000-0000-000000000003'}
+    params.update(groups)
     if guest_admin is not None:
         store.execute('INSERT INTO managed_templates VALUES(?,?,?)', (template, 'Managed Linux', guest_admin))
 
@@ -703,12 +706,14 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
                 *({'name': name, 'type': 'uuid', 'required': True}
                   for name in ('templateid', 'zoneid', 'serviceofferingid')),
                 {'name': 'name', 'type': 'string'}, {'name': 'userdata', 'type': 'string'},
+                {'name': 'securitygroupids', 'type': 'string'}, {'name': 'securitygroupnames', 'type': 'string'},
             ]}}
 
         async def raw(self, command, request):
             if command == 'listServiceOfferings':
                 return {'serviceoffering': [{'id': request['id'], 'gpucount': 0}]}
             if command == 'deployVirtualMachine':
+                assert {k: v for k, v in request.items() if k.startswith('securitygroup')} == groups
                 self.deployments += 1
                 self.userdata = request['userdata']
                 config = json.loads(base64.b64decode(request['userdata']).decode().split('\n', 1)[1])
@@ -739,11 +744,7 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
     async def client(agent, purpose='runtime'):
         return cloud
 
-    async def ssh_group(cloud):
-        return 'ssh-group'
-
     service.cloud_client = client
-    service._ssh_security_group = ssh_group
     with pytest.raises(CloudError) as error:
         await service.execute('parent', 'deployVirtualMachine', params, managed=True)
     if failure == 'async-job':
@@ -900,51 +901,6 @@ async def test_confirmed_rejection_cli_is_the_only_resolution_for_a_legacy_faile
     options.confirmed_rejection = True
     await perform(options, service)
     assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == 'rejected'
-
-
-@pytest.mark.parametrize('source', ['0.0.0.0/0', '::/0', '10.0.0.0/8', '127.0.0.1/32', '8.8.8.8/32'])
-async def test_managed_ssh_ingress_refuses_public_or_shared_source_ranges_before_cloud_calls(store, source):
-    service = Service(store, SimpleNamespace(ssh_source_cidr=source))
-
-    class NoCloudCalls:
-        async def execute(self, command, params):
-            raise AssertionError('Invalid SSH source must be rejected before infrastructure changes')
-
-    with pytest.raises(ValueError, match='one approved private'):
-        await service._ssh_security_group(NoCloudCalls())
-
-
-async def test_managed_ssh_ingress_uses_one_private_egress_address_and_reuses_the_rule(store):
-    service = Service(store, SimpleNamespace(ssh_source_cidr='10.253.80.1/32'))
-
-    class SecurityGroups:
-        def __init__(self):
-            self.groups = []
-            self.calls = []
-
-        async def execute(self, command, params):
-            self.calls.append((command, params.copy()))
-            if command == 'listSecurityGroups':
-                return {'securitygroup': self.groups}
-            if command == 'createSecurityGroup':
-                group = {'id': 'ssh-group', 'name': params['name'], 'ingressrule': []}
-                self.groups.append(group)
-                return {'securitygroup': group}
-            assert command == 'authorizeSecurityGroupIngress'
-            self.groups[0]['ingressrule'].append({'protocol': params['protocol'], 'startport': params['startport'],
-                                                'endport': params['endport'], 'cidr': params['cidrlist']})
-            return {'success': True}
-
-        async def raw(self, command, params):
-            raise AssertionError('Managed SSH ingress must use the validated runtime API path')
-
-    cloud = SecurityGroups()
-    assert await service._ssh_security_group(cloud) == 'ssh-group'
-    assert await service._ssh_security_group(cloud) == 'ssh-group'
-    ingress = [params for command, params in cloud.calls if command == 'authorizeSecurityGroupIngress']
-    assert ingress == [{'securitygroupid': 'ssh-group', 'protocol': 'tcp', 'startport': 22,
-                        'endport': 22, 'cidrlist': '10.253.80.1/32'}]
-    assert sum(command == 'createSecurityGroup' for command, _ in cloud.calls) == 1
 
 
 async def test_concurrent_catalogue_requests_share_one_fetch():

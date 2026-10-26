@@ -17,8 +17,7 @@ services:
       MASTER_KEY_FILE: /run/secrets/master_key
       APP_TLS_CERT: /run/secrets/tls_cert
       APP_TLS_KEY: /run/secrets/tls_key
-      SSH_NETWORKS: ${SSH_NETWORKS:-10.253.80.0/24}
-      SSH_SOURCE_CIDR: ${SSH_SOURCE_CIDR:-10.253.80.1/32}
+      SSH_NETWORKS: ${SSH_NETWORKS:-${CLOUDSTACK_NETWORK:-10.253.80.0/24}}
       PYTHONDONTWRITEBYTECODE: '1'
     volumes:
       - app_data:/data
@@ -39,7 +38,7 @@ services:
     cpus: 2
     networks:
       management:
-        ipv4_address: 172.30.253.2
+        ipv4_address: ${APP_ADDRESS:-172.30.253.2}
     healthcheck:
       test: ['CMD', 'python', '-c', "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8088/healthz',context=ssl._create_unverified_context(),timeout=5)"]
       interval: 30s
@@ -58,7 +57,7 @@ networks:
   management:
     ipam:
       config:
-        - subnet: 172.30.253.0/24
+        - subnet: ${APP_NETWORK:-172.30.253.0/24}
 secrets:
   master_key:
     file: ${MASTER_KEY_PATH:-./secrets/master_key}

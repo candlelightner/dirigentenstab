@@ -16,12 +16,15 @@ import sys
 import time
 import urllib.request
 
+from network_config import load_network
+
 ROOT = Path(__file__).resolve().parent.parent
+NETWORK_CONFIG = load_network(ROOT / '.env')
 STATE = Path('/var/lib/dirigentenstab/setup')
 VERSION = '4.23.0.0'
-BRIDGE = 'dscloud0'
-NETWORK = ipaddress.ip_network('10.253.80.0/24')
-ADDRESS = '10.253.80.1'
+BRIDGE = NETWORK_CONFIG['CLOUDSTACK_BRIDGE']
+NETWORK = ipaddress.ip_network(NETWORK_CONFIG['CLOUDSTACK_NETWORK'])
+ADDRESS = NETWORK_CONFIG['CLOUDSTACK_GATEWAY']
 CMK_SHA256 = '9f4f92ebc3b1e6139d81a2b3f9e7f7c663d1806234ae0ab27cf77753c553d76b'
 
 
@@ -127,7 +130,7 @@ def preflight(existing=False):
     print('Existing virtualization:', run('pgrep', '-a', 'qemu-system', check=False).split(' -')[0] or 'none')
     print('Existing ports:', run('ss', '-lnt').strip())
     print('PCI/NVIDIA inventory:', run('lspci', '-nn', check=False).strip())
-    print('Native plan: dedicated dscloud0 10.253.80.1/24, local storage, private native CloudStack services.')
+    print(f'Native plan: dedicated {BRIDGE} {ADDRESS}/{NETWORK.prefixlen}, local storage, private native CloudStack services.')
     print('Host uplink, SSH, Incus, NVIDIA/vGPU, Cloudflare Tunnel and Tailscale are preserved.')
 
 
@@ -179,7 +182,7 @@ def packages():
 def network():
     save('/etc/systemd/network/80-dirigentenstab.netdev', f'[NetDev]\nName={BRIDGE}\nKind=bridge\n')
     save('/etc/systemd/network/80-dirigentenstab.network',
-         f'[Match]\nName={BRIDGE}\n\n[Network]\nAddress={ADDRESS}/24\nConfigureWithoutCarrier=yes\nLinkLocalAddressing=no\n')
+         f'[Match]\nName={BRIDGE}\n\n[Network]\nAddress={ADDRESS}/{NETWORK.prefixlen}\nConfigureWithoutCarrier=yes\nLinkLocalAddressing=no\n')
     save('/etc/systemd/network/81-dirigentenstab-anchor.netdev', '[NetDev]\nName=dummyds0\nKind=dummy\n')
     save('/etc/systemd/network/81-dirigentenstab-anchor.network',
          f'[Match]\nName=dummyds0\n\n[Network]\nBridge={BRIDGE}\nLinkLocalAddressing=no\n')
@@ -189,7 +192,7 @@ def network():
         run('ip', 'link', 'add', 'dummyds0', 'type', 'dummy')
     run('ip', 'link', 'set', 'dummyds0', 'master', BRIDGE)
     run('ip', 'link', 'set', 'dummyds0', 'up')
-    run('ip', 'address', 'replace', f'{ADDRESS}/24', 'dev', BRIDGE)
+    run('ip', 'address', 'replace', f'{ADDRESS}/{NETWORK.prefixlen}', 'dev', BRIDGE)
     run('ip', 'link', 'set', BRIDGE, 'up')
     # Separate chain: never flush an existing firewall or alter its default policy.
     save('/etc/dirigentenstab-network.nft',
@@ -199,7 +202,7 @@ def network():
          '}\n'
          'table inet dirigentenstab_private {\n'
          ' chain private_services { type filter hook input priority -10; policy accept;\n'
-         f'  ip saddr 172.30.253.2 ip daddr {ADDRESS} tcp dport 8080 accept\n'
+         f"  ip saddr {NETWORK_CONFIG['APP_ADDRESS']} ip daddr {ADDRESS} tcp dport 8080 accept\n"
          f'  iifname != "lo" iifname != "{BRIDGE}" tcp dport {{ 111, 2049, 3306, 8080, 8250, 9090, 16509, 16514, 33060 }} drop\n'
          f'  iifname != "lo" iifname != "{BRIDGE}" udp dport {{ 111, 2049 }} drop\n'
          ' }\n}\n')
@@ -216,8 +219,15 @@ def network():
     run('systemctl', 'enable', '--now', 'dirigentenstab-network')
 
 
+def install_network_config():
+    save('/usr/local/libexec/network_config.py', (ROOT / 'scripts/network_config.py').read_text(), 0o644)
+    save('/etc/dirigentenstab-network.env',
+         ''.join(f'{key}={value}\n' for key, value in NETWORK_CONFIG.items()), 0o600)
+
+
 def guest_ssh():
     """Install scoped SSH and native-SG routed guest forwarding without restarting native services."""
+    install_network_config()
     save('/usr/local/libexec/dirigentenstab-guest-ssh.py',
          (ROOT / 'scripts/guest_ssh_forwarding.py').read_text(), 0o755)
     for kind in ('service', 'timer'):

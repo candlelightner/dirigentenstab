@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import re
 import time
@@ -273,16 +272,11 @@ class Service:
             raise ValueError('Workspace initialization requires a newly provisioned CloudStack data disk')
         if 'userdata' in params or 'userdataid' in params:
             raise ValueError('Managed templates receive trusted SSH cloud-init; custom userdata is unavailable in v0.1')
-        if params.get('securitygroupnames'):
-            raise ValueError('Use securitygroupids for additional managed VM security groups')
-        group_id = await self._ssh_security_group(cloud)
         op_id = self.gpu_deployment_id or uuid.uuid4().hex
         guest = Guest(self)
         cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk)
         name = 'ds-vm-' + op_id[:20]
-        groups = [group_id, *str(params.get('securitygroupids', '')).split(',')]
-        request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode(),
-                   'securitygroupids': ','.join(dict.fromkeys(group for group in groups if group))}
+        request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode()}
         with self.store.connect() as conn:
             conn.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',
                          (op_id, agent['id'], name, self.store.seal(request), 'prepared', time.time()))
@@ -418,23 +412,6 @@ class Service:
                 await self._bind_private_template(op)
             except CloudError:
                 self.store.audit(op['agent_id'], 'template-recovery-needs-review', op['id'], 'pending')
-
-    async def _ssh_security_group(self, cloud):
-        source = ipaddress.ip_network(self.settings.ssh_source_cidr)
-        if source.prefixlen != source.max_prefixlen or not source.is_private or source.is_loopback:
-            raise ValueError('SSH_SOURCE_CIDR must be one approved private application egress address')
-        name = 'dirigentenstab-managed-ssh'
-        groups = (await cloud.execute('listSecurityGroups', {'securitygroupname': name})).get('securitygroup', [])
-        group = next((g for g in groups if g['name'] == name), None)
-        if not group:
-            group = first(await cloud.execute('createSecurityGroup', {'name': name,
-                          'description': 'SSH only from the private Dirigentenstab application egress'}), 'securitygroup')
-        rules = group.get('ingressrule', [])
-        if not any(r.get('protocol') == 'tcp' and str(r.get('startport')) == '22'
-                   and str(r.get('endport')) == '22' and r.get('cidr') == str(source) for r in rules):
-            await cloud.execute('authorizeSecurityGroupIngress', {'securitygroupid': group['id'], 'protocol': 'tcp',
-                                'startport': 22, 'endport': 22, 'cidrlist': str(source)})
-        return group['id']
 
     def _bind_vm(self, op_id, vm_id):
         if not isinstance(vm_id, str) or not vm_id:

@@ -79,3 +79,20 @@ Set optional `CLOUDSTACK_UI_URL` to the native dashboard URL reachable from the 
 Creating the private reverse proxy is an operator action. On the reference host only, the added tailnet-only route is `tailscale serve --bg --https=3002 http://10.253.80.1:8080`, with browser URL `https://homeserver.tail3e59e6.ts.net:3002/client`. Existing 3000/3001/9443 routes were preserved. Do not enable Funnel or bind CloudStack's management API publicly. A fresh installation leaves the URL blank until its operator supplies a suitable private endpoint.
 
 GPU build preparation is optional; see [GPU_PREPARATION.md](GPU_PREPARATION.md). Set `ENABLE_GPU_CONTROL=true` before standard setup to install its dependencies and persistent private controller automatically. The standard installer requires no imported hierarchy/workspaces and does not automatically install NVIDIA drivers, partition GPUs or grant policies/change quotas. NVIDIA's licensed host manager and any private guest bundle remain operator-supplied prerequisites.
+
+## Network configuration
+
+Set the literal `CLOUDSTACK_BRIDGE`, `CLOUDSTACK_NETWORK`, `CLOUDSTACK_GATEWAY`,
+`CLOUDSTACK_SYSTEM_START/END`, `CLOUDSTACK_GUEST_START/END`, `APP_NETWORK`,
+`APP_ADDRESS` and `TAILSCALE_INTERFACE` values in `.env` before setup.
+`.env.example` shows the reference host's values. The CloudStack API URL and
+application `SSH_NETWORKS` can derive from these values using Compose/dotenv
+interpolation. `SSH_SOURCE_CIDR` is retired: managed deployment no longer
+creates a security group. Network isolation is an explicit CloudStack decision
+by the user/agent; SSH authentication and guest ownership checks still apply.
+
+Existing networks are not moved by changing `.env`. Installers snapshot validated
+network values into `/etc/dirigentenstab-network.env` for the host timers; rerun
+`sudo python3 scripts/native_setup.py --guest-ssh` and
+`sudo python3 scripts/install_console_forwarding.py` to update forwarding.
+See [Tailscale VM access](CONSOLE_ACCESS.md) for route and client checks.

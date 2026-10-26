@@ -7,16 +7,20 @@ import re
 import shlex
 import subprocess
 
-APP = '172.30.253.2/32'
-GUESTS = '10.253.80.0/24'
+from network_config import load_network
+
+CONFIG = load_network()
+BRIDGE = CONFIG['CLOUDSTACK_BRIDGE']
+APP = CONFIG['APP_ADDRESS'] + '/32'
+GUESTS = CONFIG['CLOUDSTACK_NETWORK']
 TAG = 'dirigentenstab-guest-ssh'
 
 
 def rules(bridge):
     return [
-        ['-i', bridge, '-o', 'dscloud0', '-s', APP, '-d', GUESTS, '-p', 'tcp', '--dport', '22',
+        ['-i', bridge, '-o', BRIDGE, '-s', APP, '-d', GUESTS, '-p', 'tcp', '--dport', '22',
          '-m', 'conntrack', '--ctstate', 'NEW,ESTABLISHED', '-m', 'comment', '--comment', TAG, '-j', 'ACCEPT'],
-        ['-i', 'dscloud0', '-o', bridge, '-s', GUESTS, '-d', APP, '-p', 'tcp', '--sport', '22',
+        ['-i', BRIDGE, '-o', bridge, '-s', GUESTS, '-d', APP, '-p', 'tcp', '--sport', '22',
          '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-m', 'comment', '--comment', TAG, '-j', 'ACCEPT'],
     ]
 
@@ -48,7 +52,7 @@ EGRESS_CHAIN = 'DS-GUEST-EGRESS'
 def routed_policy(chains):
     """Adapt native bridge guards while retaining live CloudStack SG chains and IP sets."""
     result = []
-    for dispatch in chains.get('BF-dscloud0-IN', []):
+    for dispatch in chains.get(f'BF-{BRIDGE}-IN', []):
         if len(dispatch) != 7 or dispatch[:3] != ['-m', 'physdev', '--physdev-in'] or dispatch[4:6] != [
                 '--physdev-is-bridged', '-j']:
             continue
@@ -93,20 +97,20 @@ def maintain_routed(remove=False, run=subprocess.run):
     current = chains.get('FORWARD', [])
     owned = [rule for rule in current if EGRESS_TAG in rule]
     desired, policy = [], None
-    if not remove and 'BF-dscloud0-IN' in chains:
+    if not remove and f'BF-{BRIDGE}-IN' in chains:
         routes = json.loads(call('ip', '-j', '-4', 'route', 'show', 'default').stdout)
-        routes = [route for route in routes if route.get('dev') and route['dev'] != 'dscloud0']
+        routes = [route for route in routes if route.get('dev') and route['dev'] != BRIDGE]
         if routes:
             uplink = min(routes, key=lambda route: route.get('metric', 0))['dev']
             tag = ['-m', 'comment', '--comment', EGRESS_TAG]
             desired = [
-                ['-i', 'dscloud0', '-o', uplink, '-s', GUESTS, '!', '-d', GUESTS, *tag, '-j', EGRESS_CHAIN],
-                ['-i', uplink, '-o', 'dscloud0', '-d', GUESTS, '-m', 'conntrack', '--ctstate',
+                ['-i', BRIDGE, '-o', uplink, '-s', GUESTS, '!', '-d', GUESTS, *tag, '-j', EGRESS_CHAIN],
+                ['-i', uplink, '-o', BRIDGE, '-d', GUESTS, '-m', 'conntrack', '--ctstate',
                  'ESTABLISHED,RELATED', *tag, '-j', 'ACCEPT'],
             ]
             policy = routed_policy(chains)
     barriers = [i for i, rule in enumerate(current) if rule in (
-        ['-i', 'dscloud0', '-j', 'DROP'], ['-o', 'dscloud0', '-j', 'DROP'])]
+        ['-i', BRIDGE, '-j', 'DROP'], ['-o', BRIDGE, '-j', 'DROP'])]
     positioned = bool(desired and barriers and all(current.index(rule) < min(barriers) for rule in owned))
     present = len(owned) == len(desired) and all(
         call('iptables', '-w', '5', '-C', 'FORWARD', *rule, check=False).returncode == 0 for rule in desired)

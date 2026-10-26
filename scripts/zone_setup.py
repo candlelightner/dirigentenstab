@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import http.cookiejar
 import json
+import ipaddress
 import os
 from pathlib import Path
 import secrets
@@ -19,7 +20,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from native_setup import ADDRESS, BRIDGE, STATE, properties, run, save
+from native_setup import ADDRESS, BRIDGE, NETWORK, NETWORK_CONFIG, STATE, properties, run, save
 
 API = f'http://{ADDRESS}:8080/client/api'
 ZONE, POD, CLUSTER = 'Dirigentenstab', 'Dirigentenstab-private', 'Dirigentenstab-KVM'
@@ -135,11 +136,15 @@ def configure_storage():
     os.chown(directory, 65534, group.gr_gid)
     directory.chmod(0o2770)
     # Only CloudStack system-VM management IPs can mount this dedicated directory.
-    # Ordinary guest allocation is .100-.220, outside this export ACL.
+    # Export only the configured management allocation range, never ordinary guest addresses.
     options = f'rw,sync,no_subtree_check,root_squash,anonuid=65534,anongid={group.gr_gid}'
+    system_ranges = ipaddress.summarize_address_range(
+        ipaddress.ip_address(NETWORK_CONFIG['CLOUDSTACK_SYSTEM_START']),
+        ipaddress.ip_address(NETWORK_CONFIG['CLOUDSTACK_SYSTEM_END']))
+    clients = [ADDRESS, *map(str, system_ranges)]
     save('/etc/exports.d/dirigentenstab.exports',
-         f'{directory} 10.253.80.1({options}) 10.253.80.16/28({options}) 10.253.80.32/28({options})\n')
-    save('/etc/nfs.conf.d/dirigentenstab.conf', '[nfsd]\nhost=10.253.80.1\nvers3=n\nvers4=y\n')
+         str(directory) + ' ' + ' '.join(f'{client}({options})' for client in clients) + '\n')
+    save('/etc/nfs.conf.d/dirigentenstab.conf', f'[nfsd]\nhost={ADDRESS}\nvers3=n\nvers4=y\n')
     run('systemctl', 'unmask', 'nfs-server', 'rpcbind', 'rpcbind.socket')
     run('exportfs', '-ra')
     run('systemctl', 'restart', 'nfs-kernel-server')
@@ -205,8 +210,8 @@ def guest_template(cloud, zone_id):
 def zone(cloud):
     cloud.call('updateConfiguration', name='system.vm.use.local.storage', value='true')
     management = cloud.call('listConfigurations', name='management.network.cidr').get('configuration', [])
-    if management and management[0].get('value') != '10.253.80.0/24':
-        cloud.call('updateConfiguration', name='management.network.cidr', value='10.253.80.0/24')
+    if management and management[0].get('value') != str(NETWORK):
+        cloud.call('updateConfiguration', name='management.network.cidr', value=str(NETWORK))
         run('systemctl', 'restart', 'cloudstack-management')
         for _ in range(120):
             try:
@@ -221,8 +226,8 @@ def zone(cloud):
                   name=ZONE, dns1='1.1.1.1', internaldns1='1.1.1.1', networktype='Basic',
                   localstorageenabled='true', securitygroupenabled='true')
     pod = ensure(cloud, 'listPods', 'pod', 'createPod', match={'name': POD}, name=POD,
-                 zoneid=zone['id'], gateway=ADDRESS, netmask='255.255.255.0',
-                 startip='10.253.80.20', endip='10.253.80.40')
+                 zoneid=zone['id'], gateway=ADDRESS, netmask=str(NETWORK.netmask),
+                 startip=NETWORK_CONFIG['CLOUDSTACK_SYSTEM_START'], endip=NETWORK_CONFIG['CLOUDSTACK_SYSTEM_END'])
     cluster = ensure(cloud, 'listClusters', 'cluster', 'addCluster', match={'name': CLUSTER},
                      clustername=CLUSTER, zoneid=zone['id'], podid=pod['id'],
                      hypervisor='KVM', clustertype='CloudManaged')
@@ -274,8 +279,8 @@ def zone(cloud):
     ranges = cloud.call('listVlanIpRanges', zoneid=zone['id'], networkid=guest['id']).get('vlaniprange', [])
     if not ranges:
         cloud.call('createVlanIpRange', zoneid=zone['id'], podid=pod['id'], networkid=guest['id'],
-                   forvirtualnetwork='false', gateway=ADDRESS, netmask='255.255.255.0',
-                   startip='10.253.80.100', endip='10.253.80.220', vlan='untagged')
+                   forvirtualnetwork='false', gateway=ADDRESS, netmask=str(NETWORK.netmask),
+                   startip=NETWORK_CONFIG['CLOUDSTACK_GUEST_START'], endip=NETWORK_CONFIG['CLOUDSTACK_GUEST_END'], vlan='untagged')
     cloud.call('updateZone', id=zone['id'], allocationstate='Enabled')
     template_id = guest_template(cloud, zone['id'])
     offerings = cloud.call('listServiceOfferings', name='Dirigentenstab-small').get('serviceoffering', [])

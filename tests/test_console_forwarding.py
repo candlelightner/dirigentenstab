@@ -43,8 +43,7 @@ def test_console_adopts_exact_working_rules_and_preserves_foreign_rules():
     assert lines[1:3] == ['-D FORWARD ' + shlex.join(rule) for rule in legacy]
     assert '--noflush' in next(c for c, _ in calls if c[0] == 'iptables-restore')
     assert all('-F' not in c and '-P' not in c for c, _ in calls)
-    assert 'tcp dport { 80, 8080 } accept' in console.GUARD
-    assert 'ip daddr 10.253.80.100' in console.GUARD
+    assert 'ip daddr 10.253.80.0/24 accept' in console.GUARD
     assert 'iifname "tailscale0" oifname "dscloud0" drop' in console.GUARD
     assert any('ts-postrouting' in c and 'MASQUERADE' in c for c, _ in calls)
 
@@ -85,12 +84,14 @@ def test_console_installer_orders_and_enables_only_its_units(tmp_path, monkeypat
     import install_console_forwarding as installer
     writes, calls = {}, []
     monkeypatch.setattr(installer, 'STATE', tmp_path)
+    monkeypatch.setattr(installer, 'install_network_config', lambda: None)
     monkeypatch.setattr(installer.os, 'geteuid', lambda: 0)
     monkeypatch.setattr(installer.os, 'umask', lambda value: None)
     monkeypatch.setattr(installer, 'save', lambda path, data, mode: writes.update({path: (data, mode)}))
     monkeypatch.setattr(installer, 'run', lambda *args: calls.append(args))
     installer.install()
     service = writes['/etc/systemd/system/dirigentenstab-console.service'][0]
+    assert 'EnvironmentFile=/etc/dirigentenstab-network.env' in service
     after = next(line for line in service.splitlines() if line.startswith('After='))
     assert all(name in after for name in ('network-online.target', 'tailscaled.service',
         'cloudstack-agent.service', 'cloudstack-management.service', 'dirigentenstab-network.service'))
@@ -99,3 +100,40 @@ def test_console_installer_orders_and_enables_only_its_units(tmp_path, monkeypat
     assert ('systemctl', 'enable', 'dirigentenstab-console.service') in calls
     assert ('systemctl', 'enable', '--now', 'dirigentenstab-console.timer') in calls
     assert all('restart' not in c and 'stop' not in c for c in calls)
+
+
+def test_vm_access_is_scoped_to_tailscale_with_only_established_replies():
+    inbound, reply = console.rules()
+    assert inbound[inbound.index('-i') + 1] == 'tailscale0'
+    assert inbound[inbound.index('-o') + 1] == 'dscloud0'
+    assert inbound[inbound.index('-s') + 1] == '100.64.0.0/10'
+    assert inbound[inbound.index('-d') + 1] == '10.253.80.0/24'
+    assert inbound[-2:] == ['-j', 'ts-forward']
+    assert reply[reply.index('-i') + 1] == 'dscloud0'
+    assert reply[reply.index('-o') + 1] == 'tailscale0'
+    assert reply[reply.index('-s') + 1] == '10.253.80.0/24'
+    assert reply[reply.index('-d') + 1] == '100.64.0.0/10'
+    assert set(reply[reply.index('--ctstate') + 1].split(',')) == {'ESTABLISHED', 'RELATED'}
+    assert all('-p' not in rule for rule in (inbound, reply))
+    assert 'iifname "tailscale0" oifname "dscloud0" ip saddr 100.64.0.0/10' in console.GUARD
+
+
+def test_upgrading_console_only_policy_replaces_owned_rules_without_touching_vm_isolation():
+    old = [
+        ['-s', '100.64.0.0/10', '-d', '10.253.80.100/32', '-i', 'tailscale0', '-o', 'dscloud0',
+         '-p', 'tcp', '-m', 'multiport', '--dports', '80,8080', '-m', 'conntrack',
+         '--ctstate', 'NEW,ESTABLISHED', '-m', 'comment', '--comment', console.TAG, '-j', 'ts-forward'],
+        ['-s', '10.253.80.100/32', '-d', '100.64.0.0/10', '-i', 'dscloud0', '-o', 'tailscale0',
+         '-p', 'tcp', '-m', 'multiport', '--sports', '80,8080', '-m', 'conntrack',
+         '--ctstate', 'RELATED,ESTABLISHED', '-m', 'comment', '--comment', console.TAG, '-j', 'ACCEPT'],
+    ]
+    isolation = ['-o', 'dscloud0', '-m', 'physdev', '--physdev-is-bridged', '-j', 'BF-dscloud0']
+    calls, run = fake_run([*old, isolation, ['-o', 'dscloud0', '-j', 'DROP']], guard=False)
+    console.maintain(run=run)
+    transaction = next(data for c, data in calls if c[0] == 'iptables-restore')
+    assert all('-D FORWARD ' + shlex.join(rule) in transaction for rule in old)
+    assert all('-I FORWARD 1 ' + shlex.join(rule) in transaction for rule in console.rules())
+    assert 'BF-dscloud0' not in transaction
+    assert '-j DROP' not in transaction
+    guard = next(data for c, data in calls if c[:2] == ('nft', '-f'))
+    assert guard.endswith(console.GUARD)
