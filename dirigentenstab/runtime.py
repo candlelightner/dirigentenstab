@@ -691,8 +691,11 @@ class Runtime:
         if (await self.service.compute_offering_access(record))['enabled']:
             @agent.tool(sequential=True)
             async def request_compute_offering(ctx: RunContext, params: dict) -> dict:
-                """Request owner approval for a CloudStack compute offering in your domain.
+                """Request optional owner assistance for a compute offering in your domain.
 
+                Prefer execute_api with createServiceOffering for CPU or permitted mediated GPU
+                offerings your native CloudStack identity can create. Use this request only when
+                owner action is needed; it does not change your existing permissions.
                 Calling this tool does not provide an immediate offering. Finish other work,
                 then call pause_work while waiting. Native parameters include name, displaytext,
                 cpunumber, cpuspeed, memory and storagetype. vgpuprofileid and gpucount require

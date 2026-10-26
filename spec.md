@@ -53,6 +53,12 @@ users. There is no new hub account or registration system.
 
 ## Compute offering requests
 
+- Agents create CPU and permitted mediated GPU offerings directly with
+  `execute_api` and native `createServiceOffering` when their own CloudStack
+  authority permits it. The request tool is optional owner assistance when
+  owner action is needed; it does not replace or restrict native creation.
+- Requests are asynchronous. Agents finish other work before using `pause_work`
+  when they need to wait for an offering; calling the tool does not pause them.
 - Every agent can request a native CloudStack compute offering by default. The
   owner or an ancestor can disable this tool; disabling any ancestor blocks all
   descendants immediately while preserving their individual selections.
