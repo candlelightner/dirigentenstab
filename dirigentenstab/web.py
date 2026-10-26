@@ -68,6 +68,22 @@ def tool_label(event):
         ' · ' + event['summary'] if event.get('summary') else '')
 
 
+def pause_reason(*sources):
+    for source in sources:
+        if not source:
+            continue
+        if isinstance(source, str):
+            try:
+                source = json.loads(source)
+            except (ValueError, TypeError):
+                if stripped := source.strip():
+                    return stripped
+        if isinstance(source, dict) and source.get('reason'):
+            if val := str(source['reason']).strip():
+                return val
+    return None
+
+
 def history_parts(history):
     """Keep chronological messages and correlated tools, including pre-v0.1.3 histories."""
     saved = {(e['type'], e.get('call_id')): e for run in history.get('runs', []) for e in run['events']}
@@ -87,9 +103,15 @@ def history_parts(history):
                 }
                 emitted.add(key)
                 yield 'activity', event
+                if kind == 'tool-call' and (part.get('tool_name') == 'pause_work' or event.get('name') == 'pause_work'):
+                    if reason := pause_reason(part.get('args'), event.get('content')):
+                        yield 'agent', reason
     for key, event in saved.items():
         if key not in emitted:
             yield 'activity', event
+            if event.get('type') == 'tool_call' and event.get('name') == 'pause_work':
+                if reason := pause_reason(event.get('content')):
+                    yield 'agent', reason
 
 
 def conversation_activity(store, human_id, agent_ids):
