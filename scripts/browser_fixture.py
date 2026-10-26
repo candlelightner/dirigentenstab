@@ -159,7 +159,15 @@ async def fake_model(messages, info):
     assert all(secret not in str(messages) + str(info.instructions) for secret in PRIVATE_VALUES)
     prompt = next((str(part.content) for message in reversed(messages) for part in message.parts
                    if part.part_kind == 'user-prompt'), '')
-    if 'background fixture' in prompt:
+    if 'heartbeat fixture' in prompt:
+        loop = asyncio.get_running_loop()
+        deadline, index = loop.time() + 40, 0
+        while loop.time() < deadline:
+            yield f'Heartbeat {index}. '
+            index += 1
+            await asyncio.sleep(1)
+        yield 'Streaming complete.'
+    elif 'background fixture' in prompt:
         yield 'Background work accepted.'
         await asyncio.sleep(2)
         yield ' Background work completed.'

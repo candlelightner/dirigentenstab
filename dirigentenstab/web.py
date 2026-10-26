@@ -122,7 +122,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 <small>Accounts are managed in CloudStack. Public registration is disabled.</small>
 </main></body></html>''', headers={'Cache-Control': 'no-store'})
 
-    @ui.page('/')
+    @ui.page('/', response_timeout=30)
     async def workspace(request: Request):
         client = ui.context.client
         token = request.cookies.get('ds_session', '')
@@ -311,6 +311,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         sync_run_details()
 
         tool_cards = {}
+        rendered_parts = []
+        rendered_conversation = None
+        render_generation = 0
+        history_generation = 0
         selection_lock = asyncio.Lock()
 
         def activity(event):
@@ -342,10 +346,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     with ui.chat_message(name='You' if kind == 'human' else 'Agent', sent=kind == 'human').classes(
                             'w-full max-w-full'):
                         if kind == 'agent':
-                            ui.markdown(content, extras=['tables', 'fenced-code-blocks'], sanitize=True).classes(
+                            return ui.markdown(content, extras=['tables', 'fenced-code-blocks'], sanitize=True).classes(
                                 'markdown w-full')
                         else:
-                            ui.label(content).classes('whitespace-pre-wrap break-words')
+                            return ui.label(content).classes('whitespace-pre-wrap break-words')
 
         async def histories():
             current = await actor()
@@ -486,6 +490,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 domain_dialog.open()
 
         async def choose_history(event):
+            nonlocal history_generation
+            history_generation += 1
+            generation, agent_id = history_generation, state['agent']
             if not event.value or event.value == state['conversation']:
                 return
             prompt.disable()
@@ -493,6 +500,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 restored = await runtime.restore(await actor(), event.value)
             finally:
                 prompt.enable()
+            if generation != history_generation or agent_id != state['agent'] or client.is_deleted:
+                return
             if restored['agent_id'] != state['agent']:
                 raise PermissionError('Conversation belongs to another agent')
             state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
@@ -500,6 +509,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             await render_history(restored)
 
         async def render_history(restored):
+            nonlocal rendered_conversation, render_generation
+            render_generation += 1
+            generation = render_generation
             state['conversation'] = restored['id']
             state['imported'] = bool(restored.get('imported'))
             state['active_operation'] = None
@@ -531,10 +543,35 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 status_label.set_text('Imported history is read-only. Sending starts a new conversation.')
             sync_composer()
             sync_run_details()
-            transcript.clear()
-            tool_cards.clear()
-            for kind, content in history_parts(restored):
-                activity(content) if kind == 'activity' else message(kind, content)
+            parts = list(history_parts(restored))
+            keys = [(kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
+                    if kind == 'activity' else (kind, index)
+                    for index, (kind, content) in enumerate(parts)]
+            if (rendered_conversation != restored['id'] or not transcript.default_slot.children
+                    or keys[:len(rendered_parts)] != [part[0] for part in rendered_parts]):
+                transcript.clear()
+                tool_cards.clear()
+                rendered_parts.clear()
+            rendered_conversation = restored['id']
+            for index, ((kind, content), key) in enumerate(zip(parts, keys, strict=True)):
+                if index < len(rendered_parts):
+                    _, previous, element = rendered_parts[index]
+                    if previous == content:
+                        continue
+                    if kind == 'activity':
+                        activity(content)
+                    elif kind == 'agent':
+                        element.set_content(content)
+                    else:
+                        element.set_text(content)
+                    rendered_parts[index] = (key, content, element)
+                else:
+                    element = activity(content) if kind == 'activity' else message(kind, content)
+                    rendered_parts.append((key, content, element))
+                if index % 20 == 0:
+                    await asyncio.sleep(0)
+                    if client.is_deleted or generation != render_generation or state['conversation'] != restored['id']:
+                        return
             transcript_scroll.scroll_to(percent=1)
             state['activity_token'] = None
 

@@ -799,3 +799,61 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
         assert next(iter(user.find('Send').elements)).visible
         await asyncio.sleep(0)
         assert runtime.restored == ['second']
+
+
+async def test_polling_updates_text_and_tool_status_without_replacing_history(monkeypatch):
+    from types import SimpleNamespace
+
+    identity = {'userid': 'owner', 'username': 'owner', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account', 'is_main': True}
+    call = {'type': 'tool_call', 'name': 'execute_api', 'call_id': 'call', 'operation_id': 'run',
+            'content': {'command': 'listVirtualMachines'}}
+    result = call | {'type': 'tool_result', 'content': {'virtualmachine': []}}
+
+    class Service(AgentCapabilities):
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        version = 0
+        async def conversations(self, current, agent_id):
+            return [{'id': 'conversation', 'title': 'Task'}]
+
+        async def restore(self, current, conversation_id):
+            return {'id': conversation_id, 'agent_id': 'agent', 'messages': [
+                {'parts': [{'part_kind': 'user-prompt', 'content': 'Inspect'}]},
+                {'parts': [{'part_kind': 'text', 'content': 'Partial' if not self.version else 'Partial complete'},
+                           {'part_kind': 'tool-call', 'tool_call_id': 'call', 'tool_name': 'execute_api'}]},
+            ], 'runs': [{'id': 'run', 'status': 'running', 'events': [call] + ([result] if self.version else [])}]}
+
+    runtime = Runtime()
+    async def current(token):
+        return identity
+
+    monkeypatch.setitem(build_ui.__globals__, 'conversation_activity', lambda *args: [
+        {'id': 'conversation', 'agent_id': 'agent', 'title': 'Task', 'operation_id': 'run',
+         'status': 'running', 'updated': runtime.version}])
+    async with user_simulation() as user:
+        build_ui(Service(), SimpleNamespace(identity=current), runtime)
+        await user.open('/')
+        poll = next(element for element in user.client.elements.values()
+                    if isinstance(element, ui.timer) and element.callback.__name__ == 'poll_activity')
+        poll.deactivate()
+        selector = next(iter(user.find(kind=ui.select, content='Conversation').elements))
+        selector.set_value('conversation')
+        await user.should_see('Partial')
+        text = next(iter(user.find(kind=ui.markdown, content='Partial').elements))
+        card = next(iter(user.find(kind=ui.expansion, content='execute_api').elements))
+        runtime.version = 1
+        await poll.callback()
+        assert not text.is_deleted and text.content == 'Partial complete'
+        assert not card.is_deleted and 'Completed' in card.text
+        assert 'listVirtualMachines' in str(card._props['call_content'])
+        await poll.callback()
+        assert not text.is_deleted and not card.is_deleted

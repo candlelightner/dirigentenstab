@@ -2,10 +2,10 @@
 
 Guidelines and conventions for AI assistants working in this repository.
 
-## 1. Delegation & Subagents (Antigravity / `agy`)
+## 1. Delegation & Subagents
 
 - The main/parent agent coordinates, reviews, and handles user communication and GitHub MCP calls. It must **never** directly edit code/files, run test suites, execute git mutations, or run Docker build/deploy commands itself.
-- Delegate all code edits, test executions, git commits/pushes, and local container rebuilds/restarts exclusively to **Gemini 3.8 Flash** subagents (`invoke_subagent` with `Model="flash"`).
+- Delegate all code edits, test executions, git commits/pushes, and local container rebuilds/restarts to competent smaller-model subagents available to the coordinating provider. Choose by task competence and availability, not a fixed provider: an OpenAI flagship can delegate to GPT-6.1 Sol or Luna, a Google flagship to Gemini Flash, and a Claude flagship to Sonnet or Haiku. Keep implementation and verification with subagents; the parent retains coordination and review.
 
 ## 2. GitHub MCP & Delivery Pipeline
 

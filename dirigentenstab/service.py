@@ -63,7 +63,7 @@ class Service:
                     self._remember(item)
 
     def redact(self, value):
-        return redact(value, self._secrets)
+        return redact(value, tuple(self._secrets))
 
     def client(self, credentials):
         self._remember(credentials)
