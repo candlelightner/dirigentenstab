@@ -270,9 +270,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
                 with ui.scroll_area().classes('messages') as transcript_scroll:
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
-                budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
-                context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
-                compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
+                with ui.expansion('Run details', value=False).classes('w-full shrink-0').mark('run_details'):
+                    budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
+                    context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
+                    compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
                 with progress:
                     reference = ui.tooltip('')
