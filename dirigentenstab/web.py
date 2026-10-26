@@ -156,14 +156,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     error = diagnose(exc, agent_id=state['agent'])
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
-        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'seen': {}, 'drafts': {}, 'mobile': False, 'details_expansion': None}
-        def viewport_changed(event):
-            mobile = event.args['width'] <= 600
-            if mobile and not state['mobile'] and state['details_expansion'] is not None:
-                state['details_expansion'].close()
-            state['mobile'] = mobile
-
-        ui.on('ds-viewport', viewport_changed)
+        state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'seen': {}, 'drafts': {}}
         agents = {row['id']: row for row in data.get('agents', [])}
         dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
         dashboard_links = []
@@ -177,9 +170,14 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
             ui.button(icon='account_tree', on_click=lambda: drawer.run_method('toggle')).props(
                 'outline round aria-label="Open agent hierarchy"').classes('text-teal-900').mark('hierarchy_toggle')
-            agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
-                                     label='Agent', with_input=True).props('dense borderless').classes(
-                                         'header-agent-selector flex-1 min-w-0').mark('agent_selector')
+            with ui.button('Select an agent').props(
+                    'flat no-caps icon-right=expand_more aria-label="Agent details" aria-haspopup="menu"').classes(
+                        'agent-details-toggle flex-1 min-w-0').mark('agent_details_toggle') as agent_heading:
+                with ui.menu().props('anchor="bottom left" self="top left"').classes(
+                        'agent-details-menu bg-white p-4').mark('agent_details_menu').style(
+                            'width:min(520px,calc(100vw - 24px));max-height:calc(var(--viewport-height,100dvh) - 84px);overflow-y:auto') as details_menu:
+                    details = ui.column().classes('agent-details w-full gap-3').mark('agent_details')
+            agent_heading.disable()
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
@@ -191,8 +189,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
             .nicegui-content{padding:0;height:calc(var(--viewport-height,100dvh) - 65px);min-height:0}
-            .header-agent-selector .q-field__native{font-size:20px;font-weight:600;flex-wrap:nowrap}
-            .header-agent-selector .q-field__native>span,.header-agent-selector input{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+            .agent-details-toggle{font-size:20px;padding:0 4px}
+            .agent-details-toggle .q-btn__content{justify-content:space-between;flex-wrap:nowrap}
+            .agent-details-toggle .q-btn__content>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -217,8 +216,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             button,.q-btn{min-height:44px}
             .dashboard-mobile{display:none;min-height:44px}
             @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}
-            .workspace.compact .agent-details{display:none}
-            @media(max-width:600px){.workspace{padding:6px;gap:6px}.agent-details{padding:10px}
+            @media(max-width:600px){.workspace{padding:6px;gap:6px}
             .conversation-stop{font-size:0;min-width:44px;padding:8px}.conversation-stop .q-icon{font-size:24px;margin:0}
             .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
@@ -229,11 +227,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 const header=document.querySelector('.q-header');
                 const height=window.visualViewport?.height || innerHeight;
                 document.documentElement.style.setProperty('--viewport-height',height+'px');
-                if(el) { el.classList.toggle('compact',innerWidth<=600 && height<=600);
-                    el.style.height=Math.max(100,height-(header?.getBoundingClientRect().height || 65))+'px'; } };
+                if(el) { el.style.height=Math.max(100,height-(header?.getBoundingClientRect().height || 65))+'px'; } };
                 window.visualViewport?.addEventListener('resize',fit); window.addEventListener('resize',fit);
-                const report=()=>{if(window.did_handshake) emitEvent('ds-viewport',{width:innerWidth})};
-                window.addEventListener('resize',report);
                 fit(); setTimeout(fit,500); })();
         </script>""")
         # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
@@ -262,13 +257,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2'):
                 history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
                 new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
-            details = ui.card().classes('w-full shrink-0 agent-details')
-            with details:
-                ui.label('Select an agent to begin').classes('text-xl font-semibold')
             with ui.card().classes('conversation'):
                 with ui.scroll_area().classes('messages') as transcript_scroll:
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
-                progress = ui.label('Ready').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
+                progress = ui.label('Select an agent to begin').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
                 with progress:
                     reference = ui.tooltip('')
                 with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
@@ -342,12 +334,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             async with selection_lock:
                 if state['requested_agent'] != agent_id:
                     return
-                agent_choice.disable()
+                details_menu.close()
+                agent_heading.disable()
                 tree.classes('pointer-events-none opacity-50').props('aria-disabled=true')
                 try:
                     await render_agent(agent_id, close_navigation=close_navigation)
                 finally:
-                    agent_choice.enable()
+                    agent_heading.set_enabled(bool(state['agent']))
                     tree.classes(remove='pointer-events-none opacity-50').props(remove='aria-disabled')
 
         async def render_agent(agent_id, *, close_navigation=True):
@@ -368,11 +361,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             transcript.clear()
             tool_cards.clear()
             progress.set_text('Ready')
-            state['updating_selector'] = True
-            try:
-                agent_choice.set_value(agent_id)
-            finally:
-                state['updating_selector'] = False
+            agent_heading.set_text(agent_label(agents.get(agent_id, agent)))
             tree.props['selected'] = 'agent:' + agent_id
             tree.update()
             if close_navigation:
@@ -380,37 +369,35 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             details.clear()
             domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
             with details:
-                with ui.expansion(value=not state['mobile']).classes('w-full').props('header-class="px-0"').mark('agent_details') as expansion:
-                    state['details_expansion'] = expansion
-                    ui.timer(0.01, lambda: ui.run_javascript("emitEvent('ds-viewport',{width:innerWidth})"), once=True)
-                    with expansion.add_slot('header'):
-                        with ui.row().classes('w-full min-w-0 items-center gap-3'):
-                            ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold break-words')
-                            ui.badge('Domain administrator', color='primary')
-                    with ui.row().classes('w-full items-center justify-end gap-3'):
-                        ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
-                        if await service.subgroup_capability(agent_id):
-                            ui.button('Create subgroup', icon='create_new_folder',
-                                      on_click=lambda: protect(subgroup_dialog)).props('outline')
-                    provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
-                    ui.label('Model: ' + provider.get('name', 'No provider') + ' / ' +
-                             (agent.get('model') or provider.get('default_model') or 'not configured')).classes('text-sm')
-                    with ui.expansion('Domain details', icon='info').classes('w-full text-sm'):
-                        ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('break-all')
-                        ui.label('CloudStack domain: ' + agent['domain_id']).classes('break-all')
-                        ui.label('Administrator account: ' + agent['account_id']).classes('break-all')
-                        ui.label('Original agent name: ' + agent['name'])
-                        for user in state['data'].get('users', []):
-                            if user.get('domainid') == agent['domain_id'] and user['id'] != agent.get('user_id'):
-                                ui.label('Administrator: ' + user.get('username', user['id']))
-                    for operation in state['data'].get('pending_provisioning', []):
-                        if operation['parent_id'] == agent_id:
-                            ui.label(f"Requires reconciliation: {operation['name']} · {operation['phase']} · "
-                                     f"Reference: {operation['id']}").classes('text-amber-900 break-all')
-                            ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
-                                     'to use scripts/admin.py repair-provisioning.').classes('text-sm')
+                with ui.row().classes('w-full min-w-0 items-center gap-3'):
+                    ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold break-words')
+                    ui.badge('Domain administrator', color='primary')
+                    ui.space()
+                    ui.button(icon='close', on_click=details_menu.close).props('flat round aria-label="Close agent details"')
+                with ui.row().classes('w-full items-center justify-end gap-3'):
+                    ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
+                    if await service.subgroup_capability(agent_id):
+                        ui.button('Create subgroup', icon='create_new_folder',
+                                  on_click=lambda: protect(subgroup_dialog)).props('outline')
+                provider = next((p for p in await service.providers(current) if p['id'] == agent.get('provider_id')), {})
+                ui.label('Model: ' + provider.get('name', 'No provider') + ' / ' +
+                         (agent.get('model') or provider.get('default_model') or 'not configured')).classes('text-sm')
+                with ui.expansion('Domain details', icon='info').classes('w-full text-sm'):
+                    ui.label(domain.get('path', domain.get('name', agent['domain_id']))).classes('break-all')
+                    ui.label('CloudStack domain: ' + agent['domain_id']).classes('break-all')
+                    ui.label('Administrator account: ' + agent['account_id']).classes('break-all')
+                    ui.label('Original agent name: ' + agent['name'])
+                    for user in state['data'].get('users', []):
+                        if user.get('domainid') == agent['domain_id'] and user['id'] != agent.get('user_id'):
+                            ui.label('Administrator: ' + user.get('username', user['id']))
+                for operation in state['data'].get('pending_provisioning', []):
+                    if operation['parent_id'] == agent_id:
+                        ui.label(f"Requires reconciliation: {operation['name']} · {operation['phase']} · "
+                                 f"Reference: {operation['id']}").classes('text-amber-900 break-all')
+                        ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
+                                 'to use scripts/admin.py repair-provisioning.').classes('text-sm')
             await histories()
-            with expansion:
+            with details:
                 with ui.expansion('Virtual machines', icon='dns').classes('w-full'):
                     try:
                         vms = await service.vm_overview(current, agent_id)
@@ -434,7 +421,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agents.update({row['id']: row for row in updated.get('agents', [])})
             tree.props['nodes'] = hierarchy_nodes(updated)
             tree.update()
-            agent_choice.set_options({key: agent_label(row) for key, row in agents.items()})
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
         async def select_node(event):
@@ -452,20 +438,20 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 domain = next((d for d in updated.get('domains', []) if d['id'] == identifier), None)
                 if domain is None:
                     raise PermissionError('Domain unavailable')
-                details.clear()
-                with details:
+                with ui.dialog() as domain_dialog, ui.card().classes('w-full max-w-xl'):
                     ui.label(domain['name']).classes('text-2xl font-semibold')
                     ui.label(domain.get('path', '')).classes('text-stone-600')
                     ui.label('CloudStack domain: ' + identifier).classes('text-xs text-stone-500 break-all')
-                    drawer.run_method('hide')
+                    async def choose_domain_agent(agent_id):
+                        domain_dialog.close()
+                        await show_agent(agent_id)
                     for agent in updated.get('agents', []):
                         if agent['domain_id'] == identifier:
                             ui.button('Chat with ' + agent['name'],
-                                      on_click=lambda _, aid=agent['id']: protect(lambda: show_agent(aid)))
-
-        async def choose_agent(event):
-            if event.value and event.value != state.get('requested_agent', state['agent']):
-                await show_agent(event.value)
+                                      on_click=lambda _, aid=agent['id']: protect(lambda: choose_domain_agent(aid)))
+                    ui.button('Close', on_click=domain_dialog.close).props('flat')
+                drawer.run_method('hide')
+                domain_dialog.open()
 
         async def choose_history(event):
             if not event.value or event.value == state['conversation']:
@@ -780,6 +766,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             await discover()
 
         async def configure_agent():
+            details_menu.close()
             current = await actor()
             agent = await service.authorize(current, state['agent'])
             options = {p['id']: p['name'] for p in await service.providers(current)}
@@ -1000,11 +987,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     await service.revoke_agent(await actor(), agent['id'])
                     dialog.close()
                     state.update(agent=None, conversation=None)
-                    agent_choice.set_value(None)
+                    details_menu.close()
+                    agent_heading.set_text('Select an agent')
+                    agent_heading.disable()
+                    progress.set_text('Agent access revoked')
                     transcript.clear()
                     details.clear()
-                    with details:
-                        ui.label('Agent access revoked').classes('text-xl font-semibold')
                     await refresh()
 
                 ui.separator()
@@ -1021,6 +1009,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             dialog.open()
 
         async def subgroup_dialog():
+            details_menu.close()
             current = await actor()
             parent = await service.authorize(current, state['agent'])
             with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-4'):
@@ -1237,7 +1226,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         ui.timer(1.0, poll_activity)
         search.on_value_change(filter_tree)
         tree.on_select(lambda e: protect(lambda: select_node(e)))
-        agent_choice.on_value_change(lambda e: None if state.get('updating_selector') else protect(lambda: choose_agent(e)))
         history_select.on_value_change(lambda e: protect(lambda: choose_history(e)))
         refresh_button.on_click(lambda: protect(refresh))
         new_button.on_click(lambda: protect(new_conversation))
