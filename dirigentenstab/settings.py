@@ -39,6 +39,8 @@ class Settings:
     gpu_helper_socket: str = ''
 
     def __post_init__(self):
+        if type(self.session_seconds) is not int or self.session_seconds <= 0:
+            raise ValueError('SESSION_SECONDS must be a positive integer')
         if self.cloudstack_ui_url:
             self.cloudstack_ui_url = dashboard_endpoint(self.cloudstack_ui_url)
 
@@ -53,6 +55,7 @@ class Settings:
                    key_file=os.getenv('MASTER_KEY_FILE', '/run/secrets/master_key'),
                    cmk=os.getenv('CMK_BINARY', '/usr/local/bin/cmk'),
                    workspace=os.getenv('TRANSFER_WORKSPACE', '/data/transfers'),
+                   session_seconds=int(os.getenv('SESSION_SECONDS', '3600')),
                    ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'),
                    ssh_source_cidr=os.getenv('SSH_SOURCE_CIDR', '10.253.80.1/32'),
                    cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
