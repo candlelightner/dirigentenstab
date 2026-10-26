@@ -220,7 +220,7 @@ class Service:
                             ('summary_model', model),
                             ('summary_prompt', prompt)):
             self.store.execute('INSERT INTO platform_settings VALUES(?,?) '
-                                'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name, value))
+                               'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name, value))
         self.store.audit(identity['userid'], 'configure-summary-model')
 
     async def gpu_admin(self, identity, action='status', **payload):
@@ -772,10 +772,10 @@ class Service:
                                'compaction_provider_id=?,compaction_model=?,auto_compact_percent=?,context_window=?,'
                                'enabled_providers=?,enabled_mcp_servers=?,owner_ssh_key_enabled=? WHERE id=?',
                                (provider_id or None, model, instructions, thinking, compaction['compaction_provider_id'],
-                                 compaction['compaction_model'], percentage, window,
-                                 json.dumps(sorted(selection)) if enabled_providers is not _UNSET else agent.get('enabled_providers'),
-                                 json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'),
-                                 agent['owner_ssh_key_enabled'] if owner_ssh_key_enabled is _UNSET else owner_ssh_key_enabled, agent_id))
+                                compaction['compaction_model'], percentage, window,
+                                json.dumps(sorted(selection)) if enabled_providers is not _UNSET else agent.get('enabled_providers'),
+                                json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'),
+                                agent['owner_ssh_key_enabled'] if owner_ssh_key_enabled is _UNSET else owner_ssh_key_enabled, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, call, user_id, name):
