@@ -33,7 +33,7 @@ dirigentenstab = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["."]
+pythonpath = [".", "scripts"]
 testpaths = ["tests"]
 markers = ["browser: real Chromium tests (install playwright and chromium)",
            "live: real private CloudStack/KVM acceptance tests (explicit opt-in)"]

@@ -33,7 +33,6 @@ class Settings:
     session_seconds: int = 3600
     max_output: int = 65536
     ssh_networks: str = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
-    ssh_source_cidr: str = '10.253.80.1/32'
     cloudstack_ui_url: str = ''
     guest_assets: str = '/data/guest-assets'
     gpu_helper_socket: str = ''
@@ -57,7 +56,6 @@ class Settings:
                    workspace=os.getenv('TRANSFER_WORKSPACE', '/data/transfers'),
                    session_seconds=int(os.getenv('SESSION_SECONDS', '3600')),
                    ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'),
-                   ssh_source_cidr=os.getenv('SSH_SOURCE_CIDR', '10.253.80.1/32'),
                    cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
                    guest_assets=os.getenv('GUEST_ASSETS', '/data/guest-assets'),
                    gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''))

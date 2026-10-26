@@ -4,6 +4,7 @@ After=docker.service cloudstack-agent.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=/etc/dirigentenstab-network.env
 ExecStart=/usr/bin/python3 /usr/local/libexec/dirigentenstab-guest-ssh.py
 NoNewPrivileges=yes
 ProtectSystem=strict

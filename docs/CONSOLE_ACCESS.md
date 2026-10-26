@@ -7,10 +7,11 @@ Console Proxy VM (CPVM). The CloudStack management interface remains a separate
 Tailscale Serve endpoint. No Tailscale installation inside guests is needed.
 
 Only Tailscale ingress is expanded. LAN/internet ingress stays blocked by the
-host; existing private application SSH access remains. Native CloudStack
-security groups still control VM-to-VM traffic and guest egress, and are not
-disabled or rewritten. Changes to VM isolation remain explicit native operations
-under the requesting user/agent's CloudStack permissions. Tailscale ingress is
+host; existing private application SSH access remains. Network isolation belongs to CloudStack and is selected by you or your agents.
+The application does not create or attach security groups automatically; explicit
+security-group IDs/names pass through unchanged. Existing native policies are
+not deleted during upgrade. SSH keys, host-key verification and agent ownership
+checks remain mandatory. Tailscale ingress is
 a host-admin access path ahead of the bridge security-group rules; services
 inside a guest still need to listen and any image-provided guest firewall applies.
 
@@ -77,8 +78,22 @@ leave correct rules and counters in place. Existing guest SSH rules remain owned
 by their separate helper. Forwarding is already persisted by
 `/etc/sysctl.d/90-tailscale-routing.conf`; this installer does not change sysctls.
 
-**Address lifecycle:** new VMs in this subnet are covered automatically. A subnet
-change requires updating the host policy and Tailscale advertisement together.
+**Configuration:** set `CLOUDSTACK_BRIDGE`, `CLOUDSTACK_NETWORK`,
+`CLOUDSTACK_GATEWAY`, the `CLOUDSTACK_SYSTEM_START/END` and
+`CLOUDSTACK_GUEST_START/END` ranges, `APP_NETWORK`, `APP_ADDRESS`, and
+`TAILSCALE_INTERFACE` in `.env`. These network values must be literal IPv4
+addresses/CIDRs or interface names (no variable expansion). Setup validates
+non-overlapping subnets/ranges and derives the netmask and NFS export ACL.
+The forwarding installers copy only validated network settings to the private
+`/etc/dirigentenstab-network.env`; application secrets are never copied there.
+Rerun the installers after changing values. Environment variables override `.env`.
+Existing service names are retained for upgrades.
+
+New VMs in the configured subnet are covered automatically. Changing `.env`
+does not migrate an existing CloudStack zone or Docker network: prepare those
+networks and update the Tailscale route advertisement before reinstalling the
+forwarding policy. `SSH_NETWORKS` may list additional explicitly allowed guest
+networks; it bounds application SSH destinations, not VM-to-VM connectivity.
 A changed Tailscale firewall backend/mark/SNAT configuration requires review;
 prerequisite failure appears in the journal.
 

@@ -3,7 +3,7 @@
 
 import os
 
-from native_setup import ROOT, STATE, run, save
+from native_setup import ROOT, STATE, install_network_config, run, save
 
 
 def install():
@@ -11,6 +11,7 @@ def install():
         raise PermissionError('Run as platform administrator/root')
     os.umask(0o077)
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    install_network_config()
     save('/usr/local/libexec/dirigentenstab-console.py',
          (ROOT / 'scripts/console_forwarding.py').read_text(), 0o755)
     save('/etc/systemd/system/dirigentenstab-console.service', '''[Unit]
@@ -20,6 +21,7 @@ After=network-online.target tailscaled.service cloudstack-agent.service cloudsta
 
 [Service]
 Type=oneshot
+EnvironmentFile=/etc/dirigentenstab-network.env
 ExecStart=/usr/bin/python3 /usr/local/libexec/dirigentenstab-console.py
 TimeoutStartSec=120
 NoNewPrivileges=yes

@@ -84,12 +84,14 @@ def test_console_installer_orders_and_enables_only_its_units(tmp_path, monkeypat
     import install_console_forwarding as installer
     writes, calls = {}, []
     monkeypatch.setattr(installer, 'STATE', tmp_path)
+    monkeypatch.setattr(installer, 'install_network_config', lambda: None)
     monkeypatch.setattr(installer.os, 'geteuid', lambda: 0)
     monkeypatch.setattr(installer.os, 'umask', lambda value: None)
     monkeypatch.setattr(installer, 'save', lambda path, data, mode: writes.update({path: (data, mode)}))
     monkeypatch.setattr(installer, 'run', lambda *args: calls.append(args))
     installer.install()
     service = writes['/etc/systemd/system/dirigentenstab-console.service'][0]
+    assert 'EnvironmentFile=/etc/dirigentenstab-network.env' in service
     after = next(line for line in service.splitlines() if line.startswith('After='))
     assert all(name in after for name in ('network-online.target', 'tailscaled.service',
         'cloudstack-agent.service', 'cloudstack-management.service', 'dirigentenstab-network.service'))
