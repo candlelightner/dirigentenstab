@@ -194,10 +194,31 @@ def validate(root: Path, manifest_path: Path, check_workflows: bool | None) -> N
         for wf in (ci_yaml, browser_yaml):
             if not wf.exists():
                 raise RuntimeError(f'Workflow file not found: {wf}')
-            if not pattern.search(wf.read_text(encoding='utf-8')):
+            content = wf.read_text(encoding='utf-8')
+            if not pattern.search(content):
                 raise RuntimeError(
                     f'{wf.name} does not pin ghcr.io/candlelightner/dirigentenstab:{tag}@sha256:<digest>'
                 )
+            if 'playwright install' in content:
+                raise RuntimeError(f'{wf.name} contains redundant playwright install')
+            if 'pip install -r' in content:
+                raise RuntimeError(f'{wf.name} contains redundant pip install -r')
+            if 'packages: write' in content:
+                raise RuntimeError(f'{wf.name} contains unauthorized packages: write')
+            if 'timeout-minutes:' not in content:
+                raise RuntimeError(f'{wf.name} missing timeout-minutes')
+            if wf.name == 'browser.yaml' and ('docker compose' in content or 'build-push-action' in content):
+                raise RuntimeError(f'{wf.name} must not contain docker steps')
+            if wf.name == 'ci.yaml':
+                test_job, sep, container_job = content.partition('\n  container:')
+                if not sep:
+                    raise RuntimeError(f'{wf.name} missing container job')
+                if 'docker compose' in test_job or 'build-push-action' in test_job:
+                    raise RuntimeError(f'{wf.name} test job must not run docker commands')
+                if 'docker compose' not in container_job or 'build-push-action' not in container_job:
+                    raise RuntimeError(f'{wf.name} container job missing required docker checks')
+
+    print(f'Validation passed ({current["tag"]})')
 
 
 def prepare(root: Path, manifest_path: Path, check_workflows: bool | None) -> None:
