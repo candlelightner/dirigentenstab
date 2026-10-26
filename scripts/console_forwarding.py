@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Maintain only Tailscale access to the reference host's Console Proxy VM."""
+"""Maintain Tailscale-only routed access to the reference host's VM subnet."""
 
 import argparse
 import shlex
@@ -7,13 +7,12 @@ import subprocess
 
 TAG = 'dirigentenstab-console'
 TABLE = 'dirigentenstab_console'
-# shortcut: this CPVM address is pinned, review it if CloudStack replaces the CPVM.
-CPVM = '10.253.80.100/32'
+GUESTS = '10.253.80.0/24'
 TAILNET = '100.64.0.0/10'
 GUARD = f'''table inet {TABLE} {{
  chain forward {{
   type filter hook forward priority -10; policy accept;
-  iifname "tailscale0" oifname "dscloud0" ip saddr {TAILNET} ip daddr 10.253.80.100 tcp dport {{ 80, 8080 }} accept
+  iifname "tailscale0" oifname "dscloud0" ip saddr {TAILNET} ip daddr {GUESTS} accept
   iifname "tailscale0" oifname "dscloud0" drop
  }}
 }}
@@ -23,11 +22,11 @@ GUARD = f'''table inet {TABLE} {{
 def rules(tagged=True):
     tag = ['-m', 'comment', '--comment', TAG] if tagged else []
     return [
-        ['-s', TAILNET, '-d', CPVM, '-i', 'tailscale0', '-o', 'dscloud0', '-p', 'tcp',
-         '-m', 'multiport', '--dports', '80,8080', '-m', 'conntrack', '--ctstate', 'NEW,ESTABLISHED',
+        ['-s', TAILNET, '-d', GUESTS, '-i', 'tailscale0', '-o', 'dscloud0',
+         '-m', 'conntrack', '--ctstate', 'NEW,ESTABLISHED,RELATED',
          *tag, '-j', 'ts-forward'],
-        ['-s', CPVM, '-d', TAILNET, '-i', 'dscloud0', '-o', 'tailscale0', '-p', 'tcp',
-         '-m', 'multiport', '--sports', '80,8080', '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED',
+        ['-s', GUESTS, '-d', TAILNET, '-i', 'dscloud0', '-o', 'tailscale0',
+         '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED',
          *tag, '-j', 'ACCEPT'],
     ]
 
@@ -70,10 +69,10 @@ def maintain(remove=False, run=subprocess.run):
         # Atomically edit only our rules, retaining all dynamic chains and counters.
         call('iptables-restore', '--wait', '5', '--noflush',
              input='*filter\n' + '\n'.join(operations) + '\nCOMMIT\n')
-        print('Console forwarding rules applied.')
+        print('Tailscale VM forwarding rules applied.')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--remove', action='store_true', help='Remove only owned console rules and guard')
+    parser.add_argument('--remove', action='store_true', help='Remove only owned Tailscale VM rules and guard')
     maintain(parser.parse_args().remove)
