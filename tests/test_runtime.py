@@ -1055,7 +1055,8 @@ async def test_configuration_pauses_resumes_active_only_and_self_prompt_reloads(
     async def configure(actor_id, target_id, settings):
         assert actor_id == target_id == 'parent'
         if settings is None:
-            return {'agent': {'id': target_id}, 'providers': [{'id': 'provider', 'name': 'Local'}]}
+            return {'agent': {'id': target_id}, 'providers': [{'id': 'provider', 'name': 'Local'}],
+                    'owner_ssh_public_key': 'ssh-ed25519 synthetic-public-key'}
         await manager.pause_agents(['parent'])
         service.store.execute('UPDATE agents SET instructions=? WHERE id=?', (settings['instructions'], target_id))
         await manager.resume_agents(['parent'])
@@ -1066,6 +1067,7 @@ async def test_configuration_pauses_resumes_active_only_and_self_prompt_reloads(
             yield 'New prompt applied'
         elif messages[-1].parts[0].part_kind == 'tool-return':
             assert messages[-1].parts[0].content['providers'][0]['id'] == 'provider'
+            assert messages[-1].parts[0].content['owner_ssh_public_key'] == 'ssh-ed25519 synthetic-public-key'
             yield {0: DeltaToolCall(name='configure_agent', json_args=json.dumps({'target_agent_id': 'parent', 'settings': {'instructions': 'Self edited prompt'}}), tool_call_id='self-edit')}
         else:
             yield {0: DeltaToolCall(name='configure_agent', json_args=json.dumps({'target_agent_id': 'parent'}), tool_call_id='inspect-config')}
