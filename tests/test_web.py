@@ -647,7 +647,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
 
         async def restore(self, current, conversation_id):
             return {'id': 'saved', 'agent_id': 'agent', 'messages': [], 'runs': [
-                {'id': 'run', 'status': 'completed', 'events': [], 'budget': {'context': self.saved_context}}]}
+                {'id': 'run', 'status': 'completed', 'events': [], 'budget': {'context': self.saved_context, 'compactions': 1}}]}
 
     runtime = Runtime()
     async with user_simulation() as user:
@@ -688,6 +688,13 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         assert agent['auto_compact_percent'] is None and agent['context_window'] is None
         assert agent['compaction_provider_id'] is None and agent['compaction_model'] == ''
         user.find('Conversation').trigger('update:modelValue', {'value': 0})
+        await user.should_see('Completed')
+        run_details = next(iter(user.find('run_details').elements))
+        assert run_details.value is False
+        user.find('run_details').trigger('update:modelValue', True)
+        assert run_details.value is True
+        await user.should_see('Requests: 0')
+        await user.should_see('Context compacted.')
         await user.should_see('Context: ~321 / 1,500 usable tokens (21.4%)')
         await user.should_see('Saved approximate usage')
         runtime.saved_context = runtime.saved_context | {'estimated_tokens': '[redacted]', 'usable_tokens': '[redacted]'}
