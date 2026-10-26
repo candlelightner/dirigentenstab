@@ -198,11 +198,14 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
             print('Textarea at failed submission:', await message.input_value())
             raise
         await page.get_by_role('heading', name='Infrastructure report', exact=True).wait_for()
-        await page.get_by_text('Completed', exact=True).wait_for()
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
+        await playwright.expect(page.locator('.thinking-indicator')).not_to_be_visible()
+        assert await page.locator('.conversation .run-status').count() == 0
         assert await page.locator('.markdown table').count() == 1
         assert await page.locator('.markdown pre code').count() == 1
         assert not await page.evaluate('window.injected === true')
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert await page.locator('.messages .q-scrollarea__container').evaluate('el => el.scrollWidth <= el.clientWidth')
         await page.screenshot(path=str(state / 'mobile-chat.png'), full_page=True)
         await message.focus()
         # Android Chrome can shrink only visualViewport, and can move focus during keyboard animation.
@@ -260,10 +263,13 @@ async def test_browser_long_task_completes_without_budget_pause_and_restores(bro
         await page.get_by_role('button', name='Send', exact=True).click()
         await page.get_by_text('Bounded lifecycle complete', exact=True).wait_for()
         assert await page.get_by_role('button', name='Continue saved task', exact=True).count() == 0
-        await page.get_by_text('Completed', exact=True).wait_for()
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
+        await playwright.expect(page.locator('.thinking-indicator')).not_to_be_visible()
+        assert await page.locator('.conversation .run-status').count() == 0
         await playwright.expect(page.get_by_text('Tools: 5', exact=False)).not_to_be_visible()
-        await page.get_by_text('Run details', exact=True).click()
+        await page.get_by_role('button', name='Run details', exact=True).click()
         await page.get_by_text('Tools: 5', exact=False).wait_for()
+        assert await page.locator('.messages .q-scrollarea__container').evaluate('el => el.scrollWidth <= el.clientWidth')
         box = await page.get_by_label('Message', exact=True).bounding_box()
         assert box['y'] + box['height'] <= 844
         await page.screenshot(path=str(state / 'long-task-completed.png'), full_page=True)
@@ -463,9 +469,33 @@ async def test_browser_header_agent_details_and_sidebar_selection_on_desktop_and
             assert await controls.get_by_role('button', name='New conversation', exact=True).is_visible()
             assert await controls.evaluate('el => el.parentElement.firstElementChild === el')
             assert await page.locator('.conversation').evaluate('el => el.previousElementSibling.classList.contains("conversation-controls")')
-            run_details = page.locator('.run-details')
-            await playwright.expect(run_details.locator('.q-item').first).to_have_attribute('aria-expanded', 'false')
-            assert await run_details.evaluate('el => el.previousElementSibling.classList.contains("composer")')
+            run_details_button = controls.get_by_role('button', name='Run details', exact=True)
+            await playwright.expect(run_details_button).to_be_visible()
+            new_btn_box = await controls.get_by_role('button', name='New conversation', exact=True).bounding_box()
+            run_btn_box = await run_details_button.bounding_box()
+            assert run_btn_box and new_btn_box and run_btn_box['x'] > new_btn_box['x']
+            await run_details_button.click()
+            run_details_menu = page.locator('.run-details-menu')
+            await run_details_menu.wait_for()
+            menu_box = await run_details_menu.bounding_box()
+            assert menu_box and 0 <= menu_box['x'] and menu_box['x'] + menu_box['width'] <= width + 2
+            assert 0 <= menu_box['y'] and menu_box['y'] + menu_box['height'] <= height + 2
+            await page.keyboard.press('Escape')
+            await run_details_menu.wait_for(state='hidden')
+            assert await page.locator('.conversation .run-details').count() == 0
+            assert await page.locator('.conversation .run-status').count() == 0
+            send_button = page.get_by_role('button', name='Send', exact=True)
+            await playwright.expect(send_button).to_be_visible()
+            assert await send_button.locator('.q-icon').count() == 1
+            assert await send_button.locator('.q-btn__content > :not(.q-icon)').count() == 0
+            assert 'Send' not in (await send_button.inner_text()).split()
+            msg_box = await page.locator('.composer .q-field__control').bounding_box()
+            snd_box = await send_button.bounding_box()
+            assert msg_box and snd_box
+            assert abs(msg_box['y'] - snd_box['y']) <= 2
+            assert abs(msg_box['height'] - snd_box['height']) <= 2
+            assert abs(snd_box['width'] - 44) <= 2 and abs(snd_box['height'] - 44) <= 2
+            assert snd_box['x'] + snd_box['width'] <= width
             search = page.get_by_label('Search agents and domains', exact=True)
             if await search.is_visible():
                 await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
@@ -512,7 +542,7 @@ async def test_browser_header_agent_details_and_sidebar_selection_on_desktop_and
             await details.get_by_role('button', name='Close agent details', exact=True).click()
             await details.wait_for(state='hidden')
             assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
-            assert await run_details.evaluate('el => el.getBoundingClientRect().bottom <= innerHeight')
+            assert await page.locator('.messages .q-scrollarea__container').evaluate('el => el.scrollWidth <= el.clientWidth')
         await browser.close()
 
 
@@ -603,10 +633,13 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
                 await page.get_by_role('option', name=title, exact=True).click()
                 await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
             await page.get_by_role('button', name='Stop conversation', exact=True).click()
-            await page.get_by_text('Stopped', exact=True).wait_for()
             await page.get_by_role('button', name='Stop conversation', exact=True).wait_for(state='hidden')
             await page.locator('.thinking-indicator').wait_for(state='hidden')
             await page.get_by_text('Partial reply retained', exact=True).wait_for()
+            assert await page.locator('.conversation .run-status').count() == 0
+            await page.get_by_role('button', name='Run details', exact=True).click()
+            await page.locator('.run-details').get_by_text('Stopped', exact=True).wait_for()
+            await page.keyboard.press('Escape')
             assert await page.get_by_label('Message', exact=True).is_enabled()
             run = store.one('SELECT r.* FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id WHERE c.title=?', (title,))
             assert run['status'] == 'interrupted'
@@ -667,9 +700,9 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await page.get_by_role('dialog').wait_for(state='hidden')
         await page.get_by_label('Message', exact=True).fill(title)
         await page.get_by_role('button', name='Send', exact=True).click()
-        meter = page.locator('.conversation').get_by_text('Context: ~', exact=False)
+        meter = page.locator('.run-details').get_by_text('Context: ~', exact=False)
         await playwright.expect(meter).not_to_be_visible()
-        await page.get_by_text('Run details', exact=True).click()
+        await page.get_by_role('button', name='Run details', exact=True).click()
         await meter.wait_for()
         assert '57,344 usable tokens' in await meter.inner_text()
         assert 'Auto-compact at 75%' in await meter.inner_text()
@@ -687,8 +720,10 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
         await playwright.expect(meter).not_to_be_visible()
-        await page.get_by_text('Completed', exact=True).wait_for()
-        await page.get_by_text('Run details', exact=True).click()
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
+        await page.locator('.thinking-indicator').wait_for(state='hidden')
+        assert await page.locator('.conversation .run-status').count() == 0
+        await page.get_by_role('button', name='Run details', exact=True).click()
         await meter.wait_for()
         assert '57,344 usable tokens' in await meter.inner_text()
         await page.screenshot(path=str(state / 'compaction-context-mobile.png'), full_page=True)
@@ -700,7 +735,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await select_agent(page, 'Research Admin')
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
-        await page.get_by_text('Run details', exact=True).click()
+        await page.get_by_role('button', name='Run details', exact=True).click()
         await page.get_by_text('Context usage unavailable for this activity.', exact=True).wait_for()
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         assert 'in show_context' not in (state / 'browser-server.log').read_text()
@@ -723,7 +758,7 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         async def choose(title):
             await page.get_by_label('Conversation', exact=True).fill(title)
             await page.get_by_role('option', name=title, exact=True).click()
-            await page.locator(f'.run-status[data-operation-id="{run(title)["id"]}"]').wait_for()
+            await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for()
         async def conversation_options():
             await page.get_by_label('Conversation', exact=True).fill('')
             await playwright.expect(page.get_by_role('option')).to_have_count(2)
@@ -747,9 +782,15 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         assert run('stop fixture second independent conversation')['status'] == 'running'
         await choose('stop fixture first independent conversation')
         await playwright.expect(page.get_by_label('Message', exact=True)).to_have_value('Keep this first conversation draft')
+        await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_visible()
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
         options_before_stop = await conversation_options()
+        await page.get_by_label('Message', exact=True).fill('')
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).to_be_visible()
+        await playwright.expect(page.get_by_role('button', name='Send', exact=True)).not_to_be_visible()
         await page.get_by_role('button', name='Stop conversation', exact=True).click()
-        await page.get_by_text('Stopped', exact=True).wait_for()
+        await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
+        await page.locator('.thinking-indicator').wait_for(state='hidden')
         assert run('stop fixture second independent conversation')['status'] == 'running'
         await page.get_by_text('Blocked / paused', exact=False).wait_for()
         assert await conversation_options() == options_before_stop
