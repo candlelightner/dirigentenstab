@@ -153,6 +153,13 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
         await user.should_see('Select an agent to begin')
+        await user.should_not_see('Chat directly with an agent')
+        toggle = next(iter(user.find('hierarchy_toggle').elements))
+        selector = next(iter(user.find('agent_selector').elements))
+        assert isinstance(toggle.parent_slot.parent, ui.header)
+        assert isinstance(selector.parent_slot.parent, ui.header)
+        assert selector.props['label'] == 'Agent'
+        assert toggle.props['aria-label'] == 'Open agent hierarchy'
         user.find('agent_selector').trigger('update:modelValue', {'value': 0})
         await asyncio.sleep(0.1)
         assert auth.calls >= 2, user.notify.messages

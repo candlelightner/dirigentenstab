@@ -175,9 +175,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             dashboard_links.append(link)
 
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
-            ui.icon('account_tree').classes('text-teal-900 text-2xl')
-            ui.label('Dirigentenstab').classes('font-semibold text-xl')
-            ui.space()
+            ui.button(icon='account_tree', on_click=lambda: drawer.run_method('toggle')).props(
+                'outline round aria-label="Open agent hierarchy"').classes('text-teal-900').mark('hierarchy_toggle')
+            agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
+                                     label='Agent', with_input=True).props('dense borderless').classes(
+                                         'header-agent-selector flex-1 min-w-0').mark('agent_selector')
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
@@ -189,6 +191,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
             .nicegui-content{padding:0;height:calc(var(--viewport-height,100dvh) - 65px);min-height:0}
+            .header-agent-selector .q-field__native{font-size:20px;font-weight:600;flex-wrap:nowrap}
+            .header-agent-selector .q-field__native>span,.header-agent-selector input{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -255,25 +259,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('outline').classes('w-full')
                     gpu_button = ui.button('GPU policies', icon='memory').props('outline').classes('w-full')
         with ui.column().classes('workspace'):
-            with ui.row().classes('w-full items-center no-wrap gap-2'):
-                ui.button('Agents', icon='account_tree', on_click=lambda: drawer.run_method('toggle')).props(
-                    'outline aria-label="Open agent hierarchy"')
-                agent_choice = ui.select({key: agent_label(row) for key, row in agents.items()},
-                                         label='Chat directly with an agent', with_input=True).classes(
-                                             'flex-1 min-w-0').mark('agent_selector')
+            with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2'):
+                history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
+                new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
             details = ui.card().classes('w-full shrink-0 agent-details')
             with details:
                 ui.label('Select an agent to begin').classes('text-xl font-semibold')
             with ui.card().classes('conversation'):
-                with ui.row().classes('w-full items-center no-wrap gap-2'):
-                    history_select = ui.select({}, label='Conversation', with_input=True).classes('flex-1 min-w-0')
-                    new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
                 with ui.scroll_area().classes('messages') as transcript_scroll:
                     transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
-                with ui.expansion('Run details', value=False).classes('w-full shrink-0').mark('run_details'):
-                    budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
-                    context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
-                    compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
                 progress = ui.label('Ready').classes('text-xs text-stone-600 run-status').props('role=status aria-live=polite')
                 with progress:
                     reference = ui.tooltip('')
@@ -292,6 +286,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     stop_button.set_visibility(False)
                     send_button.bind_enabled_from(prompt, 'value', backward=lambda value:
                                                   bool(value and value.strip()) and not state['submitting'])
+                with ui.expansion('Run details', value=False).classes('run-details w-full shrink-0').mark('run_details'):
+                    budget_label = ui.label('').classes('text-xs text-stone-600').props('role=status')
+                    context_label = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('context_usage')
+                    compaction_status = ui.label('').classes('text-xs text-stone-600').props('role=status').mark('compaction_status')
 
         tool_cards = {}
         selection_lock = asyncio.Lock()
