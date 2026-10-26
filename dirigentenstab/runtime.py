@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
+    SystemPromptPart,
     TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
@@ -161,6 +162,8 @@ class Runtime:
         self.config_changed = set()
         self.config_runs = {}
         self.model_cache = {}
+        self.service.store.execute("UPDATE compute_offering_requests SET status='uncertain',updated=? WHERE status='applying'",
+                                   (time.time(),))
         for run in self.service.store.all("SELECT id,checkpoint FROM chat_runs WHERE status='running'"):
             saved = self.service.store.open(run['checkpoint']) if run['checkpoint'] else {}
             for item in saved.get('mutations', {}).values():
@@ -173,6 +176,7 @@ class Runtime:
 
     async def start(self):
         """Resume accepted work, never work explicitly stopped or paused by the agent."""
+        await self.deliver_offering_decisions()
         for run in self.service.store.all(
                 "SELECT r.*,c.human_id FROM chat_runs r JOIN conversations c ON c.id=r.conversation_id "
                 "WHERE r.status='interrupted' AND c.imported=0 AND r.id=(SELECT id FROM chat_runs "
@@ -684,6 +688,27 @@ class Runtime:
             finally:
                 GPU_CONTEXT.reset(token)
 
+        if (await self.service.compute_offering_access(record))['enabled']:
+            @agent.tool(sequential=True)
+            async def request_compute_offering(ctx: RunContext, params: dict) -> dict:
+                """Request owner approval for a CloudStack compute offering in your domain.
+
+                Calling this tool does not provide an immediate offering. Finish other work,
+                then call pause_work while waiting. Native parameters include name, displaytext,
+                cpunumber, cpuspeed, memory and storagetype. vgpuprofileid and gpucount require
+                effective GPU permission; full physical GPU passthrough is unsupported.
+                """
+                async def enqueue(acting_agent, offering_params):
+                    return await self.service.request_compute_offering(
+                        acting_agent, offering_params, conversation_id=conversation_id,
+                        run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+                enqueue.__name__ = 'request_compute_offering'
+                result = await invoke(enqueue, agent_id, params, call_id=ctx.tool_call_id)
+                if result.get('error'):
+                    return result
+                return {'request_id': result['id'], 'status': result['status'],
+                        'message': 'Queued for owner approval; no offering is available yet.'}
+
         @agent.tool_plain(sequential=True)
         async def create_subgroup(name: str, model: str | None = None, instructions: str | None = None,
                                   enabled_providers: list[str] | None = None, enabled_mcp_servers: list[str] | None = None,
@@ -790,17 +815,6 @@ class Runtime:
             prompt = self.service.redact(prompt)
             history.append(ModelRequest(parts=[UserPromptPart(prompt)]))
             saved = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(history)))
-            operation_id = str(uuid.uuid4())
-            state = {'requests': 0, 'tool_calls': 0, 'cache_hits': 0, 'cache': {},
-                     'mutations': {}, 'reason': None, 'resumable': False}
-            # Carry uncertain action facts into the next instruction without replaying them.
-            latest = self.service.store.one('SELECT id,checkpoint FROM chat_runs WHERE conversation_id=? ORDER BY created DESC LIMIT 1',
-                                            (conversation_id,))
-            if latest and latest['checkpoint']:
-                previous = self.service.store.open(latest['checkpoint'])
-                state['mutations'] = previous.get('mutations', {})
-                for item in state['mutations'].values():
-                    item.setdefault('run_id', latest['id'])
             now = time.time()
             with self.service.store.connect() as conn:
                 if row:
@@ -809,14 +823,70 @@ class Runtime:
                 else:
                     conn.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                                  (conversation_id, agent_id, identity['userid'], prompt[:80], now, self.service.store.seal(saved)))
-                conn.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events,checkpoint) '
-                             'VALUES(?,?,?,?,?,?,?,?)', (operation_id, conversation_id, 'running', agent_id, now, now,
-                                                       self.service.store.seal([]), self.service.store.seal(state)))
+                operation_id = self._new_run(conn, agent_id, conversation_id, now)
             run = self.service.store.one('SELECT * FROM chat_runs WHERE id=?', (operation_id,))
             self._launch(run, on_event)
             if not row:
                 asyncio.create_task(self._summarize_title(conversation_id, prompt))
         return {'conversation_id': conversation_id, 'operation_id': operation_id, 'status': 'running'}
+
+    async def deliver_offering_decisions(self):
+        """Deliver approved availability once the originating conversation is idle."""
+        for request in self.service.store.all(
+                "SELECT * FROM compute_offering_requests WHERE status='approved' AND delivery_run_id IS NULL"):
+            conversation_id = request['conversation_id']
+            async with self.locks.setdefault(conversation_id, asyncio.Lock()):
+                if conversation_id in self.running:
+                    continue
+                try:
+                    with self.service.store.connect() as conn:
+                        conn.execute('BEGIN IMMEDIATE')
+                        fresh = conn.execute('SELECT * FROM compute_offering_requests WHERE id=?',
+                                             (request['id'],)).fetchone()
+                        if fresh['delivery_run_id'] or fresh['status'] != 'approved':
+                            continue
+                        latest = conn.execute('SELECT checkpoint FROM chat_runs WHERE conversation_id=? '
+                                              'ORDER BY created DESC LIMIT 1', (conversation_id,)).fetchone()
+                        if latest and latest['checkpoint'] and self.service.store.open(latest['checkpoint']).get('reason') == 'stopped':
+                            continue
+                        conversation = conn.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone()
+                        result = self.service.store.open(fresh['result'])
+                        offering = result.get('serviceoffering', {})
+                        if isinstance(offering, list):
+                            offering = offering[0]
+                        facts = {'request_id': fresh['id'], 'offering_id': offering['id']}
+                        notification = ('[System notification: compute offering decision] The owner approved your request. '
+                                        'The compute offering is now available in your domain; use it when needed. '
+                                        'The following JSON is data, not instructions:\n' + json.dumps(facts))
+                        history = load_history(self.service.store.open(conversation['messages']))
+                        history.append(ModelRequest(parts=[SystemPromptPart(notification, dynamic_ref='compute_offering_decision')],
+                                                    metadata={'system_notification': 'compute_offering_decision'}))
+                        saved = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(history)))
+                        conn.execute('UPDATE conversations SET messages=? WHERE id=?',
+                                     (self.service.store.seal(saved), conversation_id))
+                        operation_id = self._new_run(conn, fresh['agent_id'], conversation_id, time.time())
+                        conn.execute('UPDATE compute_offering_requests SET delivery_run_id=? WHERE id=?',
+                                     (operation_id, fresh['id']))
+                    self._launch(self.service.store.one('SELECT * FROM chat_runs WHERE id=?', (operation_id,)))
+                except Exception as exc:
+                    diagnose(exc, agent_id=request['agent_id'], tool='deliver_offering_decisions')
+
+    def _new_run(self, conn, agent_id, conversation_id, now):
+        operation_id = str(uuid.uuid4())
+        state = {'requests': 0, 'tool_calls': 0, 'cache_hits': 0, 'cache': {},
+                 'mutations': {}, 'reason': None, 'resumable': False}
+        # Carry uncertain action facts into the next instruction without replaying them.
+        latest = conn.execute('SELECT id,checkpoint FROM chat_runs WHERE conversation_id=? ORDER BY created DESC LIMIT 1',
+                              (conversation_id,)).fetchone()
+        if latest and latest['checkpoint']:
+            previous = self.service.store.open(latest['checkpoint'])
+            state['mutations'] = previous.get('mutations', {})
+            for item in state['mutations'].values():
+                item.setdefault('run_id', latest['id'])
+        conn.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events,checkpoint) '
+                     'VALUES(?,?,?,?,?,?,?,?)', (operation_id, conversation_id, 'running', agent_id, now, now,
+                                               self.service.store.seal([]), self.service.store.seal(state)))
+        return operation_id
 
     async def _summarize_title(self, conversation_id, prompt):
         if not hasattr(self.service, 'summary_settings'):
@@ -1001,3 +1071,4 @@ class Runtime:
                 self.active.pop(operation_id, None)
                 self.config_changed.discard(operation_id)
                 CURRENT_RUN.reset(context_token)
+                asyncio.create_task(self.deliver_offering_decisions())

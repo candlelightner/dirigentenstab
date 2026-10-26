@@ -595,6 +595,8 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
+    store.execute('DROP TABLE compute_offering_requests')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)', ('parent', 'pending', journal, journal, 'validating', 1))

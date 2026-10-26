@@ -82,9 +82,11 @@ def test_compaction_migration_retains_original_encrypted_history_and_keys(servic
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
+    store.execute('DROP TABLE compute_offering_requests')
     store.execute('PRAGMA user_version=13')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 16
+    assert reopened.one('PRAGMA user_version')['user_version'] == 17
     assert reopened.one('SELECT messages FROM conversations')['messages'] == history
     assert reopened.one('SELECT credentials FROM agents')['credentials'] == original
     assert reopened.one('SELECT auto_compact_percent FROM agents')['auto_compact_percent'] is None
