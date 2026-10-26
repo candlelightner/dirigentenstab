@@ -476,6 +476,7 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
             search = page.get_by_label('Search agents and domains', exact=True)
             if await search.is_visible():
                 await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
+            await search.wait_for(state='hidden')
             await toggle.focus()
             await toggle.press('Enter')
             await playwright.expect(search).to_be_visible()
