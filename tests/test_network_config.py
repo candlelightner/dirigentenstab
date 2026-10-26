@@ -30,8 +30,8 @@ def test_custom_network_configuration_reaches_setup_and_forwarding(tmp_path, mon
         else:
             assert module.ADDRESS == '10.42.0.1' and str(module.NETWORK) == '10.42.0.0/23'
             writes, commands = {}, []
-            monkeypatch.setattr(module, 'save', lambda path, text: writes.update({path: text}))
-            monkeypatch.setattr(module, 'run', lambda *args: commands.append(args))
+            monkeypatch.setattr(module, 'save', lambda path, text, writes=writes: writes.update({path: text}))
+            monkeypatch.setattr(module, 'run', lambda *args, commands=commands: commands.append(args))
             module.network()
             assert ('ip', 'address', 'replace', '10.42.0.1/23', 'dev', 'vmbr7') in commands
             assert 'Address=10.42.0.1/23' in writes['/etc/systemd/network/80-dirigentenstab.network']

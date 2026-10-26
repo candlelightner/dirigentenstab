@@ -291,7 +291,7 @@ class ProvisioningCloud:
             return {'user': [u for u in self.users() if
                     (not params.get('id') or u['id'] == params['id']) and
                     (not params.get('account') or u['account'] == params['account']) and
-                    not params.get('domainid') or u['domainid'] == params['domainid'])]}
+                    (not params.get('domainid') or u['domainid'] == params['domainid'])]}
         elif command == 'listUserKeys':
             return {'userapikey': [key for key in self.keys.values() if key.get('userid') == params['userid']]}
         elif command == 'listUserKeyRules':
