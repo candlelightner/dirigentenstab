@@ -138,6 +138,67 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await browser.close()
 
 
+async def test_browser_remembers_last_open_conversation_per_agent(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True)
+        page = await context.new_page()
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        message = page.get_by_label('Message', exact=True)
+        for title in ('First research conversation', 'Second research conversation'):
+            await message.fill(title)
+            await page.get_by_role('button', name='Send', exact=True).click()
+            await page.get_by_text(title, exact=True).last.wait_for()
+            await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+            await page.get_by_role('button', name='New conversation', exact=True).click()
+        selector = page.get_by_label('Conversation', exact=True)
+        await selector.fill('First research conversation')
+        await page.get_by_role('option', name='First research conversation', exact=True).click()
+        await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
+        await message.fill('Unsent research draft')
+        await select_agent(page, 'Main Agent')
+        await message.fill('Main conversation')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        await select_agent(page, 'Research Admin')
+        await playwright.expect(message).to_have_value('Unsent research draft')
+        await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
+        assert await page.get_by_text('Second research conversation', exact=True).count() == 0
+        await page.reload()
+        await page.get_by_text('Main conversation', exact=True).last.wait_for()
+        await select_agent(page, 'Research Admin')
+        await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
+        await page.get_by_role('button', name='Sign out', exact=True).click()
+        await page.get_by_role('button', name='Sign in', exact=True).wait_for()
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
+        from dirigentenstab.store import Store
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        main_conversation = store.one("SELECT value FROM platform_settings WHERE name LIKE 'last_conversation:%' "
+                                      "AND name NOT LIKE '%:research'")['value']
+        for invalid_id in ('deleted-conversation', main_conversation):
+            store.execute("UPDATE platform_settings SET value=? WHERE name LIKE 'last_conversation:%:research'",
+                          (invalid_id,))
+            await select_agent(page, 'Main Agent')
+            await select_agent(page, 'Research Admin')
+            await page.locator('.q-message').get_by_text('Second research conversation', exact=True).wait_for()
+        await page.get_by_role('button', name='New conversation', exact=True).click()
+        await message.fill('New draft')
+        await select_agent(page, 'Main Agent')
+        await select_agent(page, 'Research Admin')
+        await playwright.expect(message).to_have_value('New draft')
+        assert await page.locator('.q-message').count() == 0
+        await page.reload()
+        await select_agent(page, 'Research Admin')
+        assert await page.locator('.q-message').count() == 0
+        await browser.close()
+
+
 async def test_browser_disabled_cloudstack_human_loses_existing_socket_access(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:

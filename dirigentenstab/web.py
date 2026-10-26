@@ -406,6 +406,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     agent_heading.set_enabled(bool(state['agent']))
                     tree.classes(remove='pointer-events-none opacity-50').props(remove='aria-disabled')
 
+        def remember_conversation(conversation_id):
+            service.store.execute(
+                'INSERT INTO platform_settings(name,value) VALUES(?,?) '
+                'ON CONFLICT(name) DO UPDATE SET value=excluded.value',
+                (f'last_conversation:{identity["userid"]}:{state["agent"]}', conversation_id or ''),
+            )
+
         async def render_agent(agent_id, *, close_navigation=True):
             state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
             prompt.disable()
@@ -465,6 +472,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         ui.label('Use Create subgroup with this same name to resume, or ask an administrator '
                                  'to use scripts/admin.py repair-provisioning.').classes('text-sm')
             await histories()
+            remembered = service.store.one('SELECT value FROM platform_settings WHERE name=?',
+                                           (f'last_conversation:{identity["userid"]}:{agent_id}',))
+            conversation_id = remembered['value'] if remembered else None
+            if (not remembered or conversation_id) and conversation_id not in history_select.options:
+                conversation_id = next(iter(history_select.options), None)
+            if conversation_id:
+                generation = history_generation
+                restored = await runtime.restore(current, conversation_id)
+                if generation == history_generation:
+                    await render_history(restored)
+                    prompt.set_value(state['drafts'].get((agent_id, conversation_id), ''))
+            history_select.set_value(state['conversation'])
             with details:
                 with ui.expansion('Virtual machines', icon='dns').classes('w-full'):
                     try:
@@ -523,10 +542,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         async def choose_history(event):
             nonlocal history_generation
-            history_generation += 1
-            generation, agent_id = history_generation, state['agent']
             if not event.value or event.value == state['conversation']:
                 return
+            history_generation += 1
+            generation, agent_id = history_generation, state['agent']
             prompt.disable()
             try:
                 restored = await runtime.restore(await actor(), event.value)
@@ -544,6 +563,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             nonlocal rendered_conversation, render_generation
             render_generation += 1
             generation = render_generation
+            if state['conversation'] != restored['id']:
+                remember_conversation(restored['id'])
             state['conversation'] = restored['id']
             state['imported'] = bool(restored.get('imported'))
             state['active_operation'] = None
@@ -628,6 +649,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
 
         async def new_conversation():
+            nonlocal history_generation
+            history_generation += 1
+            remember_conversation(None)
             state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
             prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
             state.update(conversation=None, active_operation=None, busy=False, imported=False,
@@ -706,6 +730,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if state['agent'] == agent_id and state['conversation'] == conversation_id:
                     prompt.set_value('')
                     state['drafts'].pop((agent_id, conversation_id), None)
+                    remember_conversation(result['conversation_id'])
                     state['conversation'] = result['conversation_id']
                     state['activity_token'] = None
                     await render_history(await runtime.restore(current, result['conversation_id']))
