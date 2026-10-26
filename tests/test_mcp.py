@@ -524,11 +524,13 @@ async def test_owner_public_key_visibility_defaults_on_inherits_denial_and_requi
     own = await e.service.configure_agent('leaf-agent', 'leaf-agent')
     assert own['owner_ssh_public_key'] == public
     assert own['owner_ssh_key_access'] == {'selected': True, 'allowed': True, 'enabled': True}
+    assert (await e.service.context(await e.service.agent('leaf-agent')))['owner_ssh_public_key'] == public
     assert key.export_private_key().decode() not in json.dumps(own)
 
     await e.service.update_agent(e.root, 'middle-agent', None, '', '', owner_ssh_key_enabled=False)
     denied = await e.service.configure_agent('leaf-agent', 'leaf-agent')
     assert denied['owner_ssh_public_key'] is None
+    assert (await e.service.context(await e.service.agent('leaf-agent')))['owner_ssh_public_key'] is None
     assert public not in json.dumps(denied)
     assert denied['owner_ssh_key_access'] == {'selected': True, 'allowed': False, 'enabled': False}
     # Saving other settings retains the child's selection without overriding inherited denial.
