@@ -460,6 +460,8 @@ async def test_browser_entire_agent_details_collapse_on_desktop_and_mobile(brows
         subgroup = details.get_by_role('button', name='Create subgroup', exact=True)
         for width, height in [(1440, 900), (390, 844)]:
             await page.set_viewport_size({'width': width, 'height': height})
+            if width <= 900:
+                await page.locator('.q-drawer--mobile').wait_for(state='attached')
             toggle = page.locator('.q-header').get_by_role('button', name='Open agent hierarchy', exact=True)
             await playwright.expect(toggle).to_be_visible()
             await playwright.expect(page.locator('.q-header').get_by_label('Agent', exact=True)).to_be_visible()
