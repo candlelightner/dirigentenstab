@@ -12,6 +12,7 @@ services:
       CLOUDSTACK_URL: ${CLOUDSTACK_URL:?Configure CLOUDSTACK_URL}
       CLOUDSTACK_UI_URL: ${CLOUDSTACK_UI_URL:-}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Configure HTTPS PUBLIC_ORIGIN}
+      SESSION_SECONDS: ${SESSION_SECONDS:-3600}
       DATABASE: /data/dirigentenstab.db
       MASTER_KEY_FILE: /run/secrets/master_key
       APP_TLS_CERT: /run/secrets/tls_cert

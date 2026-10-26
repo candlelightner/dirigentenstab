@@ -154,3 +154,77 @@ async def test_session_expiration_and_persistent_login_rate_limit(store):
     restarted = Auth(app)
     with pytest.raises(PermissionError, match='Too many'):
         await restarted.login('', '', '/', 'test-address')
+
+
+@pytest.mark.parametrize('raw,expected', [(None, 3600), ('43200', 43200), ('0', None),
+                                         ('-1', None), ('1.5', None), ('forever', None)])
+def test_session_lifetime_environment_default_override_and_validation(monkeypatch, raw, expected):
+    from dirigentenstab import settings
+
+    monkeypatch.setattr(settings, 'load_dotenv', lambda: None)
+    monkeypatch.setenv('CLOUDSTACK_URL', 'https://cloud.invalid/client/api')
+    monkeypatch.setenv('PUBLIC_ORIGIN', 'https://hub.invalid')
+    if raw is None:
+        monkeypatch.delenv('SESSION_SECONDS', raising=False)
+    else:
+        monkeypatch.setenv('SESSION_SECONDS', raw)
+    if expected is None:
+        with pytest.raises(ValueError):
+            settings.Settings.load()
+    else:
+        assert settings.Settings.load().session_seconds == expected
+
+
+async def test_configured_login_lifetime_matches_cookie_and_server_expiration(store, monkeypatch):
+    from http.cookies import SimpleCookie
+
+    import httpx
+    from fastapi import FastAPI
+
+    from dirigentenstab import auth as auth_module, settings
+
+    monkeypatch.setattr(settings, 'load_dotenv', lambda: None)
+    monkeypatch.setenv('CLOUDSTACK_URL', 'https://cloud.invalid/client/api')
+    monkeypatch.setenv('PUBLIC_ORIGIN', 'https://hub.invalid')
+    monkeypatch.setenv('SESSION_SECONDS', '43200')
+    configuration = settings.Settings.load()
+
+    async def human_call(identity, command, params):
+        if command == 'listUsers':
+            return {'user': [{'id': 'person', 'state': 'enabled'}]}
+        return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
+
+    def cloud_login(request):
+        assert request.url == configuration.cloudstack_url
+        return httpx.Response(200, json={'loginresponse': {
+            'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin',
+            'type': 1, 'sessionkey': 'private-cloud-session'}},
+            headers={'set-cookie': 'JSESSIONID=private-cloud-cookie; Path=/'})
+
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(auth_module.httpx, 'AsyncClient',
+                        lambda **kwargs: client_type(transport=httpx.MockTransport(cloud_login), **kwargs))
+    monkeypatch.setattr(auth_module, 'bind_sockets', lambda auth: None)
+    auth = Auth(SimpleNamespace(store=store, settings=configuration, human_call=human_call))
+    application = FastAPI()
+    auth_module.attach(application, auth, configuration)
+    started = time.time()
+    async with client_type(transport=httpx.ASGITransport(app=application), base_url=configuration.origin) as client:
+        response = await client.post('/auth/login', data={'username': 'admin', 'password': 'fixture-password', 'domain': '/'},
+                                     headers={'origin': configuration.origin})
+    finished = time.time()
+    assert response.status_code == 303
+    cookie = SimpleCookie(response.headers['set-cookie'])['ds_session']
+    assert cookie['max-age'] == '43200'
+    token = cookie.value
+    session = store.one('SELECT expires,csrf FROM sessions WHERE token_hash=?', (auth.digest(token),))
+    assert started + 43200 <= session['expires'] <= finished + 43200
+    now = session['expires'] - 1
+    monkeypatch.setattr(auth_module.time, 'time', lambda: now)
+    assert (await auth.identity(token))['userid'] == 'person'
+    auth.csrf(token, session['csrf'])
+    now = session['expires']
+    with pytest.raises(PermissionError, match='Session expired'):
+        await auth.identity(token)
+    with pytest.raises(PermissionError, match='Invalid CSRF token'):
+        auth.csrf(token, session['csrf'])
