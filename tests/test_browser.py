@@ -134,7 +134,7 @@ async def test_browser_disabled_cloudstack_human_loses_existing_socket_access(br
         page = await context.new_page()
         await login(page, url)
         (state / 'human-disabled').touch()
-        await page.get_by_role('button', name='New conversation', exact=True).click()
+        # The activity timer revalidates the socket session and redirects automatically.
         await page.get_by_role('button', name='Sign in', exact=True).wait_for()
         response = await context.request.get(url + '/')
         assert response.url.endswith('/login')
