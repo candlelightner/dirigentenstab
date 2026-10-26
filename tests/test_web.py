@@ -50,6 +50,22 @@ def test_tree_preserves_scoped_root_without_inventing_missing_parent():
     assert nodes == [{'id': 'domain:research', 'label': 'Research', 'icon': 'folder', 'children': []}]
 
 
+def test_global_admin_is_separate_above_preserved_domain_tree():
+    nodes = hierarchy_nodes({
+        'domains': [{'id': 'native', 'name': 'ROOT', 'level': 0},
+                    {'id': 'main-domain', 'name': 'Agents', 'parentdomainid': 'native'},
+                    {'id': 'child-domain', 'name': 'Research', 'parentdomainid': 'main-domain'}],
+        'agents': [{'id': 'main', 'name': 'Agents', 'domain_id': 'main-domain', 'is_main': True},
+                   {'id': 'global', 'name': 'Custom global name', 'domain_id': 'native', 'is_global': True},
+                   {'id': 'child', 'name': 'Research', 'domain_id': 'child-domain'}],
+    })
+    assert nodes[0] == {'id': 'agent:global', 'label': 'Global Admin',
+                        'icon': 'admin_panel_settings', 'children': []}
+    assert nodes[1]['id'] == 'agent:main' and nodes[1]['label'] == 'Main Agent'
+    assert nodes[1]['children'] == [{'id': 'agent:child', 'label': 'Research',
+                                     'icon': 'smart_toy', 'children': []}]
+
+
 def test_history_excludes_system_instructions_and_keeps_tool_activity():
     history = {'messages': [
         {'kind': 'request', 'parts': [{'part_kind': 'system-prompt', 'content': 'internal instructions'},
@@ -259,8 +275,8 @@ def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
     assert 'alice' not in str(nodes) and 'Agents--ds-' not in str(nodes)
 
 
-@pytest.mark.parametrize('manage', [True, False])
-async def test_mcp_ui_separates_server_administration_and_agent_assignments(monkeypatch, manage):
+@pytest.mark.parametrize('manage,all_tools', [(True, False), (False, False), (True, True)])
+async def test_mcp_ui_separates_server_administration_and_agent_assignments(monkeypatch, manage, all_tools):
     from dirigentenstab import mcp
 
     agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
@@ -313,7 +329,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
             assert current == identity and agent_id == 'agent'
             return {'can_manage_servers': manage, 'servers': [
                 {'id': 'search', 'name': 'Search service', 'url': 'https://search.example/mcp',
-                 'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['web_search']},
+                 'enabled': True, 'tools': ['*'] if all_tools else [], 'allowed_tools': None if manage else ['web_search']},
                 {'id': 'other', 'name': 'Other service', 'url': 'https://other.example/mcp',
                  'enabled': True, 'tools': [], 'allowed_tools': None if manage else ['other_tool']}]}
 
@@ -359,7 +375,15 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         user.find('MCP tools').click()
         await user.should_see('Search the public web')
         assert Integration.discoveries == ['search']
-        assert not next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
+        assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value == all_tools
+        if all_tools:
+            assert next(iter(user.find(kind=ui.checkbox, content='web_extract').elements)).value
+            await user.should_not_see('(unavailable)')
+            user.find(kind=ui.checkbox, content='web_extract').click()
+            user.find('Save assigned tools').click()
+            await user.should_see('Assigned tools saved for this agent.')
+            assert Integration.assigned == [('agent', 'search', ['web_search'])]
+            return
         if manage:
             await user.should_see('API key / bearer token (blank keeps existing)')
             before_save = auth.calls

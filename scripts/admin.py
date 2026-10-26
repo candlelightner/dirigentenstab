@@ -66,7 +66,9 @@ async def perform(options, app, login=None):
     token, _ = await auth.login(login['username'], login['password'], login.get('domain', '/'), 'local-admin')
     try:
         identity = await auth.identity(token)
-        if options.command in {'rotate', 'migrate-key'}:
+        if options.command == 'provision-global-admin':
+            await app.provision_global_admin(identity)
+        elif options.command in {'rotate', 'migrate-key'}:
             await app.rotate_credentials(identity, options.identifier)
         elif options.command == 'migrate-keys':
             domains = (await app.human_call(identity, 'listDomains', {'listall': True})).get('domain', [])
@@ -113,7 +115,7 @@ async def perform(options, app, login=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['status', 'recover-deployments', 'resolve-rejection',
+    parser.add_argument('command', choices=['provision-global-admin', 'status', 'recover-deployments', 'resolve-rejection',
                                             'rotate', 'revoke', 'repair-provisioning', 'repair-execution',
                                             'recover-templates', 'approve-template', 'adopt-key',
                                             'migrate-key', 'migrate-keys'])

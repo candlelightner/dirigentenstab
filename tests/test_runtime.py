@@ -486,6 +486,20 @@ async def test_mcp_sdk_filters_tools_and_keeps_results_untrusted_redacted_and_du
     assert any(event['name'] == 'mcp_12345678_tavily_search' for event in restored['runs'][0]['events'])
 
 
+async def test_mcp_wildcard_defaults_expose_discovered_tools(service, mcp_remote, monkeypatch):
+    mcp_remote.binding['tools'] = ['*']
+
+    async def model(messages, info):
+        names = {tool.name for tool in info.function_tools}
+        assert 'mcp_12345678_tavily_search' in names
+        assert 'mcp_12345678_unassigned' in names
+        yield 'All discovered tools available'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Inspect tools')
+    assert result['status'] == 'completed'
+
+
 async def test_mcp_revocation_after_discovery_prevents_dispatch(service, mcp_remote, monkeypatch):
     async def model(messages, info):
         mcp_remote.allowed = False

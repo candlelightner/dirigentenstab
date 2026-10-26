@@ -16,12 +16,15 @@ from .store import Store
 
 
 def agent_label(agent):
+    if agent.get('is_global'):
+        return 'Global Admin'
     return 'Main Agent' if agent.get('is_main') else agent['name']
 
 
 def hierarchy_nodes(data):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
-    agents = {a['domain_id']: a for a in data.get('agents', [])}
+    global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
+    agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
     domains, roots = {}, []
     for domain in data.get('domains', []):
         agent = agents.get(domain['id'])
@@ -37,12 +40,14 @@ def hierarchy_nodes(data):
             roots.append(node)
         else:
             parent['children'].append(node)
-    # CloudStack's native ROOT is a container, never a managed AI identity.
+    # Keep the global identity separate from the native domain hierarchy.
     native_roots = {d['id'] for d in data.get('domains', [])
                     if d.get('path') == 'ROOT' or d.get('level') == 0 or
                     (d['name'] == 'ROOT' and not d.get('parentdomainid'))}
-    return [child for node in roots for child in
-            (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])]
+    return [{'id': 'agent:' + agent['id'], 'label': agent_label(agent),
+             'icon': 'admin_panel_settings', 'children': []} for agent in global_agents] + [
+        child for node in roots for child in
+        (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])]
 
 
 def tool_label(event):
@@ -411,7 +416,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             with details:
                 with ui.row().classes('w-full min-w-0 items-center gap-3'):
                     ui.label(agent_label(agents.get(agent_id, agent))).classes('text-xl font-semibold break-words')
-                    ui.badge('Domain administrator', color='primary')
+                    ui.badge('Root administrator' if agents.get(agent_id, agent).get('is_global')
+                             else 'Domain administrator', color='primary')
                     ui.space()
                     ui.button(icon='close', on_click=details_menu.close).props('flat round aria-label="Close agent details"')
                 with ui.row().classes('w-full items-center justify-end gap-3'):
@@ -695,7 +701,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             manage = configuration['can_manage_servers']
             with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-3'):
                 ui.label('MCP tools').classes('text-xl font-semibold')
-                ui.label('Only explicitly assigned tools are available. Every ancestor limits descendant access. '
+                ui.label('Global Admin starts with all tools enabled. Every ancestor limits descendant access. '
                          'External results are untrusted.').classes('text-sm')
                 options = ({'': 'New server'} if manage else {}) | {key: row['name'] for key, row in servers.items()}
                 selected = ui.select(options, label='MCP server', value=next(iter(servers), '' if manage else None)).classes('w-full')
@@ -719,7 +725,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 displayed, ready, generation = None, None, 0
 
                 def remember():
-                    if displayed:
+                    if displayed and (catalogues.get(displayed) or '*' not in choices.get(displayed, set())):
                         choices[displayed] = {name for name, checkbox in checkboxes.items() if checkbox.value}
 
                 def render(server_id):
@@ -730,9 +736,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     catalogue = catalogues.get(server_id, {})
                     checked = choices.get(server_id, set())
                     with tool_list:
-                        for tool_name in sorted(catalogue.keys() | checked):
+                        for tool_name in sorted(catalogue.keys() | (checked - {'*'})):
                             with ui.column().classes('w-full shrink-0 gap-0 min-w-0'):
-                                checkboxes[tool_name] = ui.checkbox(tool_name, value=tool_name in checked)
+                                checkboxes[tool_name] = ui.checkbox(tool_name, value='*' in checked or tool_name in checked)
                                 ui.label(catalogue.get(tool_name, '(unavailable)')).classes(
                                     'text-sm whitespace-pre-wrap break-words')
 

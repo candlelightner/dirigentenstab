@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 
 from .cloud import CloudError, validate
 from .gpu import GPU_COMMANDS, effective_policy, narrows, operation_id, validate_policy
-from .limits import APP_ROOT_AGENT, gpu_count
+from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, gpu_count
 
 
 class Journal:
@@ -267,7 +267,7 @@ class Controller:
         policy = effective_policy(chain, self.journal.policies())
         if profile not in policy['profiles'] or policy['max_allocations'] == 0:
             raise PermissionError('GPU profile or allocation is denied by an ancestor domain policy')
-        if agent['id'] != APP_ROOT_AGENT and not policy['subgroup_requests']:
+        if agent['id'] not in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT} and not policy['subgroup_requests']:
             raise PermissionError('Subgroup GPU capacity requests are disabled by an ancestor policy')
         await self.quota_enforced(chain)
         visible = (await (await self.service.cloud_client(agent)).raw('listDomains', {'listall': True})).get('domain', [])

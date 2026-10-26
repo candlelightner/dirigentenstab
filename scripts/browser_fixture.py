@@ -22,7 +22,7 @@ from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from dirigentenstab import runtime as runtime_module
 from dirigentenstab.auth import Auth, attach
 from dirigentenstab.cloud import Cloud
-from dirigentenstab.limits import APP_ROOT_AGENT
+from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from dirigentenstab.mcp import MCP
 from dirigentenstab.service import Service
 from dirigentenstab.settings import Settings
@@ -244,7 +244,8 @@ def main():
             conn.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
                           (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
                            store.seal(''), ''))
-        for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'), *[
+        for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'),
+                                         (GLOBAL_ADMIN_AGENT, ROOT_DOMAIN, 'Global Admin'), *[
                 (f'agent-{b}-{d}', f'domain-{b}-{d}', f'Team {b} Level {d}') for b in range(12) for d in range(4)]]:
             conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,model) '
                           'VALUES(?,?,?,?,?,?,?,?)', (identifier, name, domain, identifier+'-account', identifier+'-user',

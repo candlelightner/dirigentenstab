@@ -14,7 +14,7 @@ import httpx
 from .cloud import Cloud, CloudError, redact, validate
 from .settings import endpoint, dashboard_endpoint
 from .hierarchy import validate_child
-from .limits import APP_ROOT_AGENT, check_vm_policy, gpu_count
+from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 
 _UNSET = object()
@@ -109,9 +109,9 @@ class Service:
         visible = {domain['id'] for domain in domains}
         agents = self.store.all('SELECT id,name,domain_id,account_id,user_id,provider_id,model,instructions,'
                                 'can_provision,enabled FROM agents')
-        main = self.store.one('SELECT id FROM provisioning WHERE parent_id IS NULL AND phase=?', ('complete',))
-        agents = [a | {'is_main': bool(main and a['id'] == main['id'])}
-                  for a in agents if a['domain_id'] in visible and a['enabled']]
+        main = self.store.one('SELECT id FROM provisioning WHERE id=? AND phase=?', (APP_ROOT_AGENT, 'complete'))
+        agents = [a | {'is_main': bool(main and a['id'] == main['id']), 'is_global': a['id'] == GLOBAL_ADMIN_AGENT}
+                  for a in agents if a['domain_id'] in visible and a['enabled'] and (a['id'] != GLOBAL_ADMIN_AGENT or identity['type'] == 1)]
         users = (await self.human_call(identity, 'listUsers', {'listall': 'true'})).get('user', [])
         visible_agents = {a['id'] for a in agents}
         pending = [op for op in self.store.all(
@@ -127,6 +127,9 @@ class Service:
                  else await self.agent(agent_id))
         if not agent:
             raise PermissionError('Agent is unavailable')
+        if agent_id == GLOBAL_ADMIN_AGENT and (identity.get('_agent_id') not in {None, GLOBAL_ADMIN_AGENT}
+                                               or not identity.get('_agent_id') and identity.get('type') != 1):
+            raise PermissionError('Global Admin requires a root administrator')
         if identity.get('_agent_id'):
             actor = await self.agent(identity['_agent_id'])
             result = await (await self.cloud_client(actor)).raw('listDomains', {'id': agent['domain_id'], 'listall': True})
@@ -622,7 +625,7 @@ class Service:
         target = await self.authorize(identity, target_id)
         if actor_id != target_id:
             chain = await self.agent_chain(target)
-            if actor_id not in {member['id'] for member in chain[:-1]}:
+            if actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]}:
                 raise PermissionError('Only an ancestor agent may configure descendants')
         if settings is None:
             from .mcp import MCP
@@ -731,12 +734,15 @@ class Service:
                 thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or owner_ssh_key_enabled is not _UNSET or any(
                     value is not _UNSET for value in (compaction_provider_id, compaction_model, auto_compact_percent, context_window))):
             raise PermissionError('An agent may only edit its own system prompt')
-        if actor_id and actor_id != agent_id and actor_id not in {member['id'] for member in chain[:-1]}:
+        if actor_id and actor_id != agent_id and actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]}:
             raise PermissionError('Only an ancestor agent may configure descendants')
         if owner_ssh_key_enabled is not _UNSET:
             if type(owner_ssh_key_enabled) is not bool:
                 raise ValueError('Owner SSH public key access must be a boolean')
-            if owner_ssh_key_enabled and not all(member['owner_ssh_key_enabled'] for member in chain[:-1]):
+            key_ancestors = chain[:-1]
+            if actor_id and actor_id != agent_id:
+                key_ancestors = [*key_ancestors, *(await self.agent_chain(await self.agent(actor_id)))]
+            if owner_ssh_key_enabled and not all(member['owner_ssh_key_enabled'] for member in key_ancestors):
                 raise PermissionError('Owner SSH public key access cannot widen ancestor access')
         selection = self.selected_providers(agent) if enabled_providers is _UNSET else enabled_providers
         if not isinstance(selection, (set, list)) or any(not isinstance(item, str) for item in selection):
@@ -763,7 +769,10 @@ class Service:
         selected_servers = set(selected_servers)
         if not selected_servers <= {row['id'] for row in self.store.all('SELECT id FROM mcp_servers')}:
             raise ValueError('MCP server is unavailable')
-        if any(not policy.server_enabled(chain[:-1], server_id)
+        server_ancestors = chain[:-1]
+        if actor_id and actor_id != agent_id:
+            server_ancestors = [*server_ancestors, *(await self.agent_chain(await self.agent(actor_id)))]
+        if any(not policy.server_enabled(server_ancestors, server_id)
                for server_id in selected_servers - policy.selected_servers(agent)):
             raise PermissionError('MCP selections cannot widen ancestor access')
         affected = await self.affected_agents(agent_id)
@@ -834,6 +843,10 @@ class Service:
         pair = self._native_pair(available, agent, key_id=credentials['id'], credentials=credentials)
         self._remember(pair)
         client = self.client(pair)
+        if agent.get('id') == GLOBAL_ADMIN_AGENT:
+            accounts = (await client.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
+            if not any(a.get('id') == agent['account_id'] and a.get('accounttype') == 1 for a in accounts):
+                raise PermissionError('Global Admin must retain native root administrator authority')
         domains = (await client.raw('listDomains', {'id': agent['domain_id']})).get('domain', [])
         if not any(domain.get('id') == agent['domain_id'] for domain in domains):
             raise PermissionError('Replacement credentials failed domain validation; old keys retained')
@@ -887,7 +900,8 @@ class Service:
                 if (not isinstance(tools, list) or len(tools) > 100 or
                         any(not isinstance(tool, str) or not TOOL_NAME.fullmatch(tool) for tool in tools)):
                     raise ValueError('Assign at most 100 exact MCP tool names')
-                if not set(tools) <= policy._effective(chain, server_id):
+                allowed = policy._effective(chain, server_id)
+                if '*' not in allowed and not set(tools) <= allowed:
                     raise PermissionError('MCP selections cannot widen parent access')
         async with self._provision_lock:
             op = self.store.one('SELECT * FROM provisioning WHERE parent_id=? AND name=?', (agent_id, name))
@@ -912,7 +926,9 @@ class Service:
             return result
 
     async def _provision(self, op, cloud, parent_domain):
-        op_id, resource = op['id'], 'ds-' + op['id'][:20]
+        op_id = op['id']
+        resource = 'ds-global-admin' if op_id == GLOBAL_ADMIN_AGENT else 'ds-' + op_id[:20]
+        account_type = 1 if op_id == GLOBAL_ADMIN_AGENT else 2
         def save(phase, **fields):
             fields = {'phase': phase, 'updated': time.time(), 'error': None, **fields}
             self.store.execute('UPDATE provisioning SET ' + ','.join(key + '=?' for key in fields) + ' WHERE id=?',
@@ -944,7 +960,7 @@ class Service:
                 if not account:
                     password = uuid.uuid4().hex + uuid.uuid4().hex
                     account = first(await cloud.raw('createAccount', {
-                        'account': resource, 'username': resource, 'password': password, 'accounttype': 2,
+                        'account': resource, 'username': resource, 'password': password, 'accounttype': account_type,
                         'domainid': op['domain_id'], 'firstname': 'Dirigentenstab', 'lastname': op['name'],
                         'email': resource + '@invalid.example'}), 'account')
                 user = next((u for u in account.get('user', []) if u['username'] == resource), None)
@@ -952,10 +968,10 @@ class Service:
                     users = (await cloud.raw('listUsers', {'account': resource, 'domainid': op['domain_id'],
                                                           'listall': True})).get('user', [])
                     user = next((u for u in users if u['username'] == resource), None)
-                if account.get('accounttype') != 2 or not user:
-                    raise PermissionError('Subordinate account must be a domain administrator')
+                if account.get('accounttype') != account_type or not user:
+                    raise PermissionError('Managed account has the wrong native administrator type')
                 save('account', account_id=account['id'], user_id=user['id'])
-            target = {'user_id': op['user_id'], 'account_id': op['account_id'], 'domain_id': op['domain_id']}
+            target = {'id': op_id, 'user_id': op['user_id'], 'account_id': op['account_id'], 'domain_id': op['domain_id']}
             credentials = self.store.open(op['credentials']) if op['credentials'] else None
             if not credentials or 'credential' not in credentials:
                 previous = self._pairs(credentials) + self._pairs(await self._owned_keys(cloud.raw, target))
@@ -977,12 +993,22 @@ class Service:
                              'ON CONFLICT(id) DO NOTHING',
                              (op_id, op['name'], op['domain_id'], op['account_id'], op['user_id'],
                               self.store.seal(pair), op['provider_id'], op['model'], op['instructions']))
-                if inherited and conn.execute('SELECT changes()').fetchone()[0]:
+                inserted = conn.execute('SELECT changes()').fetchone()[0]
+                if inserted and op_id == GLOBAL_ADMIN_AGENT:
+                    conn.execute('UPDATE agents SET (thinking,compaction_provider_id,compaction_model,'
+                                 'auto_compact_percent,context_window)=(SELECT thinking,compaction_provider_id,'
+                                 'compaction_model,auto_compact_percent,context_window FROM agents WHERE id=?) '
+                                 'WHERE id=? AND EXISTS(SELECT 1 FROM agents WHERE id=?)',
+                                 (APP_ROOT_AGENT, op_id, APP_ROOT_AGENT))
+                if inherited and inserted:
                     conn.execute('UPDATE agents SET thinking=?,compaction_provider_id=?,compaction_model=?,'
                                  'auto_compact_percent=?,context_window=?,enabled_providers=?,enabled_mcp_servers=? WHERE id=?',
                                  inherited)
                     conn.execute('INSERT INTO mcp_assignments SELECT ?,server_id,tools FROM mcp_assignments WHERE agent_id=?',
                                  (op_id, parent['id']))
+                    if parent['id'] == GLOBAL_ADMIN_AGENT:
+                        conn.execute("INSERT OR IGNORE INTO mcp_assignments SELECT ?,id,'[\"*\"]' FROM mcp_servers",
+                                     (op_id,))
                 conn.execute("UPDATE provisioning SET phase='cleaning-credentials',updated=? WHERE id=?",
                              (time.time(), op_id))
             await self._cleanup_credentials(cloud.raw, target, credentials['previous'], pair)
@@ -1011,7 +1037,40 @@ class Service:
                            (op_id, 'Agents', '', 'Manage this domain safely. Only the human owner assigns work.',
                             time.time()))
         op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
-        return await self._provision(op, cloud, root['id'])
+        result = await self._provision(op, cloud, root['id'])
+        await self.provision_global_admin(cloud=cloud, root=root)
+        return result
+
+    async def provision_global_admin(self, identity=None, *, cloud=None, root=None):
+        """Create the dedicated ROOT account without modifying existing agent identities."""
+        if cloud is None:
+            if not identity or identity.get('_agent_id') or identity.get('type') != 1:
+                raise PermissionError('Global Admin provisioning requires a human root administrator')
+            service = self
+            class HumanCloud:
+                async def raw(self, command, params=None):
+                    return await service.human_call(identity, command, params)
+            cloud = HumanCloud()
+        version = (await cloud.raw('listCapabilities')).get('capability', {}).get('cloudstackversion', '')
+        if not re.fullmatch(r'4\.23\.\d+\.\d+', version):
+            raise RuntimeError('CloudStack 4.23.x is required for native key pairs; no identities were created')
+        if root is None:
+            root = next((d for d in (await cloud.raw('listDomains', {'listall': True})).get('domain', [])
+                         if d.get('level') == 0), None)
+        if not root or root.get('level') != 0:
+            raise PermissionError('Native ROOT domain could not be verified')
+        async with self._provision_lock:
+            main = self.store.one('SELECT * FROM agents WHERE id=?', (APP_ROOT_AGENT,))
+            provider = self.store.one('SELECT id,default_model FROM providers ORDER BY id LIMIT 1')
+            self.store.execute('INSERT INTO provisioning(id,parent_id,name,domain_id,provider_id,model,instructions,updated) '
+                               'VALUES(?,NULL,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
+                               (GLOBAL_ADMIN_AGENT, 'Global Admin', root['id'],
+                                main['provider_id'] if main and main['provider_id'] else provider['id'] if provider else None,
+                                main['model'] if main and main['provider_id'] else provider['default_model'] if provider else '',
+                                'Manage CloudStack globally using your own native root administrator identity. '
+                                'Only the human owner assigns work.', time.time()))
+            op = self.store.one('SELECT * FROM provisioning WHERE id=?', (GLOBAL_ADMIN_AGENT,))
+            return await self._provision(op, cloud, root['id'])
 
     @staticmethod
     def _native_pair(available, agent, *, key_id=None, credentials=None):
