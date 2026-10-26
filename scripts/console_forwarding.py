@@ -29,7 +29,7 @@ def rules(tagged=True):
     tag = ['-m', 'comment', '--comment', TAG] if tagged else []
     return [
         ['-s', TAILNET, '-d', GUESTS, '-i', TAILSCALE, '-o', BRIDGE,
-         '-m', 'conntrack', '--ctstate', 'NEW,ESTABLISHED,RELATED',
+         '-m', 'conntrack', '--ctstate', 'NEW,RELATED,ESTABLISHED',
          *tag, '-j', 'ts-forward'],
         ['-s', GUESTS, '-d', TAILNET, '-i', BRIDGE, '-o', TAILSCALE,
          '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED',

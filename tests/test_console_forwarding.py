@@ -50,7 +50,9 @@ def test_console_adopts_exact_working_rules_and_preserves_foreign_rules():
 
 def test_console_reapply_is_noop_with_disjoint_guest_ssh_first():
     guest = ['-i', 'br-app', '-o', 'dscloud0', '--comment', 'dirigentenstab-guest-ssh', '-j', 'ACCEPT']
-    calls, run = fake_run([guest, *console.rules(), ['-j', 'ts-forward']])
+    current = console.rules()
+    current[0][current[0].index('--ctstate') + 1] = 'NEW,RELATED,ESTABLISHED'
+    calls, run = fake_run([guest, *current, ['-j', 'ts-forward']])
     console.maintain(run=run)
     assert not any(c[0] == 'iptables-restore' or c[:2] == ('nft', '-f') for c, _ in calls)
 
