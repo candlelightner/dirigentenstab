@@ -1183,7 +1183,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.button('Prepare authorized GPU offering', on_click=lambda: protect(offering))
                     owned = {p['uuid'] for p in data['pools']}
                     devices = {d['busaddress']: d.get('vgpuprofilename', '') + ' · ' + d['busaddress']
-                                for d in data['devices'] if d.get('state') == 'Free' and d['busaddress'] not in owned}
+                               for d in data['devices'] if d.get('state') == 'Free' and d['busaddress'] not in owned}
                     device = ui.select(devices, label='Unclaimed free GPU device').classes('w-full')
                     async def claim():
                         if not domain.value or not device.value:
