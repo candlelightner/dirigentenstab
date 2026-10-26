@@ -152,7 +152,8 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         assert 'action="/auth/login"' in login.text and '/_nicegui_ws' not in login.text
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
-        await user.should_see('Select an agent to begin')
+        await user.should_see('Select an agent')
+        await user.should_not_see('Select an agent to begin')
         await user.should_not_see('Chat directly with an agent')
         toggle = next(iter(user.find('hierarchy_toggle').elements))
         heading = next(iter(user.find('agent_details_toggle').elements))
@@ -244,7 +245,7 @@ def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
                     {'id': 'child-domain', 'name': 'Research--ds-aabbcc', 'parentdomainid': 'main-domain'},
                     {'id': 'legacy', 'name': 'Meaningful--ds-1234', 'parentdomainid': 'child-domain'}],
         'agents': [{'id': 'main', 'name': 'Agents', 'domain_id': 'main-domain', 'is_main': True},
-                   {'id': 'child', 'name': 'Research', 'domain_id': 'child-domain'}],
+                    {'id': 'child', 'name': 'Research', 'domain_id': 'child-domain'}],
         'users': [{'id': 'human', 'username': 'alice', 'domainid': 'main-domain'}],
     })
     assert nodes[0]['label'] == 'Main Agent' and nodes[0]['icon'] == 'smart_toy'
@@ -595,6 +596,13 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
             user.find('Message').type('Run a task')
             user.find('Send').click()
         await user.should_see('Stop conversation')
+        await user.should_not_see('Send')
+        user.find('Message').type('interrupt text')
+        await user.should_see('Send')
+        await user.should_not_see('Stop conversation')
+        user.find('Message').clear()
+        await user.should_see('Stop conversation')
+        await user.should_not_see('Send')
         await user.should_see('Partial reply retained')
         user.find('Stop conversation').click()
         if final_status == 'running':
@@ -610,7 +618,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
         assert runtime.stopped == ['operation']
         assert next(iter(user.find(kind=ui.textarea, content='Message').elements)).enabled
         user.find('Message').type('Next task')
-        assert next(iter(user.find(kind=ui.button, content='Send').elements)).enabled
+        assert next(iter(user.find('Send').elements)).enabled
 
 
 async def test_compaction_configuration_persists_and_context_meter_restores():
@@ -705,10 +713,10 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
         assert agent['compaction_provider_id'] is None and agent['compaction_model'] == ''
         user.find('Conversation').trigger('update:modelValue', {'value': 0})
         await user.should_see('Completed')
-        run_details = next(iter(user.find('run_details').elements))
-        assert run_details.value is False
-        user.find('run_details').trigger('update:modelValue', True)
-        assert run_details.value is True
+        run_details_menu = next(iter(user.find('run_details_menu').elements))
+        assert run_details_menu.value is False
+        user.find('run_details_menu').trigger('update:modelValue', True)
+        assert run_details_menu.value is True
         await user.should_see('Requests: 0')
         await user.should_see('Context compacted.')
         await user.should_see('Context: ~321 / 1,500 usable tokens (21.4%)')
@@ -787,6 +795,7 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
         await poll.callback()
         assert list(selector.options) == ['second', 'first']
         user.find('Conversation').trigger('update:modelValue', {'value': 0})
-        await user.should_see('Ready')
+        await user.should_see('Send')
+        assert next(iter(user.find('Send').elements)).visible
         await asyncio.sleep(0)
         assert runtime.restored == ['second']
