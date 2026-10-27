@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import traceback
 import uuid
 
@@ -11,6 +12,39 @@ from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedMode
 from .cloud import CloudError
 
 logger = logging.getLogger('dirigentenstab.operations')
+
+
+# CloudStack ApiErrorCode values (ApiServer.java): 431 PARAM_ERROR, 432 UNSUPPORTED_ACTION_ERROR, 530 INTERNAL_ERROR,
+# 532 ACCOUNT_RESOURCE_LIMIT_ERROR, 533 INSUFFICIENT_CAPACITY_ERROR, 535 RESOURCE_ALLOCATION_ERROR.
+# 530 is generic, so its rule matches on text only. Each rule: (error codes, errortext fragments, hint). The first match wins; hints are guesses, never verified causes.
+ERROR_HINTS = (
+    ({533}, ('insufficientservercapacity', 'unable to create a deployment'),
+     'placement failed. Common causes: cluster CPU/RAM allocation above cluster.cpu|memory.allocated.capacity.disablethreshold (default 85%), '
+     'host/storage tags not matching the offering, local vs shared primary storage mismatch, no free GPU/vGPU slot. '
+     'Check usage of running VMs in the domain, try a smaller or local-storage offering, or ask the owner.'),
+    ({532, 535}, ('maximum number of resources of type',),
+     'quota or resource limit of the account or domain{resource}. Check resource limits and usage, free resources or ask the owner.'),
+    ({432}, ('does not exist or is not available', 'is not available for user'),
+     'your role lacks this API. Do not retry with other identities; use APIs in available_api_names or request_escalation if truly required.'),
+    ({431}, ('due to invalid value',),
+     'invalid parameter{parameter}. Use describe_api to check names, types and allowed values.'),
+    (set(), ('is not in a state', ' in state '),
+     'a VM/resource state precondition failed. Check its current state with the list API first.'),
+)
+
+
+def error_hint(text):
+    code = re.search(r'\((\d{3})\)|error (\d{3})|HTTP (\d{3})', text)
+    code = int(next(g for g in code.groups() if g)) if code else None
+    lowered = text.lower()
+    for codes, fragments, hint in ERROR_HINTS:
+        if code in codes or any(fragment in lowered for fragment in fragments):
+            resource = re.search(r"of type '?(\w+)", text)
+            parameter = re.search(r"[Pp]arameter:? '?([A-Za-z]\w+)", text)
+            return ' Hint (not a verified cause): ' + hint.format(
+                resource=f' (resource type {resource[1]})' if resource else '',
+                parameter=f' {parameter[1]}' if parameter else '')
+    return ''
 
 
 class OperationError(ValueError):
@@ -47,7 +81,7 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
             category = 'authorization'
             description = 'CloudStack denied this operation for the agent’s account, domain or API key.'
         if exc.public_detail:
-            description += ' Details: ' + exc.public_detail[:500]
+            description += ' Details: ' + exc.public_detail[:500] + error_hint(str(exc))
     elif isinstance(exc, ModelHTTPError):
         category = 'model-provider'
         code = exc.status_code
