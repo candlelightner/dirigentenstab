@@ -4,6 +4,7 @@ import pytest
 from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
+from dirigentenstab import web_chat
 from dirigentenstab.web import build_ui, hierarchy_nodes, history_parts
 
 
@@ -919,7 +920,7 @@ async def test_polling_updates_text_and_tool_status_without_replacing_history(mo
     async def current(token):
         return identity
 
-    monkeypatch.setitem(build_ui.__globals__, 'conversation_activity', lambda *args: [
+    monkeypatch.setattr(web_chat, 'conversation_activity', lambda *args: [
         {'id': 'conversation', 'agent_id': 'agent', 'title': 'Task', 'operation_id': 'run',
          'status': 'running', 'updated': runtime.version}])
     async with user_simulation() as user:

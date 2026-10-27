@@ -13,12 +13,11 @@ from fastapi.responses import Response
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from .auth import Auth
+from .auth import NATIVE_POLL_SECONDS, Auth
 
 PREFIX = '/vm-console/'
 RESOURCE = '/resource/noVNC/'
 SESSION_POLL_SECONDS = 1
-NATIVE_POLL_SECONDS = 30
 CACHE_BYTES = 32 * 1024 * 1024
 CACHE_ENTRIES = 256
 logger = logging.getLogger('dirigentenstab.console')
@@ -183,7 +182,7 @@ class ConsoleProxy:
                             if not self._session_alive(grant.session):
                                 return
                             if time.monotonic() >= next_native_check:
-                                await self.auth.identity_from_session(grant.session)
+                                await self.auth.identity_from_session(grant.session, fresh=True)
                                 next_native_check = time.monotonic() + NATIVE_POLL_SECONDS
 
                     tasks = [asyncio.create_task(work()) for work in (incoming, outgoing, watch_session)]

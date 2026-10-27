@@ -190,7 +190,8 @@ def test_bidirectional_websocket_origin_session_and_active_revocation(setup, mon
     monkeypatch.setattr('dirigentenstab.console.NATIVE_POLL_SECONDS', 0.01)
     revoked = False
 
-    async def revalidate(session):
+    async def revalidate(session, fresh=False):
+        assert fresh
         assert session == 'one'
         if revoked:
             raise PermissionError('Revoked native session')
