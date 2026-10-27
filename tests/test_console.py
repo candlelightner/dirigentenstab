@@ -66,7 +66,7 @@ def test_native_authorization_and_local_transport_rewrite(setup):
     query = parse_qs(urlsplit(path).query)
     assert 'native+secret' not in path and 'cpvm' not in path
     assert query['host'] == ['app.example'] and query['port'] == ['3001']
-    assert query['encrypt'] == ['1'] and query['autoconnect'] == ['true']
+    assert query['encrypt'] == ['1'] and query['autoconnect'] == ['true'] and query['reconnect'] == ['false']
     ticket = path.split('/')[2]
     assert query['path'] == ['vm-console/' + ticket + '/ws']
     assert proxy.grants[ticket].websocket == 'ws://cpvm:8080/websockify?token=native+secret/ticket='
@@ -321,5 +321,31 @@ def test_console_session_end_is_logged_without_ticket(setup, monkeypatch, caplog
             break
         time.sleep(0.02)
     lines = [r.getMessage() for r in caplog.records if 'session ended' in r.message]
-    assert len(lines) == 1 and 'client-closed' in lines[0] and '5 B up, 5 B down' in lines[0]
+    assert len(lines) == 1 and 'client-closed' in lines[0]
+    assert [r.levelname for r in caplog.records if 'session ended' in r.message] == ['INFO'] and '5 B up, 5 B down' in lines[0]
     assert 'native-secret' not in caplog.text and ticket not in caplog.text and '127.0.0.1' not in caplog.text
+
+
+def test_unexpected_console_end_is_logged_as_warning(setup, caplog):
+    proxy, app, path, _ = setup
+    ticket = path.split('/')[2]
+    caplog.set_level('INFO', logger='dirigentenstab.console')
+
+    def drop(socket):
+        socket.recv()  # close upstream after the first client message
+
+    with serve(drop, '127.0.0.1', 0, subprotocols=['binary']) as server, \
+            TestClient(app, base_url='https://app.example:3001') as client:
+        Thread(target=server.serve_forever, daemon=True).start()
+        proxy.grants[ticket].websocket = f'ws://127.0.0.1:{server.socket.getsockname()[1]}/websockify?token=t'
+        client.cookies.set('ds_session', 'one')
+        with client.websocket_connect('/vm-console/' + ticket + '/ws', headers={'origin': 'https://app.example:3001'},
+                                     subprotocols=['binary']) as ws:
+            ws.send_bytes(b'x')
+            for _ in range(100):
+                if any('session ended' in r.message for r in caplog.records):
+                    break
+                time.sleep(0.02)
+        server.shutdown()
+    ended = [r for r in caplog.records if 'session ended' in r.message]
+    assert [(r.levelname, 'upstream-closed' in r.getMessage()) for r in ended] == [('WARNING', True)]

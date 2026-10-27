@@ -492,6 +492,19 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 console_frame = ui.element('iframe').classes('console-frame bg-black rounded').props(
                     'title="VM console" src="about:blank" allow="clipboard-read; clipboard-write"').mark('console_frame')
                 console_frame.set_visibility(False)
+                # noVNC (same-origin iframe) drops its `noVNC_connected` class on disconnect; tell the server.
+                ui.add_body_html("""<script>(() => { const frame = () => document.querySelector('iframe.console-frame');
+                    document.addEventListener('load', e => { if (e.target !== frame()) return;
+                        const f = e.target, root = f.contentDocument?.documentElement; let seen = root?.classList.contains('noVNC_connected');
+                        if (root) new MutationObserver(() => { const up = root.classList.contains('noVNC_connected');
+                            if (up) seen = true; else if (seen) { seen = false; f.dispatchEvent(new Event('consoledisconnect')); }
+                        }).observe(root, {attributes: true, attributeFilter: ['class']}); }, true); })();</script>""")
+                # Keep the terminal fitted to the visible area while the mobile keyboard is open.
+                ui.add_body_html(f"""<script>(() => {{ let t; const refit = () => {{ clearTimeout(t); t = setTimeout(() => {{
+                    const box = document.querySelector('.terminal-container'); if (!box?.offsetParent) return;
+                    box.scrollIntoView({{block: 'nearest'}}); try {{ getElement({term.id}).fit(); }} catch (_) {{}} }}, 150); }};
+                    window.visualViewport?.addEventListener('resize', refit); window.visualViewport?.addEventListener('scroll', refit);
+                    window.addEventListener('resize', refit); }})();</script>""")
                 with ui.column().classes('files-pane w-full flex-1 min-h-0 min-w-0 gap-1 no-wrap') as files_pane:
                     with ui.row().classes('w-full items-center gap-1 no-wrap'):
                         ui.button(icon='arrow_upward', on_click=lambda: protect(lambda: list_dir(posixpath.dirname(files_dir)))).props(
@@ -854,6 +867,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             else:
                 set_console_src(url)
                 console_status.set_text(f'Console: {vm_name(vm_id)}')
+
+        async def console_disconnected():
+            if console_frame.props.get('src') != 'about:blank':
+                set_console_src()  # drop the dead canvas; Reconnect fetches a fresh single-use ticket
+                console_status.set_text('Console disconnected')
+
+        console_frame.on('consoledisconnect', lambda: protect(console_disconnected))
 
         async def popout_console():
             await connect_console(popout=True)

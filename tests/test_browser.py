@@ -1262,6 +1262,22 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         await page.locator('.terminal-pane').get_by_role('button', name='Reconnect', exact=True).wait_for()
         await page.locator('.terminal-pane').get_by_role('button', name='Disconnect', exact=True).wait_for()
 
+        # With the keyboard open (smaller visualViewport) the xterm container fits above it and refits.
+        rows = 'document.querySelectorAll(".terminal-container .xterm-rows > div").length'
+        await page.wait_for_function(f'{rows} > 0')
+        full_rows = await page.evaluate(rows)
+        await page.evaluate('''() => {
+            Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>480});
+            visualViewport.dispatchEvent(new Event('resize'));
+        }''')
+        await page.wait_for_function(f'{rows} < {full_rows}')
+        small_rows = await page.evaluate(rows)
+        box = await page.locator('.terminal-container').bounding_box()
+        assert box and box['y'] >= 0 and box['y'] + box['height'] <= 480
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.evaluate("delete visualViewport.height;visualViewport.dispatchEvent(new Event('resize'))")
+        await page.wait_for_function(f'{rows} > {small_rows}')
+
         frame = page.locator('iframe[title="VM console"]')
         (state / 'console-error').touch()
         await terminal_pane.get_by_role('button', name='Console', exact=True).click()
@@ -1302,6 +1318,14 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         assert reconnected_url != embedded_url
         await page.wait_for_timeout(1100)
         await playwright.expect(frame).to_have_attribute('src', reconnected_url)
+        # A dropped console shows Reconnect, and reconnecting uses a fresh single-use ticket.
+        await (await (await frame.element_handle()).content_frame()).evaluate("ws.send('close-now')")
+        await terminal_pane.get_by_text('Console disconnected', exact=True).wait_for()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
+        await terminal_pane.get_by_role('button', name='Reconnect', exact=True).click()
+        await frame.content_frame.get_by_text('Connected through console proxy', exact=True).wait_for()
+        assert await frame.get_attribute('src') not in (embedded_url, reconnected_url)
+        assert 'reconnect=false' in await frame.get_attribute('src')
         await terminal_pane.get_by_role('button', name='SSH', exact=True).click()
         await playwright.expect(frame).to_have_attribute('src', 'about:blank')
         await playwright.expect(frame).not_to_be_visible()
