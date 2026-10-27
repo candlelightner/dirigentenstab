@@ -1317,13 +1317,13 @@ async def test_escalation_tool_visibility_and_service_recheck(service, monkeypat
     async def model(messages, info):
         names = {tool.name for tool in info.function_tools}
         if not disabled_before_dispatch:
-            assert 'request_escalation' not in names
+            assert {'request_escalation', 'remove_skill'}.isdisjoint(names)
             yield 'Disabled'
         elif messages[-1].parts[0].part_kind == 'tool-return':
             assert messages[-1].parts[0].content['category'] == 'authorization'
             yield 'Access changed'
         else:
-            assert 'request_escalation' in names
+            assert {'request_escalation', 'remove_skill'} <= names
             service.store.execute("UPDATE agents SET escalation_requests_enabled=0 WHERE id='parent'")
             yield {0: DeltaToolCall(name='request_escalation', json_args='{"description":"Register GPU profile","reason":"Native identity cannot register profiles","command":"createVgpuProfile","params":{"name":"Requested offering"}}', tool_call_id='request')}
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
@@ -1499,7 +1499,7 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
     from types import MethodType
     from dirigentenstab.service import Service
 
-    for name in ('_skill_metadata', 'list_skills', 'get_skill', 'save_skill', 'share_skill'):
+    for name in ('_skill_metadata', 'list_skills', 'get_skill', 'save_skill', 'share_skill', 'remove_skill'):
         setattr(service, name, MethodType(getattr(Service, name), service))
 
     async def chain(agent):
@@ -1536,6 +1536,8 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
             assert 'error' not in returned
             if step == 1:
                 skill_id = returned['id']
+            if step in {7, 8}:
+                assert returned['text'] == text
         actions = [
             ('save_skill', {'name': 'Setup', 'description': 'Guest setup', 'text': text}),
             ('share_skill', {'skill_id': skill_id, 'agent_ids': ['child']}),
@@ -1545,9 +1547,10 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
             ('save_skill', {'name': 'Setup', 'description': 'Guest setup', 'text': text, 'skill_id': skill_id}),
             ('get_skill', {'skill_id': skill_id}),
             ('get_skill', {'skill_id': skill_id}),
+            ('remove_skill', {'skill_id': skill_id, 'reason': 'Obsolete instructions'}),
         ]
         if step == len(actions):
-            assert returned['text'] == text
+            assert returned['status'] == 'pending' and returned['request_id']
             yield 'Done'
             return
         name, args = actions[step]
@@ -1560,5 +1563,7 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
     row = service.store.one('SELECT * FROM skills')
     assert json.loads(row['shared_agent_ids']) == ['child']
     assert row['revision'] == 3 and service.store.open(row['text']) == text
-    # Three edits/shares inspect the skill, and both explicit reads must reach the service.
-    assert reads == 7
+    # Removal inspects its current revision twice, including the generic escalation boundary.
+    assert reads == 9
+    removal = service.store.one('SELECT command,status FROM escalation_requests')
+    assert removal == {'command': 'removeSkill', 'status': 'pending'}

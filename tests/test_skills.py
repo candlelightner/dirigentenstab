@@ -269,3 +269,83 @@ async def test_global_skill_sharing_keeps_main_agent_as_a_separate_root(env):
     skill = await e.service.save_skill(e.owner, GLOBAL_ADMIN_AGENT, 'Global setup', 'Setup notes', 'Full text')
     loaded = await e.service.get_skill(e.owner, skill['id'])
     assert not {APP_ROOT_AGENT, 'main-child'} & {a['id'] for a in loaded['shareable_agents']}
+
+
+async def removal(e, skill_id, agent_id='creator', **changes):
+    return await e.service.remove_skill(agent_id, skill_id, 'Obsolete instructions',
+        **({'conversation_id': 'conversation', 'run_id': 'run', 'call_id': 'remove'} | changes))
+
+
+async def test_removal_requires_explicit_human_approval_and_preserves_dismissed_skill(env):
+    e = env
+    skill = await create(e)
+    row = await removal(e, skill['id'])
+    assert row['command'] == 'removeSkill' and row['status'] == 'pending'
+    assert row['params']['text'] == '@literal full text secret'
+    assert (await removal(e, skill['id']))['id'] == row['id']
+    assert await e.service.get_skill(e.creator, skill['id'])
+    with pytest.raises(PermissionError, match='human'):
+        await e.service.decide_escalation(e.creator, row['id'], True)
+    await e.service.decide_escalation(e.owner, row['id'], False)
+    assert await e.service.get_skill(e.creator, skill['id'])
+    row = await removal(e, skill['id'], call_id='approved')
+    assert (await e.service.decide_escalation(e.owner, row['id'], True))['status'] == 'approved'
+    assert not e.store.all('SELECT * FROM skills')
+    assert (await e.service.decide_escalation(e.owner, row['id'], True))['status'] == 'approved'
+
+
+@pytest.mark.parametrize('sharing', ['selected', 'global'])
+async def test_visible_reader_can_request_removal_but_revocation_blocks_approval(env, sharing):
+    e = env
+    skill = await create(e)
+    with pytest.raises(PermissionError, match='unavailable'):
+        await removal(e, skill['id'], agent_id='child')
+    if sharing == 'selected':
+        await e.service.share_skill(e.creator, skill['id'], ['child'])
+    else:
+        await e.service.approve_skill_global(e.owner, skill['id'], 1)
+    e.store.execute("UPDATE conversations SET agent_id='child' WHERE id='conversation'")
+    e.store.execute("UPDATE chat_runs SET agent_id='child' WHERE id='run'")
+    row = await removal(e, skill['id'], agent_id='child')
+    assert row['status'] == 'pending'
+    e.store.execute('UPDATE skills SET shared_agent_ids=\'[]\',global_revision=NULL WHERE id=?', (skill['id'],))
+    with pytest.raises(PermissionError, match='unavailable'):
+        await e.service.decide_escalation(e.owner, row['id'], True)
+    assert e.store.one('SELECT id FROM skills')['id'] == skill['id']
+
+
+async def test_removal_rejects_forged_stale_disabled_and_expired_approval(env):
+    e = env
+    skill = await create(e)
+    row = await removal(e, skill['id'])
+    with pytest.raises(ValueError, match='exact current'):
+        await e.service.request_escalation('creator', 'Remove', 'Obsolete', 'removeSkill',
+                                          row['params'] | {'text': 'Forged'},
+                                          conversation_id='conversation', run_id='run', call_id='forged')
+    e.store.execute("UPDATE agents SET escalation_requests_enabled=0 WHERE id='root'")
+    with pytest.raises(PermissionError, match='disabled'):
+        await removal(e, skill['id'], call_id='disabled')
+    with pytest.raises(PermissionError, match='disabled'):
+        await e.service.decide_escalation(e.owner, row['id'], True)
+    e.store.execute("UPDATE agents SET escalation_requests_enabled=1 WHERE id='root'")
+    await e.service.save_skill(e.creator, 'creator', 'Changed', 'Changed', 'Changed', skill['id'])
+    with pytest.raises(ValueError, match='changed'):
+        await e.service.decide_escalation(e.owner, row['id'], True)
+    fresh = await removal(e, skill['id'], call_id='fresh')
+    e.store.execute("UPDATE sessions SET expires=0 WHERE token_hash='session'")
+    with pytest.raises(PermissionError, match='expired'):
+        await e.service.decide_escalation(e.owner, fresh['id'], True)
+    assert e.store.one('SELECT revision FROM skills')['revision'] == 2
+
+
+async def test_generic_removal_request_cannot_bypass_skill_visibility(env):
+    e = env
+    skill = await create(e)
+    loaded = await e.service.get_skill(e.creator, skill['id'])
+    snapshot = {key: loaded[key] for key in ('id', 'revision', 'name', 'description', 'text')}
+    e.store.execute("UPDATE conversations SET agent_id='child' WHERE id='conversation'")
+    e.store.execute("UPDATE chat_runs SET agent_id='child' WHERE id='run'")
+    with pytest.raises(PermissionError, match='unavailable'):
+        await e.service.request_escalation('child', 'Remove hidden skill', 'Obsolete', 'removeSkill', snapshot,
+                                          conversation_id='conversation', run_id='run', call_id='bypass')
+    assert not e.store.all('SELECT * FROM escalation_requests')

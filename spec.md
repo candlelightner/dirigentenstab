@@ -186,6 +186,8 @@ creation.
 - Global sharing requires explicit human approval of the exact revision, either
   in the existing escalation queue or in the human skill editor. Editing removes
   global visibility until the new revision receives approval.
+- `remove_skill` requests removal of a skill the agent can read. Removal always
+  requires human owner approval of the exact revision; requests never delete it immediately.
 - The sidebar's existing view selector includes Skills. Selecting a skill opens
   a minimal editor; names and descriptions are listed without loading full text.
 
