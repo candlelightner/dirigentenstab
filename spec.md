@@ -226,8 +226,8 @@ current compaction settings.
 - Configure the owner's SSH public key centrally once and add it to newly
   created VMs alongside agent access. Do not require per-VM manual SSH setup for
   compatible managed deployments. VM enrollment never needs the owner's private
-  SSH key. The owner may optionally save a private key, encrypted at rest and
-  removable at any time, solely for the hub's embedded SSH terminal.
+  SSH key. The embedded SSH terminal uses the VM's managed access key after native
+  authorization; the hub stores no owner private key.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.

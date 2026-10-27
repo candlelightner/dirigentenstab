@@ -15,6 +15,11 @@ permissions:
 
 jobs:
   chromium:
+    name: chromium (shard ${{ matrix.shard }}/2)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     runs-on: ubuntu-24.04
     timeout-minutes: 9
     container:
@@ -22,6 +27,7 @@ jobs:
       options: --shm-size=1g
     env:
       HOME: /root
+      BROWSER_SHARD: ${{ matrix.shard }}/2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always() && steps.changes.outputs.code == 'true'
         with:
-          name: playwright-browser-results
+          name: playwright-browser-results-${{ matrix.shard }}
           path: |
             browser-results/**/browser-server.log
             browser-results/**/*.png

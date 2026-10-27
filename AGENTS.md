@@ -14,7 +14,7 @@ Guidelines and conventions for AI assistants working in this repository.
   1. Branch off `main` (`implementation/<topic>` or `fix/<topic>`) in a dedicated git worktree. The main checkout `/home/emil/dirigentenstab` is deploy-only: never edit, commit, or leave uncommitted changes there; only pull `origin/main` and deploy from it.
   2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py` for UI changes.
   3. Commit locally and push branch changes via GitHub MCP (`create_branch` + `push_files`) when shell git credentials are absent.
-  4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, 5-minute browser timeout) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
+  4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, two parallel Chromium shards) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
   5. Merge PR into `main` via GitHub MCP.
   6. Pull `origin/main` in `/home/emil/dirigentenstab`, build the image tagged `dirigentenstab-local:<7-char short SHA of the deployed main commit>` (never reuse an older tag), set only `IMAGE` in `.env` to it, restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI. Afterwards remove merged worktrees and their branches.
 
