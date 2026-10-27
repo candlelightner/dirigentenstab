@@ -349,3 +349,39 @@ def test_hierarchy_nodes_modes():
     assert vm_nodes[0]['children'][0]['id'] == 'vm:vm-eng-1'
     assert vm_nodes[0]['children'][0]['label'] == 'build-server'
     assert 'Marketing' not in str(vm_nodes)
+
+
+@pytest.mark.parametrize('url', [
+    'https://console.example:8443/?ticket=secret', 'http://10.0.0.1/console',
+    'https:///missing-host', 'javascript:alert(1)', '//console.example/',
+    'https://@console.example/', 'https://user:password@console.example/', 'https://console.example:bad/',
+    'https://console.example:0/', 'https://console.example/\nattack',
+    'https://console.example\\@evil.example/', None,
+])
+async def test_vm_console_url_validation_and_native_identity(service_and_store, monkeypatch, url):
+    service, _ = service_and_store
+    identity = {'userid': 'human'}
+
+    async def call(actor, command, params):
+        assert actor is identity
+        assert command == 'createConsoleEndpoint'
+        assert params == {'virtualmachineid': 'vm-1'}
+        return {'consoleendpoint': {'success': True, 'url': url}}
+
+    monkeypatch.setattr(service, 'human_call', call)
+    if url in ('https://console.example:8443/?ticket=secret', 'http://10.0.0.1/console'):
+        assert await service.vm_console_url(identity, 'vm-1') == url
+    else:
+        with pytest.raises(ValueError, match='Console unavailable'):
+            await service.vm_console_url(identity, 'vm-1')
+
+
+async def test_vm_console_error(service_and_store, monkeypatch):
+    service, _ = service_and_store
+
+    async def call(*args):
+        return {'consoleendpoint': {'success': False, 'details': 'VM stopped'}}
+
+    monkeypatch.setattr(service, 'human_call', call)
+    with pytest.raises(ValueError, match='VM stopped'):
+        await service.vm_console_url({'userid': 'human'}, 'vm-1')

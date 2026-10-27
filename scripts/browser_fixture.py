@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from nicegui import app, ui
+from websockets.sync.server import serve
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from dirigentenstab import runtime as runtime_module
@@ -50,11 +51,40 @@ for branch in range(12):
 
 
 def fake_api(state):
+    def echo(socket):
+        for message in socket:
+            socket.send(message)
+
+    websocket = serve(echo, '127.0.0.1', 0, subprotocols=['binary'])
+    websocket_port = websocket.socket.getsockname()[1]
+    Thread(target=websocket.serve_forever, daemon=True).start()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_GET(self):
+            if self.path.startswith('/resource/noVNC/'):
+                if self.path == '/resource/noVNC/vnc.html':
+                    content = '<body style="margin:0;background:#111;color:white">Fixture noVNC console<div id="status"></div><script src="fixture.js"></script></body>'
+                    mime = 'text/html'
+                elif self.path == '/resource/noVNC/fixture.js':
+                    content = '''const q = new URLSearchParams(location.search);
+const ws = new WebSocket('wss://' + q.get('host') + ':' + q.get('port') + '/' + q.get('path') + '?token=' + q.get('token'), ['binary']);
+ws.onopen = () => ws.send('Connected through console proxy');
+ws.onmessage = e => document.getElementById('status').textContent = e.data;
+'''
+                    mime = 'text/javascript'
+                else:
+                    self.send_error(404)
+                    return
+                data = content.encode()
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/v1/models':
                 value, status = {'data': [
                     {'id': 'fixture-model', 'context_window': 65536, 'effort': {'supported_levels': ['low', 'high', 'max'], 'default_level': 'high'}},
@@ -95,6 +125,17 @@ def fake_api(state):
                 value = {'virtualmachine': [{'id': '00000000-0000-0000-0000-000000000004', 'name': 'research-vm',
                                              'displayname': 'Research Worker',
                                              'state': 'Running'}]}
+            elif command == 'createConsoleEndpoint':
+                count_file = state / 'console-count'
+                count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+                count_file.write_text(str(count))
+                if (state / 'console-delay').exists():
+                    import time
+                    time.sleep(0.8)
+                value = {'consoleendpoint': {'success': not (state / 'console-error').exists(),
+                         'details': 'Console fixture denied',
+                         'url': f'http://127.0.0.1:{self.server.server_address[1]}/resource/noVNC/vnc.html'
+                                f'?host=127.0.0.1&port={websocket_port}&encrypt=0&path=websockify&token=ticket-{count}'}}
             elif command == 'listApis':
                 value = {'api': [{'name': 'updateVirtualMachine', 'params': [
                     {'name': 'id', 'type': 'uuid', 'required': True},

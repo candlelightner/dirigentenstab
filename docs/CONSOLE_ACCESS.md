@@ -167,3 +167,41 @@ Removal deletes only tagged Tailscale VM exceptions and the owned guard table;
 VM forwarding then depends on the remaining native rules. Re-run the
 installer to restore it. Do not flush iptables/nftables or stop Tailscale to roll
 this back. Stopping the oneshot alone deliberately leaves rules in place.
+
+## Application embedded console transport
+
+The default guest-SSH helper also maintains the application's private path to
+native Console Proxy VMs. Standard setup installs this helper and its existing
+`dirigentenstab-guest-ssh.timer`; the optional Tailscale installer above is not
+needed for embedded consoles. After reviewing an update, refresh only this
+project helper with `sudo ./setup.sh --guest-ssh`.
+
+On every run it queries the local `cloud` database through root's existing
+socket authentication, using a read-only SELECT of non-removed `ConsoleProxy`
+VMs and their non-removed NICs. Only usable IPv4 addresses in the configured
+`CLOUDSTACK_NETWORK` qualify. No API credentials, ARP or libvirt discovery is
+used. Each qualifying address receives two rules under the existing
+`dirigentenstab-guest-ssh` ownership tag:
+
+- Requests: Docker `dirigentenstab_management` bridge to `CLOUDSTACK_BRIDGE`,
+  source `APP_ADDRESS/32`, destination CPVM `/32`, TCP destination ports
+  **80,8080**, NEW/ESTABLISHED.
+- Replies: the reverse interfaces and addresses, TCP source ports **80,8080**,
+  **ESTABLISHED** only.
+
+These exceptions grant no application HTTP access to ordinary guests, LAN or
+internet destinations. TCP 443 is not opened. Existing scoped TCP 22 rules and
+foreign/native isolation rules are retained. Changed CPVM addresses replace old
+exceptions on the next timer run (normally within 60 seconds); a failed,
+missing, timed-out or malformed database discovery removes console exceptions
+and keeps SSH rules. Discovery errors appear in the guest-SSH service journal.
+A missing Docker management network removes the helper's owned rules until it
+returns. The existing helper's `--remove` removes both SSH and CPVM exceptions.
+
+After an approved installation, verify the tagged rules and counters with
+`sudo iptables -nvL FORWARD --line-numbers` and inspect
+`sudo journalctl -u dirigentenstab-guest-ssh.service --no-pager`. Probe ports 80
+and 8080 **from the application container**, then open a fresh authenticated
+embedded console and verify screen updates and keyboard input. Host-local curl
+does not exercise this forwarding path. CPVM transport success alone does not
+verify application session authorization or WebSocket ticket handling.

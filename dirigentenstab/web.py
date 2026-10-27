@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from nicegui import app, ui
 
+from .console import ConsoleProxy
 from .runtime import Runtime, provider_models, test_provider
 from .diagnostics import diagnose
 from .settings import Settings
@@ -236,6 +237,8 @@ def conversation_activity(store, human_id, agent_ids):
 
 def build_ui(service, auth, runtime=None):
     runtime = runtime or Runtime(service)
+    console_proxy = ConsoleProxy(service)
+    console_proxy.install(app)
 
     @app.get('/login', response_class=HTMLResponse)
     async def login_page(request: Request):
@@ -339,6 +342,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .terminal-pane{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden;gap:6px}
             .terminal-container{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden}
             .terminal-container .xterm{width:100%!important;height:100%!important;min-width:0;max-width:100%}
+            .console-frame{flex:1;min-height:0;height:100%;width:100%;max-width:100%;border:0}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
             .messages .q-scrollarea__container{overflow-x:hidden!important}
             .messages .q-scrollarea__content{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box}
@@ -387,11 +391,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.row().classes('w-full items-center no-wrap'):
                     sidebar_select = ui.select(['Agents', 'VMs'], multiple=True, value=['Agents']).props(
                         'dense options-dense').classes('sidebar-view-select text-base font-semibold min-w-[140px] max-w-[180px]').mark('sidebar_view_select')
+                    sidebar_select.disable()
                     ui.space()
                     ui.button(icon='close', on_click=lambda: drawer.run_method('hide')).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
                 alias_switch = ui.switch('Show aliases', value=False).props('dense').classes(
                     'sidebar-show-aliases text-xs text-stone-600').mark('sidebar_show_aliases')
+                alias_switch.disable()
                 alias_switch.set_visibility('VMs' in (sidebar_select.value or []))
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
@@ -449,16 +455,27 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                             on_click=lambda: protect(stop_agent)).props('outline aria-label="Stop conversation"').mark('Stop conversation')
             with ui.card().classes('terminal-pane flex-1 w-full min-h-0 min-w-0 p-2 gap-2 flex flex-col').mark('terminal_pane') as terminal_pane:
                 terminal_pane.set_visibility(False)
-                with ui.row().classes('terminal-controls w-full items-center justify-between no-wrap gap-2'):
-                    terminal_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('terminal_status').props('role=status')
+                with ui.row().classes('terminal-controls w-full items-center justify-between gap-2'):
+                    with ui.row().classes('items-center gap-2 no-wrap min-w-0'):
+                        terminal_mode = ui.toggle({'ssh': 'SSH', 'console': 'Console'}, value='ssh').props(
+                            'dense no-caps aria-label="Connection type"').mark('terminal_mode')
+                        terminal_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('terminal_status').props('role=status')
+                        console_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('console_status').props('role=status')
+                        console_status.set_visibility(False)
                     with ui.row().classes('items-center gap-1 no-wrap'):
+                        popout_btn = ui.button(icon='open_in_new', on_click=lambda: protect(popout_console)).props(
+                            'flat round dense aria-label="Open console in new tab"').mark('console_popout')
+                        popout_btn.set_visibility(False)
                         reconnect_btn = ui.button(icon='refresh', on_click=lambda: protect(reconnect_terminal)).props('flat round dense aria-label="Reconnect"').mark('terminal_reconnect')
                         disconnect_btn = ui.button(icon='power_settings_new', on_click=lambda: protect(disconnect_terminal)).props('flat round dense aria-label="Disconnect"').mark('terminal_disconnect')
                         ui.button(icon='close', on_click=lambda: protect(close_terminal_view)).props('flat round dense aria-label="Close terminal"').mark('terminal_close')
                 terminal_error = ui.label('').classes('text-xs text-red-600 truncate').mark('terminal_error')
                 terminal_error.set_visibility(False)
-                with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').mark('terminal_container'):
+                with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').mark('terminal_container') as terminal_container:
                     term = ui.xterm(options={'cursorBlink': True, 'theme': {'background': '#000000'}}).classes('w-full h-full').mark('xterm')
+                console_frame = ui.element('iframe').classes('console-frame bg-black rounded').props(
+                    'title="VM console" src="about:blank" allow="clipboard-read; clipboard-write"').mark('console_frame')
+                console_frame.set_visibility(False)
 
         def sync_run_details():
             status_label.set_visibility(bool(status_label.text))
@@ -556,6 +573,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         async def render_agent(agent_id, *, close_navigation=True):
             close_active_terminal()
+            set_console_src()
             state['current_vm'] = None
             terminal_pane.set_visibility(False)
             conversation_controls.set_visibility(True)
@@ -647,9 +665,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                         ui.label(str(diagnose(exc, agent_id=agent_id))).classes('text-sm text-amber-900')
 
         active_session = None
+        ssh_request = 0
 
         def close_active_terminal():
-            nonlocal active_session
+            nonlocal active_session, ssh_request
+            ssh_request += 1
             if active_session:
                 if hasattr(service, 'unregister_terminal_session'):
                     service.unregister_terminal_session(active_session)
@@ -660,6 +680,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         async def connect_vm(vm_id, vm_name=None):
             close_active_terminal()
+            request = ssh_request
+            terminal_error.set_text('')
             terminal_error.set_visibility(False)
             reconnect_btn.disable()
             disconnect_btn.disable()
@@ -671,6 +693,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if not key_row:
                     raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
                 conn, vm = await service.open_vm_terminal_connection(current, vm_id)
+                if request != ssh_request or state.get('current_vm') != vm_id:
+                    conn.close()
+                    return
                 session = TerminalSession(current['userid'], vm_id, conn, None, term)
                 if hasattr(service, 'register_terminal_session'):
                     service.register_terminal_session(session)
@@ -678,6 +703,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 active_session = session
 
                 def on_disconnect(error_msg=None):
+                    if request != ssh_request:
+                        return
                     terminal_status.set_text('Disconnected' + (f': {error_msg}' if error_msg else ''))
                     reconnect_btn.enable()
                     disconnect_btn.disable()
@@ -693,6 +720,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     term_size=(cols, rows),
                     encoding=None,
                 )
+                if request != ssh_request:
+                    chan.close()
+                    conn.close()
+                    return
                 session.chan = chan
                 ssh_session.chan = chan
                 terminal_status.set_text(f"Connected: {vm.get('name', vm_id)}")
@@ -700,6 +731,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 reconnect_btn.enable()
                 await term.fit()
             except Exception as exc:
+                if request != ssh_request:
+                    return
                 close_active_terminal()
                 error_msg = str(exc)
                 terminal_status.set_text('Disconnected: ' + error_msg[:60])
@@ -730,20 +763,89 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         term.on_data(handle_term_data)
         term.on_resize(handle_term_resize)
+        terminal_mode.on_value_change(lambda e: protect(lambda: switch_terminal_mode(e.value)))
+
+        def vm_name(vm_id):
+            vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == vm_id), None)
+            return vm_info.get('name') if vm_info else vm_id
+
+        console_request = 0
+
+        def set_console_src(url='about:blank'):
+            nonlocal console_request
+            console_request += 1
+            console_frame.props['src'] = url
+            console_frame.update()
 
         async def show_vm(vm_id):
-            vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == vm_id), None)
-            vm_name = vm_info.get('name') if vm_info else vm_id
+            close_active_terminal()
+            name = vm_name(vm_id)
             state['current_vm'] = vm_id
-            agent_heading.set_text(f"VM: {vm_name}")
+            set_console_src()
+            agent_heading.set_text(f"VM: {name}")
             agent_heading.disable()
             conversation_controls.set_visibility(False)
             conversation_card.set_visibility(False)
             terminal_pane.set_visibility(True)
             drawer.run_method('hide')
-            await connect_vm(vm_id, vm_name)
+            if terminal_mode.value == 'ssh':
+                await switch_terminal_mode('ssh')
+            else:
+                terminal_mode.set_value('ssh')
 
-        def disconnect_terminal():
+        async def connect_console(*, popout=False):
+            set_console_src()
+            request = console_request
+            vm_id = state.get('current_vm')
+            if not vm_id:
+                return
+            console_status.set_text(f'Opening console: {vm_name(vm_id)}…')
+            terminal_error.set_visibility(False)
+            try:
+                url = await console_proxy.open(await actor(), vm_id)
+            except Exception as exc:
+                if request == console_request:
+                    console_status.set_text('Console unavailable')
+                    terminal_error.set_text(str(exc))
+                    terminal_error.set_visibility(True)
+                return
+            if request != console_request or vm_id != state.get('current_vm') or terminal_mode.value != 'console':
+                return
+            if popout:
+                ui.navigate.to(url, new_tab=True)
+                console_status.set_text('Console opened in new tab')
+            else:
+                set_console_src(url)
+                console_status.set_text(f'Console: {vm_name(vm_id)}')
+
+        async def popout_console():
+            await connect_console(popout=True)
+
+        async def switch_terminal_mode(mode):
+            console = mode == 'console'
+            terminal_error.set_text('')
+            terminal_error.set_visibility(False)
+            if console:
+                close_active_terminal()
+            for element in (console_status, console_frame, popout_btn):
+                element.set_visibility(console)
+            terminal_status.set_visibility(not console)
+            terminal_container.set_visibility(not console)
+            reconnect_btn.enable()
+            disconnect_btn.set_enabled(console or bool(active_session))
+            if not console:
+                set_console_src()
+                await term.fit()
+                if state.get('current_vm') and not active_session:
+                    await connect_vm(state['current_vm'], vm_name(state['current_vm']))
+            elif state.get('current_vm') and console_frame.props.get('src') == 'about:blank':
+                await connect_console()
+
+        async def disconnect_terminal():
+            if terminal_mode.value == 'console':
+                set_console_src()
+                console_status.set_text('Console closed')
+                return
             close_active_terminal()
             terminal_status.set_text('Disconnected')
             disconnect_btn.disable()
@@ -751,12 +853,16 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             term.writeln('\r\n\x1b[33mDisconnected by user.\x1b[0m\r\n')
 
         async def reconnect_terminal():
-            if state.get('current_vm'):
-                vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == state['current_vm']), None)
-                await connect_vm(state['current_vm'], vm_info.get('name') if vm_info else state['current_vm'])
+            if not state.get('current_vm'):
+                return
+            if terminal_mode.value == 'console':
+                await connect_console()
+            else:
+                await connect_vm(state['current_vm'], vm_name(state['current_vm']))
 
         async def close_terminal_view():
             close_active_terminal()
+            set_console_src()
             state['current_vm'] = None
             terminal_pane.set_visibility(False)
             conversation_controls.set_visibility(True)
@@ -819,6 +925,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         def update_sidebar_view():
             has_vms = 'VMs' in (sidebar_select.value or [])
             alias_switch.set_visibility(has_vms)
+            ui.run_javascript(f'try {{ localStorage.setItem({sidebar_key}, '
+                              + json.dumps(json.dumps({'view': sidebar_select.value, 'aliases': alias_switch.value})) + ') } catch (_) {}')
             tree.props['nodes'] = hierarchy_nodes(
                 state.get('data', {}), mode=sidebar_select.value, show_aliases=alias_switch.value
             )
@@ -1871,6 +1979,25 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         sidebar_select.on_value_change(select_sidebar_view)
         alias_switch.on_value_change(lambda _: update_sidebar_view())
+        sidebar_key = json.dumps('dirigentenstab.sidebar.' + str(identity.get('userid', '')))
+
+        async def restore_sidebar():
+            try:
+                saved = json.loads(await ui.run_javascript(
+                    f'try {{ return localStorage.getItem({sidebar_key}) }} catch (_) {{ return null }}') or '{}')
+                raw_view = saved.get('view')
+                view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs'}]
+                        if isinstance(raw_view, list) else [])
+                alias_switch.set_value(saved.get('aliases') is True)
+                if view:
+                    sidebar_select.set_value(view)
+            except (ValueError, TypeError, AttributeError):
+                pass  # Corrupt or foreign value: keep defaults.
+            finally:
+                sidebar_select.enable()
+                alias_switch.enable()
+
+        ui.timer(0.01, lambda: protect(restore_sidebar), once=True)
         if ssh_key_button is not None:
             ssh_key_button.on_click(lambda: protect(lambda: open_dialog(open_ssh_key_dialog)))
         if providers_button is not None:

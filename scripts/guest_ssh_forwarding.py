@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Maintain scoped guest SSH and native security-group checks on routed guest egress."""
+"""Maintain scoped app SSH/CPVM access and native security-group checks on guest egress."""
 
 import argparse
+import ipaddress
 import json
 import re
 import shlex
 import subprocess
+import sys
 
 from network_config import load_network
 
@@ -25,18 +27,47 @@ def rules(bridge):
     ]
 
 
+def console_rules(bridge, call):
+    """Only native, active ConsoleProxy NICs may receive app HTTP/WebSocket traffic."""
+    try:
+        result = call('mysql', '--batch', '--skip-column-names', 'cloud', '-e',
+                      "SELECT n.ip4_address FROM nics n JOIN vm_instance v ON v.id=n.instance_id "
+                      "WHERE v.type='ConsoleProxy' AND v.removed IS NULL AND n.removed IS NULL "
+                      "AND n.ip4_address IS NOT NULL;")
+        addresses = {ipaddress.ip_address(line.strip()) for line in result.stdout.splitlines()}
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(f'CPVM discovery unavailable; removing app console exceptions: {error}', file=sys.stderr)
+        return []
+    network = ipaddress.ip_network(GUESTS)
+    desired = []
+    for address in sorted((ip for ip in addresses if ip.version == 4 and ip in network
+                           and ip not in (network.network_address, network.broadcast_address)), key=int):
+        target = str(address) + '/32'
+        tag = ['-m', 'comment', '--comment', TAG]
+        desired.extend([
+            ['-i', bridge, '-o', BRIDGE, '-s', APP, '-d', target, '-p', 'tcp',
+             '-m', 'multiport', '--dports', '80,8080', '-m', 'conntrack', '--ctstate',
+             'NEW,ESTABLISHED', *tag, '-j', 'ACCEPT'],
+            ['-i', BRIDGE, '-o', bridge, '-s', target, '-d', APP, '-p', 'tcp',
+             '-m', 'multiport', '--sports', '80,8080', '-m', 'conntrack', '--ctstate',
+             'ESTABLISHED', *tag, '-j', 'ACCEPT'],
+        ])
+    return desired
+
+
 def maintain_ssh(remove=False, run=subprocess.run):
     def call(*args, check=True):
         return run(args, check=check, capture_output=True, text=True, timeout=10)
     current = call('iptables', '-w', '-S', 'FORWARD').stdout.splitlines()
-    owned = [shlex.split(line)[2:] for line in current if TAG in shlex.split(line)]
+    current = [shlex.split(line)[2:] for line in current if line.startswith('-A FORWARD ')]
+    owned = [rule for rule in current if TAG in rule]
     desired = []
     if not remove:
         network = call('docker', 'network', 'inspect', 'dirigentenstab_management', check=False)
-        if network.returncode:
-            return
-        desired = rules('br-' + json.loads(network.stdout)[0]['Id'][:12])
-    if (desired and len(owned) == 2 and all(TAG in line for line in current[1:3]) and
+        if not network.returncode:
+            bridge = 'br-' + json.loads(network.stdout)[0]['Id'][:12]
+            desired = rules(bridge) + console_rules(bridge, call)
+    if (owned == desired and current[:len(desired)] == desired and
             all(call('iptables', '-w', '-C', 'FORWARD', *rule, check=False).returncode == 0 for rule in desired)):
         return
     for rule in owned:
