@@ -292,6 +292,17 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
         state = {'agent': None, 'conversation': None, 'busy': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}}
+        autoscroll_key = f'chat_autoscroll:{identity["userid"]}'
+        autoscroll_setting = service.store.one('SELECT value FROM platform_settings WHERE name=?', (autoscroll_key,))
+
+        async def save_autoscroll():
+            await actor()
+            service.store.execute(
+                'INSERT INTO platform_settings(name,value) VALUES(?,?) '
+                'ON CONFLICT(name) DO UPDATE SET value=excluded.value',
+                (autoscroll_key, 'true' if autoscroll.value else 'false'),
+            )
+
         agents = {row['id']: row for row in data.get('agents', [])}
         dashboard_url = service.dashboard_url(identity) if identity.get('type') == 1 else ''
         dashboard_links = []
@@ -406,6 +417,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 with ui.button('Settings', icon='settings').props('outline aria-haspopup="menu"').classes('w-full').mark('settings_button'):
                     with ui.menu().classes('bg-white p-2 min-w-[200px]').mark('settings_menu') as settings_menu:
                         with ui.column().classes('gap-1 p-0 w-full'):
+                            autoscroll = ui.switch('Chat autoscroll',
+                                value=not autoscroll_setting or autoscroll_setting['value'] != 'false',
+                                on_change=lambda: protect(save_autoscroll)).mark('chat_autoscroll')
                             ssh_key_button = ui.button('SSH key', icon='vpn_key').props('flat no-caps align=left').classes('w-full').mark('ssh_key_button')
                             if identity.get('type') == 1:
                                 providers_button = ui.button('Model providers', icon='settings').props('flat no-caps align=left').classes('w-full')
@@ -1151,7 +1165,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     await asyncio.sleep(0)
                     if client.is_deleted or generation != render_generation or state['conversation'] != restored['id']:
                         return
-            transcript_scroll.scroll_to(percent=1)
+            if autoscroll.value:
+                transcript_scroll.scroll_to(percent=1)
             state['activity_token'] = None
 
         escalation_rows = []
