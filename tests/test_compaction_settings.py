@@ -146,7 +146,7 @@ async def test_runtime_uses_selected_compactor_and_keeps_full_archive_across_tur
     original = [ModelRequest(parts=[UserPromptPart('Original task: ' + 'important facts ' * 1800)]),
                 ModelResponse(parts=[TextPart('Old completed work ' * 1000)]),
                 ModelRequest(parts=[UserPromptPart('Preserve resource R-123')]),
-                ModelResponse(parts=[TextPart('Recent result ' * 250)])]
+                ModelResponse(parts=[TextPart('Recent result ' * 100)])]
     store = service.store
     store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                   ('conversation', 'agent', 'owner', 'Long task', 1,
