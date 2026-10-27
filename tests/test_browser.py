@@ -376,6 +376,9 @@ async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(bro
         await link.wait_for()
         await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Platform settings', exact=True).click()
+        limit = page.get_by_label('Open escalation requests per agent', exact=True)
+        await playwright.expect(limit).to_have_value('3')
+        await limit.fill('2')
         await page.get_by_label('CloudStack Dashboard URL', exact=True).fill('https://another.tailnet.invalid/client')
         await page.get_by_role('button', name='Save', exact=True).click()
         await page.get_by_role('dialog').wait_for(state='hidden')
@@ -385,6 +388,9 @@ async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(bro
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await link.wait_for()
         assert await link.get_attribute('href') == 'https://another.tailnet.invalid/client/'
+        await page.get_by_role('button', name='Settings', exact=True).click()
+        await page.get_by_role('button', name='Platform settings', exact=True).click()
+        await playwright.expect(limit).to_have_value('2')
         await browser.close()
 
 
@@ -975,60 +981,90 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         await browser.close()
 
 
-async def test_compute_offering_requests_mobile_approve_deny_and_inheritance(browser_app):
+@pytest.mark.parametrize('width', [390, 1440])
+async def test_escalation_requests_review_approve_dismiss_and_inheritance(browser_app, width):
     from dirigentenstab.limits import APP_ROOT_AGENT
     from dirigentenstab.store import Store
 
     url, state = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
-        context = await browser.new_context(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': 844})
         page = await context.new_page()
         await login(page, url)
         await select_agent(page, 'Research Admin')
-        requests = page.get_by_role('button', name='Compute offering requests: 0 pending', exact=True)
+        requests = page.get_by_role('button', name='Escalation requests: 0 pending', exact=True)
         await requests.wait_for()
         assert await requests.evaluate("el => getComputedStyle(el).animationName") == 'none'
         assert await requests.evaluate("el => getComputedStyle(el).color") == 'rgb(120, 113, 108)'
-        await page.get_by_label('Message', exact=True).fill('offering fixture')
+        await page.get_by_label('Message', exact=True).fill('escalation fixture')
         await page.get_by_role('button', name='Send', exact=True).click()
-        pending = page.get_by_role('button', name='Compute offering requests: 1 pending', exact=True)
+        pending = page.get_by_role('button', name='Escalation requests: 1 pending', exact=True)
         await pending.wait_for()
-        assert await pending.evaluate("el => getComputedStyle(el).animationName") == 'offering-pulse'
+        assert not (state / 'escalation-executed.json').exists()
+        assert await pending.evaluate("el => getComputedStyle(el).animationName") == 'escalation-pulse'
         await page.emulate_media(reduced_motion='reduce')
         assert await pending.evaluate("el => getComputedStyle(el).animationName") == 'none'
         await pending.click()
-        await page.get_by_role('dialog').get_by_text('Browser compute', exact=False).wait_for()
+        request_list = page.get_by_role('dialog')
+        summary = request_list.locator('.escalation-summary').first
+        await summary.wait_for()
+        assert await request_list.get_by_role('button', name='Approve', exact=True).count() == 0
+        assert await request_list.get_by_role('button', name='Dismiss', exact=True).count() == 0
+        assert await request_list.get_by_text('updateVirtualMachine', exact=True).count() == 0
+        summary = request_list.locator('.escalation-summary').first
+        lines = summary.locator('.truncate')
+        assert await lines.count() == 2
+        assert await lines.evaluate_all("els => els.every(el => getComputedStyle(el).whiteSpace === 'nowrap' && getComputedStyle(el).textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth)")
+        assert await lines.first.evaluate("el => Number(getComputedStyle(el).fontWeight) >= 700")
+        assert await lines.evaluate_all("els => parseFloat(getComputedStyle(els[0]).fontSize) > parseFloat(getComputedStyle(els[1]).fontSize)")
+        await summary.focus()
+        await summary.press('Enter')
+        dialog = page.get_by_role('dialog').last
+        await dialog.get_by_text('Goal: Rename the research VM so the owner can identify the production analysis workspace', exact=True).wait_for()
+        await dialog.get_by_text('Permission needed: My current CloudStack account cannot update this VM because its native role does not allow updateVirtualMachine', exact=True).wait_for()
+        await dialog.get_by_text('updateVirtualMachine', exact=True).wait_for()
+        assert await dialog.get_by_text('Goal: Rename the research VM so the owner can identify the production analysis workspace', exact=True).evaluate(
+            "el => getComputedStyle(el).whiteSpace === 'pre-wrap'")
+        assert json.loads(await dialog.locator('.font-mono.text-xs').text_content()) == {
+            'id': '00000000-0000-0000-0000-000000000004', 'name': 'Research revised'}
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
-        await page.screenshot(path=str(state / 'compute-offering-pending-mobile.png'), full_page=True, animations='disabled')
+        await page.screenshot(path=str(state / 'escalation-pending-mobile.png'), full_page=True, animations='disabled')
         await page.get_by_role('button', name='Approve', exact=True).click()
         await page.get_by_text('Approved', exact=True).wait_for()
-        created = json.loads((state / 'offering-created.json').read_text())
-        assert created['domainid'] == '00000000-0000-0000-0000-000000000002'
+        executed = json.loads((state / 'escalation-executed.json').read_text())
+        assert executed == {'command': 'updateVirtualMachine', 'params': {
+            'id': '00000000-0000-0000-0000-000000000004', 'name': 'Research revised'}}
+        await dialog.get_by_role('button', name='Back to requests', exact=True).click()
         await page.get_by_role('button', name='Close', exact=True).click()
-        await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
+        await page.get_by_text('Escalation result available.', exact=True).wait_for()
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await select_agent(page, 'Research Admin')
-        await page.get_by_text('Compute offering approved and now available.', exact=True).wait_for()
+        await page.get_by_text('Escalation result available.', exact=True).wait_for()
         await page.get_by_role('button', name='New conversation', exact=True).click()
-        await page.get_by_label('Message', exact=True).fill('offering fixture')
+        await page.get_by_label('Message', exact=True).fill('escalation fixture')
         await page.get_by_role('button', name='Send', exact=True).click()
         await pending.wait_for()
         await pending.click()
-        await page.get_by_role('button', name='Deny', exact=True).click()
-        await page.get_by_text('Dismissed', exact=True).wait_for()
+        summary = page.get_by_role('dialog').locator('.escalation-summary').first
+        await summary.focus()
+        await summary.press('Space')
+        dialog = page.get_by_role('dialog').last
+        await dialog.get_by_role('button', name='Dismiss', exact=True).click()
+        await dialog.get_by_text('Dismissed', exact=True).wait_for()
+        await dialog.get_by_role('button', name='Back to requests', exact=True).click()
         await page.get_by_role('button', name='Close', exact=True).click()
-        await page.get_by_text('Compute offering request declined', exact=True).wait_for()
+        await page.get_by_text('Escalation request declined', exact=True).wait_for()
         store = Store(str(state / 'browser.db'), str(state / 'master'))
-        declined = store.one("SELECT * FROM compute_offering_requests WHERE status='deferred'")
+        declined = store.one("SELECT * FROM escalation_requests WHERE status='deferred'")
         assert not declined['delivery_run_id']
-        store.execute('UPDATE agents SET compute_offering_requests_enabled=0 WHERE id=?', (APP_ROOT_AGENT,))
+        store.execute('UPDATE agents SET escalation_requests_enabled=0 WHERE id=?', (APP_ROOT_AGENT,))
         await open_configuration(page)
-        toggle = page.get_by_role('checkbox', name='Request compute offerings', exact=True)
+        toggle = page.get_by_role('checkbox', name='Request permission escalation', exact=True)
         await playwright.expect(toggle).to_be_disabled()
         await playwright.expect(toggle).not_to_be_checked()
-        assert store.one("SELECT compute_offering_requests_enabled FROM agents WHERE id='research'")['compute_offering_requests_enabled'] == 1
+        assert store.one("SELECT escalation_requests_enabled FROM agents WHERE id='research'")['escalation_requests_enabled'] == 1
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
-        await page.screenshot(path=str(state / 'compute-offering-mobile.png'), full_page=True, animations='disabled')
+        await page.screenshot(path=str(state / 'escalation-mobile.png'), full_page=True, animations='disabled')
         await browser.close()

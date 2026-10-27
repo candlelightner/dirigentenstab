@@ -27,10 +27,13 @@ class AgentCapabilities:
     async def subgroup_capability(self, agent_id):
         return True
 
-    async def list_compute_offering_requests(self, identity):
+    def escalation_request_limit(self):
+        return 3
+
+    async def list_escalation_requests(self, identity):
         return []
 
-    async def compute_offering_access(self, agent):
+    async def escalation_access(self, agent):
         return {'selected': True, 'allowed': True, 'enabled': True}
 
     async def owner_ssh_key_access(self, agent):
@@ -926,3 +929,11 @@ def test_history_preserves_real_user_beside_merged_offering_notification():
     ]}]}
     assert list(history_parts(history)) == [
         ('human', 'Continue with my VM'), ('notice', 'Compute offering approved and now available.')]
+
+
+def test_history_displays_generic_escalation_notice_without_machine_instructions():
+    history = {'messages': [{'parts': [
+        {'part_kind': 'system-prompt', 'dynamic_ref': 'escalation_decision', 'content': 'private result'},
+        {'part_kind': 'user-prompt', 'content': '<system>[System notification: escalation decision] private result</system>'},
+    ]}]}
+    assert list(history_parts(history)) == [('notice', 'Escalation result available.')] * 2

@@ -22,7 +22,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 17
+    assert reopened.one('PRAGMA user_version')['user_version'] == 18
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -41,8 +41,8 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
-    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
-    store.execute('DROP TABLE compute_offering_requests')
+    store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
+    store.execute('DROP TABLE escalation_requests')
     store.execute('PRAGMA user_version=9')
     runtime = store.seal({'id': 'runtime-key-id', 'apikey': 'runtime'})
     provisioning = store.seal({'id': 'provisioning-key-id', 'apikey': 'provision'})
@@ -84,8 +84,8 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
-    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
-    store.execute('DROP TABLE compute_offering_requests')
+    store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
+    store.execute('DROP TABLE escalation_requests')
     store.execute('PRAGMA user_version=11')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
@@ -113,8 +113,8 @@ def test_thinking_migration_preserves_credentials_and_conversations_with_model_d
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
-    store.execute('ALTER TABLE agents DROP COLUMN compute_offering_requests_enabled')
-    store.execute('DROP TABLE compute_offering_requests')
+    store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
+    store.execute('DROP TABLE escalation_requests')
     store.execute('PRAGMA user_version=12')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
@@ -237,3 +237,46 @@ async def test_configured_login_lifetime_matches_cookie_and_server_expiration(st
         await auth.identity(token)
     with pytest.raises(PermissionError, match='Invalid CSRF token'):
         auth.csrf(token, session['csrf'])
+
+
+def test_escalation_migration_preserves_single_queue_ciphertext_decisions_and_history(store):
+    # Recreate the actual deployed schema17, with encrypted records and disabled access.
+    for column in ('command', 'description', 'reason'):
+        store.execute('ALTER TABLE escalation_requests DROP COLUMN ' + column)
+    store.execute('ALTER TABLE escalation_requests RENAME TO compute_offering_requests')
+    store.execute('ALTER TABLE agents RENAME COLUMN escalation_requests_enabled TO compute_offering_requests_enabled')
+    store.execute('PRAGMA user_version=17')
+    credentials, params = store.seal({'apikey': 'legacy-key'}), store.seal({'name': 'Legacy', 'domainid': 'owned'})
+    result = store.seal({'serviceoffering': {'id': 'created-offering'}})
+    history = store.seal([{'kind': 'request', 'parts': [{'part_kind': 'system-prompt',
+                           'content': 'Saved legacy notice', 'dynamic_ref': 'compute_offering_decision'}]}])
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,compute_offering_requests_enabled) '
+                  'VALUES(?,?,?,?,?,?,0)', ('agent', 'Agent', 'owned', 'account', 'user', credentials))
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,compute_offering_requests_enabled) '
+                  'VALUES(?,?,?,?,?,?,1)', ('child', 'Child', 'owned-child', 'child-account', 'child-user', credentials))
+    store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                  ('conversation', 'agent', 'owner', 'History', 1, history))
+    store.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
+                  ('run', 'conversation', 'completed', 'agent', 1, 1, store.seal([])))
+    statuses = ('pending', 'applying', 'approved', 'deferred', 'uncertain', 'failed')
+    for status in statuses:
+        store.execute('INSERT INTO compute_offering_requests '
+                      '(id,agent_id,conversation_id,run_id,call_id,human_id,params,result,status,created,updated,delivery_run_id) '
+                      'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                      (status, 'agent', 'conversation', 'run', status, 'owner', params, result, status, 1, 2,
+                       'run' if status == 'approved' else None))
+    reopened = Store(str(store.path), str(store.path.parent / 'master'))
+    assert not reopened.one("SELECT name FROM sqlite_master WHERE name='compute_offering_requests'")
+    assert {row['id']: row['escalation_requests_enabled'] for row in reopened.all(
+        'SELECT id,escalation_requests_enabled FROM agents')} == {'agent': 0, 'child': 1}
+    assert reopened.one("SELECT value FROM platform_settings WHERE name='escalation_request_limit'")['value'] == '3'
+    assert reopened.one('SELECT credentials FROM agents')['credentials'] == credentials
+    assert reopened.one('SELECT messages FROM conversations')['messages'] == history
+    rows = reopened.all('SELECT * FROM escalation_requests ORDER BY id')
+    assert {row['status'] for row in rows} == set(statuses)
+    for row in rows:
+        assert row['params'] == params and row['result'] == result
+        assert row['command'] == 'createServiceOffering'
+        assert row['call_id'] == row['status'] and row['created'] == 1 and row['updated'] == 2
+        assert row['description'] == 'Legacy compute offering request'
+        assert row['delivery_run_id'] == ('run' if row['status'] == 'approved' else None)

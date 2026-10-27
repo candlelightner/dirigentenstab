@@ -101,20 +101,16 @@ def service(tmp_path):
                 raise PermissionError('not authorized')
             return await self.agent(agent_id)
 
-        async def compute_offering_access(self, agent):
-            return {'enabled': bool(agent['compute_offering_requests_enabled'])}
+        async def escalation_access(self, agent):
+            return {'enabled': bool(agent['escalation_requests_enabled'])}
 
-        async def request_compute_offering(self, agent_id, params, **context):
+        async def request_escalation(self, agent_id, description, reason, command, params, **context):
             from dirigentenstab.service import Service
-            return await Service.request_compute_offering(self, agent_id, params, **context)
+            return await Service.request_escalation(self, agent_id, description, reason, command, params, **context)
 
-        async def _validate_offering_gpu(self, agent_id, params, run_id):
+        def _escalation_request(self, row):
             from dirigentenstab.service import Service
-            return await Service._validate_offering_gpu(self, agent_id, params, run_id)
-
-        def _offering_request(self, row):
-            from dirigentenstab.service import Service
-            return Service._offering_request(self, row)
+            return Service._escalation_request(self, row)
 
         async def context(self, agent):
             return {'name': agent['name'], 'domain_id': agent['domain_id']}
@@ -1279,61 +1275,63 @@ async def test_history_decryption_does_not_block_event_loop(service, monkeypatch
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def offering_request_for_run(service, run, status='approved'):
+async def escalation_request_for_run(service, run, status='approved'):
     import time
     import uuid
     request_id = str(uuid.uuid4())
-    service.store.execute('INSERT INTO compute_offering_requests '
-                          '(id,agent_id,conversation_id,run_id,call_id,human_id,params,result,status,created,updated) '
-                          'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+    service.store.execute('INSERT INTO escalation_requests '
+                          '(id,agent_id,conversation_id,run_id,call_id,human_id,params,result,status,created,updated,command,description,reason) '
+                          'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                           (request_id, 'parent', run['conversation_id'], run['operation_id'], 'offering-request',
                            'human', service.store.seal({'name': 'Requested offering'}),
-                           service.store.seal({'serviceoffering': {'id': 'offering-id'}}), status, time.time(), time.time()))
+                           service.store.seal({'vgpuprofile': {'id': 'profile-id'}}), status, time.time(), time.time(),
+                           'createVgpuProfile', 'Register GPU profile', 'Native identity cannot register profiles'))
     return request_id
 
 
-async def test_compute_offering_tool_queues_then_agent_can_pause_without_holding_execution(service, monkeypatch):
+async def test_escalation_tool_queues_then_agent_can_pause_without_holding_execution(service, monkeypatch):
     async def model(messages, info):
         tools = {tool.name: tool for tool in info.function_tools}
-        assert 'Finish other work' in tools['request_compute_offering'].description
+        assert 'Finish other work' in tools['request_escalation'].description
         if messages[-1].parts[0].part_kind == 'tool-return':
             result = messages[-1].parts[0].content
             assert result['status'] == 'pending' and result['request_id']
             yield {0: DeltaToolCall(name='pause_work', json_args='{"reason":"Waiting for offering"}', tool_call_id='pause')}
         else:
-            yield {0: DeltaToolCall(name='request_compute_offering', json_args='{"params":{"name":"Requested offering"}}', tool_call_id='request')}
+            yield {0: DeltaToolCall(name='request_escalation', json_args='{"description":"Register GPU profile","reason":"Native identity cannot register profiles","command":"createVgpuProfile","params":{"name":"Requested offering"}}', tool_call_id='request')}
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     manager = runtime.Runtime(service)
     result = await manager.chat({'userid': 'human'}, 'parent', None, 'Need a compute offering')
     assert result['status'] == 'interrupted' and not manager.active
-    request = service.store.one('SELECT * FROM compute_offering_requests')
+    request = service.store.one('SELECT * FROM escalation_requests')
     assert request['status'] == 'pending' and request['run_id'] == result['operation_id']
-    assert service.store.open(request['params'])['domainid'] == 'parent-domain'
+    assert service.store.open(request['params']) == {'name': 'Requested offering'}
+    assert request['command'] == 'createVgpuProfile'
     assert manager.slots._value == 4
 
 
 @pytest.mark.parametrize('disabled_before_dispatch', [False, True])
-async def test_compute_offering_tool_visibility_and_service_recheck(service, monkeypatch, disabled_before_dispatch):
+async def test_escalation_tool_visibility_and_service_recheck(service, monkeypatch, disabled_before_dispatch):
     if not disabled_before_dispatch:
-        service.store.execute("UPDATE agents SET compute_offering_requests_enabled=0 WHERE id='parent'")
+        service.store.execute("UPDATE agents SET escalation_requests_enabled=0 WHERE id='parent'")
     async def model(messages, info):
         names = {tool.name for tool in info.function_tools}
         if not disabled_before_dispatch:
-            assert 'request_compute_offering' not in names
+            assert 'request_escalation' not in names
             yield 'Disabled'
         elif messages[-1].parts[0].part_kind == 'tool-return':
             assert messages[-1].parts[0].content['category'] == 'authorization'
             yield 'Access changed'
         else:
-            assert 'request_compute_offering' in names
-            service.store.execute("UPDATE agents SET compute_offering_requests_enabled=0 WHERE id='parent'")
-            yield {0: DeltaToolCall(name='request_compute_offering', json_args='{"params":{"name":"Requested offering"}}', tool_call_id='request')}
+            assert 'request_escalation' in names
+            service.store.execute("UPDATE agents SET escalation_requests_enabled=0 WHERE id='parent'")
+            yield {0: DeltaToolCall(name='request_escalation', json_args='{"description":"Register GPU profile","reason":"Native identity cannot register profiles","command":"createVgpuProfile","params":{"name":"Requested offering"}}', tool_call_id='request')}
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Need an offering')
-    assert not service.store.all('SELECT * FROM compute_offering_requests')
+    assert not service.store.all('SELECT * FROM escalation_requests')
 
 
-async def test_approved_offering_delivery_is_atomic_restart_safe_and_preserves_recovery(service, monkeypatch):
+async def test_approved_escalation_delivery_is_atomic_restart_safe_and_preserves_recovery(service, monkeypatch):
     import asyncio
     manager = runtime.Runtime(service)
     manager.slots = asyncio.Semaphore(0)
@@ -1342,17 +1340,17 @@ async def test_approved_offering_delivery_is_atomic_restart_safe_and_preserves_r
     checkpoint = {'reason': 'agent_paused', 'mutations': {'saved': {'status': 'uncertain', 'tool': 'execute'}}}
     service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?',
                           (service.store.seal(checkpoint), original['operation_id']))
-    request_id = await offering_request_for_run(service, original)
+    request_id = await escalation_request_for_run(service, original)
     # A crash after commit but before launch must resume the same accepted run exactly once.
     monkeypatch.setattr(manager, '_launch', lambda *args: (_ for _ in ()).throw(RuntimeError('Process interrupted')))
-    await manager.deliver_offering_decisions()
-    delivered = service.store.one('SELECT delivery_run_id FROM compute_offering_requests WHERE id=?', (request_id,))['delivery_run_id']
+    await manager.deliver_escalation_decisions()
+    delivered = service.store.one('SELECT delivery_run_id FROM escalation_requests WHERE id=?', (request_id,))['delivery_run_id']
     assert delivered and len(service.store.all('SELECT * FROM chat_runs')) == 2
     calls = []
     async def model(messages, info):
         notifications = [part for message in messages for part in message.parts
-                         if part.part_kind == 'system-prompt' and part.dynamic_ref == 'compute_offering_decision']
-        assert len(notifications) == 1 and 'offering-id' in notifications[0].content
+                         if part.part_kind == 'system-prompt' and part.dynamic_ref == 'escalation_decision']
+        assert len(notifications) == 1 and 'profile-id' in notifications[0].content
         assert 'saved' in info.instructions and 'uncertain' in info.instructions
         calls.append(messages)
         yield 'Offering available'
@@ -1360,33 +1358,33 @@ async def test_approved_offering_delivery_is_atomic_restart_safe_and_preserves_r
     restarted = runtime.Runtime(service)
     await restarted.start()
     await asyncio.gather(*list(restarted.active.values()))
-    await restarted.deliver_offering_decisions()
+    await restarted.deliver_escalation_decisions()
     assert len(calls) == 1 and len(service.store.all('SELECT * FROM chat_runs')) == 2
-    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests')['delivery_run_id'] == delivered
+    assert service.store.one('SELECT delivery_run_id FROM escalation_requests')['delivery_run_id'] == delivered
 
 
-async def test_offering_denial_and_explicit_stop_never_invoke_agent(service):
+async def test_escalation_denial_and_explicit_stop_never_invoke_agent(service):
     import asyncio
     manager = runtime.Runtime(service)
     manager.slots = asyncio.Semaphore(0)
     stopped = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
     await manager.stop({'userid': 'human'}, stopped['operation_id'])
-    request_id = await offering_request_for_run(service, stopped, 'deferred')
+    request_id = await escalation_request_for_run(service, stopped, 'deferred')
     before = service.store.one('SELECT messages FROM conversations')['messages']
-    await manager.deliver_offering_decisions()
+    await manager.deliver_escalation_decisions()
     assert service.store.one('SELECT messages FROM conversations')['messages'] == before
-    service.store.execute("UPDATE compute_offering_requests SET status='approved' WHERE id=?", (request_id,))
+    service.store.execute("UPDATE escalation_requests SET status='approved' WHERE id=?", (request_id,))
     restarted = runtime.Runtime(service)
     await restarted.start()
     assert not restarted.active and len(service.store.all('SELECT * FROM chat_runs')) == 1
-    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests')['delivery_run_id'] is None
+    assert service.store.one('SELECT delivery_run_id FROM escalation_requests')['delivery_run_id'] is None
 
 
-async def test_offering_approval_waits_for_current_work_and_preserves_other_conversations(service, monkeypatch):
+async def test_escalation_approval_waits_for_current_work_and_preserves_other_conversations(service, monkeypatch):
     import asyncio
     entered, release, notified = asyncio.Event(), asyncio.Event(), asyncio.Event()
     async def model(messages, info):
-        if any(message.metadata and message.metadata.get('system_notification') == 'compute_offering_decision'
+        if any(message.metadata and message.metadata.get('system_notification') == 'escalation_decision'
                for message in messages):
             notified.set()
             yield 'Offering available'
@@ -1399,8 +1397,8 @@ async def test_offering_approval_waits_for_current_work_and_preserves_other_conv
     first = await manager.submit({'userid': 'human'}, 'parent', None, 'Work first')
     await asyncio.wait_for(entered.wait(), 2)
     other = await manager.submit({'userid': 'human'}, 'child', None, 'Unrelated work')
-    await offering_request_for_run(service, first)
-    await manager.deliver_offering_decisions()
+    await escalation_request_for_run(service, first)
+    await manager.deliver_escalation_decisions()
     assert len(service.store.all('SELECT * FROM chat_runs')) == 2
     assert other['operation_id'] in manager.active and not notified.is_set()
     release.set()
@@ -1411,7 +1409,7 @@ async def test_offering_approval_waits_for_current_work_and_preserves_other_conv
     assert len(rows) == 3 and sum(row['agent_id'] == 'child' for row in rows) == 1
 
 
-async def test_offering_delivery_rolls_back_history_and_marker_together(service, monkeypatch):
+async def test_escalation_delivery_rolls_back_history_and_marker_together(service, monkeypatch):
     import asyncio
     manager = runtime.Runtime(service)
     manager.slots = asyncio.Semaphore(0)
@@ -1419,25 +1417,79 @@ async def test_offering_delivery_rolls_back_history_and_marker_together(service,
     await manager.stop({'userid': 'human'}, original['operation_id'])
     service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?',
                           (service.store.seal({'reason': 'agent_paused'}), original['operation_id']))
-    request_id = await offering_request_for_run(service, original)
+    request_id = await escalation_request_for_run(service, original)
     before = service.store.one('SELECT messages FROM conversations')['messages']
     def fail_insert(*args):
         raise RuntimeError('Database write interrupted')
     monkeypatch.setattr(manager, '_new_run', fail_insert)
-    await manager.deliver_offering_decisions()
+    await manager.deliver_escalation_decisions()
     assert service.store.one('SELECT messages FROM conversations')['messages'] == before
-    assert service.store.one('SELECT delivery_run_id FROM compute_offering_requests WHERE id=?', (request_id,))['delivery_run_id'] is None
+    assert service.store.one('SELECT delivery_run_id FROM escalation_requests WHERE id=?', (request_id,))['delivery_run_id'] is None
     assert len(service.store.all('SELECT * FROM chat_runs')) == 1
 
 
-async def test_offering_restart_marks_inflight_creation_uncertain_without_replay(service):
+async def test_escalation_restart_marks_inflight_creation_uncertain_without_replay(service):
     import asyncio
     manager = runtime.Runtime(service)
     manager.slots = asyncio.Semaphore(0)
     original = await manager.submit({'userid': 'human'}, 'parent', None, 'Need an offering')
     await manager.stop({'userid': 'human'}, original['operation_id'])
-    await offering_request_for_run(service, original, 'applying')
+    await escalation_request_for_run(service, original, 'applying')
     restarted = runtime.Runtime(service)
     await restarted.start()
     assert not restarted.active
-    assert service.store.one('SELECT status FROM compute_offering_requests')['status'] == 'uncertain'
+    assert service.store.one('SELECT status FROM escalation_requests')['status'] == 'uncertain'
+
+
+@pytest.mark.parametrize('status', ['approved', 'failed', 'uncertain'])
+async def test_escalation_outcomes_are_bounded_redacted_and_delivered_once(service, monkeypatch, status):
+    import asyncio
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    original = await manager.submit({'userid': 'human'}, 'parent', None, 'Need privileged action')
+    await manager.stop({'userid': 'human'}, original['operation_id'])
+    service.store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?',
+                          (service.store.seal({'reason': 'agent_paused'}), original['operation_id']))
+    request_id = await escalation_request_for_run(service, original, status)
+    result = {'jobid': 'saved-job', 'output': 'SUPERSECRET ' + 'x' * 3000}
+    service.store.execute('UPDATE escalation_requests SET result=? WHERE id=?',
+                          (service.store.seal(result), request_id))
+    launched = []
+    monkeypatch.setattr(manager, '_launch', lambda run: launched.append(run))
+    await manager.deliver_escalation_decisions()
+    await manager.deliver_escalation_decisions()
+    assert len(launched) == 1 and not service.executions
+    history = service.store.open(service.store.one('SELECT messages FROM conversations')['messages'])
+    notice = history[-1]['parts'][0]
+    assert notice['part_kind'] == 'system-prompt' and notice['dynamic_ref'] == 'escalation_decision'
+    facts = json.loads(notice['content'].split('instructions:\n', 1)[1])
+    assert facts['status'] == status and facts['result']['truncated']
+    assert len(facts['result']['preview']) == service.settings.max_output
+    assert 'SUPERSECRET' not in notice['content'] and '[redacted]' in facts['result']['preview']
+    assert service.store.open(service.store.one('SELECT result FROM escalation_requests')['result']) == result
+    if status != 'approved':
+        assert 'command completed' not in notice['content']
+
+
+async def test_escalation_queue_limit_is_clear_to_requesting_agent(service, monkeypatch):
+    async def model(messages, info):
+        if messages[-1].parts[0].part_kind == 'tool-return':
+            result = messages[-1].parts[0].content
+            assert result['category'] == 'escalation' and 'limit 3' in result['error']
+            yield 'Waiting for existing decisions'
+        else:
+            run_id = runtime.CURRENT_RUN.get()
+            run = service.store.one('SELECT conversation_id FROM chat_runs WHERE id=?', (run_id,))
+            for index in range(3):
+                service.store.execute('INSERT INTO escalation_requests '
+                                      '(id,agent_id,conversation_id,run_id,call_id,human_id,params,status,created,updated) '
+                                      "VALUES(?,?,?,?,?,?,?,'pending',0,0)",
+                                      (f'queued-{index}', 'parent', run['conversation_id'], run_id, f'queued-{index}',
+                                       'human', service.store.seal({})))
+            yield {0: DeltaToolCall(name='request_escalation', json_args=json.dumps({
+                'description': 'Register profile', 'reason': 'API permission denied',
+                'command': 'createVgpuProfile', 'params': {'name': 'GRID P40-12Q'}}), tool_call_id='over-limit')}
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Need a privileged action')
+    assert result['output'] == 'Waiting for existing decisions'
+    assert len(service.store.all('SELECT * FROM escalation_requests')) == 3

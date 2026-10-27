@@ -51,34 +51,44 @@ users. There is no new hub account or registration system.
 - Native permission changes govern subsequent actions; agent autonomy and
   system prompts do not override them.
 
-## Compute offering requests
+## Owner-approved escalation
 
-- Agents create CPU and permitted mediated GPU offerings directly with
-  `execute_api` and native `createServiceOffering` when their own CloudStack
-  authority permits it. The request tool is optional owner assistance when
-  owner action is needed; it does not replace or restrict native creation.
+- Agents use native CloudStack operations through their own identity whenever
+  permitted. When their current native permissions prevent a required action,
+  `request_escalation` queues a short goal, a short explanation of that limitation,
+  and the exact native command and parameters for the human owner's review.
+  This covers arbitrary native actions, including registering a GPU profile;
+  it is not an offering-specific provisioning workflow.
+- Every agent has this tool enabled by default. The owner or an ancestor can
+  disable it; inherited disabling immediately blocks descendants while retaining
+  their individual selections. This setting governs requesting assistance, not
+  the agent's native CloudStack authority.
+- A global platform setting limits open escalation requests per agent across all
+  conversations, defaulting to three. Pending and applying requests occupy slots;
+  repeated delivery of the same tool call does not consume another slot. Finished
+  or dismissed requests release their slots. Enforce the count and insertion atomically.
 - Requests are asynchronous. Agents finish other work before using `pause_work`
-  when they need to wait for an offering; calling the tool does not pause them.
-- Every agent can request a native CloudStack compute offering by default. The
-  owner or an ancestor can disable this tool; disabling any ancestor blocks all
-  descendants immediately while preserving their individual selections.
-- The tool accepts native `createServiceOffering` parameters and durably queues
-  the request for the human owner's review. Requests do not borrow administrator
-  credentials or directly create offerings.
-- Approval creates the requested offering through the owner's current native
-  CloudStack session, scoped to the requesting agent's domain. Native CloudStack
-  authority still applies. Approval does not resize or create a VM.
-- Denial dismisses the request without changing infrastructure or invoking the
-  agent. Its originating chat shows only a centered UI note: “Compute offering
-  request declined”. Approved offerings notify the requesting agent that the
-  offering is available. Durable decisions and notifications survive application
-  restarts. Uncertain creation outcomes are inspected rather than submitted again.
-- Agents with existing mediated GPU permission may request native vGPU-profile
-  offerings. Validate their current inherited GPU policy and native quota both
-  when queuing and approving. No physical GPU passthrough or legacy GPU details
-  bypass is allowed, and requesting an offering does not mutate host devices.
-- A top-right header icon opens requests on mobile and desktop. Pending requests
-  pulse between orange and red; the idle icon is gray.
+  if they need to wait. A request does not execute the command or pause the agent.
+- Explicit approval executes only the reviewed command and unchanged parameters
+  through the owner's current native platform-administrator session. Validate
+  against that administrator's native API metadata; do not inject a domain or
+  change the agent's persistent permissions. Reuse the existing native API
+  execution and asynchronous-job handling. This path does not execute host
+  commands or bypass the GPU controller for host-device operations.
+- Keep one durable queue. Migrate existing compute-offering requests as explicit
+  `createServiceOffering` commands, preserving their parameters, decisions,
+  results, history and notifications. Persist submitted asynchronous job IDs
+  before waiting. An uncertain outcome must never silently replay a command.
+- Deliver approved, failed and uncertain results to the originating agent once,
+  after its current conversation finishes or pauses. A stopped conversation must
+  not restart because a result arrived. Results are clearly identified system
+  notifications, not owner-authored messages.
+- Dismissal invokes no agent and changes no infrastructure. Its originating chat
+  shows only a centered informational note. The top-right icon opens a compact
+  list with the goal and reason on two ellipsized lines; selecting a request opens
+  a separate full-text popup with the exact command and parameters. Approve and
+  Dismiss controls appear only in that detail popup. Pending requests pulse
+  orange/red; the idle icon is gray.
 
 ## Autonomous execution and conversations
 

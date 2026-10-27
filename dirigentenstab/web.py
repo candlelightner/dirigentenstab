@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import math
 import os
 
 import httpx
@@ -91,13 +92,16 @@ def history_parts(history):
     for message in history.get('messages', []):
         for part in message.get('parts', []):
             kind = part.get('part_kind')
-            if kind == 'user-prompt' and str(part.get('content', '')).startswith(
-                    '<system>[System notification: compute offering decision]'):
+            if (kind == 'user-prompt' and str(part.get('content', '')).startswith(
+                    '<system>[System notification: escalation decision]')
+                    or kind == 'system-prompt' and part.get('dynamic_ref') == 'escalation_decision'):
+                yield 'notice', 'Escalation result available.'
+            elif (kind == 'user-prompt' and str(part.get('content', '')).startswith(
+                    '<system>[System notification: compute offering decision]')
+                    or kind == 'system-prompt' and part.get('dynamic_ref') == 'compute_offering_decision'):
                 yield 'notice', 'Compute offering approved and now available.'
             elif kind in {'user-prompt', 'text'}:
                 yield 'human' if kind == 'user-prompt' else 'agent', str(part.get('content', ''))
-            elif kind == 'system-prompt' and part.get('dynamic_ref') == 'compute_offering_decision':
-                yield 'notice', 'Compute offering approved and now available.'
             elif kind in {'tool-call', 'tool-return'}:
                 event_type = 'tool_call' if kind == 'tool-call' else 'tool_result'
                 key = (event_type, part.get('tool_call_id'))
@@ -213,9 +217,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             if identity.get('type') == 1:
                 dashboard_link('dashboard-header text-teal-900')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
-            offering_button = ui.button(icon='approval', color=None, on_click=lambda: protect(open_offerings)).props(
-                'flat round aria-label="Compute offering requests: 0 pending"').classes('offering-requests').mark('offering_requests')
-            offering_button.set_visibility(identity.get('type') == 1)
+            escalation_button = ui.button(icon='approval', color=None, on_click=lambda: protect(open_escalations)).props(
+                'flat round aria-label="Escalation requests: 0 pending"').classes('escalation-requests').mark('escalation_requests')
+            escalation_button.set_visibility(identity.get('type') == 1)
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
@@ -223,10 +227,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .agent-details-toggle{font-size:20px;padding:0 4px}
             .agent-details-toggle .q-btn__content{justify-content:space-between;flex-wrap:nowrap}
             .agent-details-toggle .q-btn__content>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-            .offering-requests{color:#78716c;flex-shrink:0}
-            .offering-requests.pending{animation:offering-pulse 2s ease-in-out infinite alternate}
-            @keyframes offering-pulse{from{color:#ea580c}to{color:#dc2626}}
-            @media(prefers-reduced-motion:reduce){.offering-requests.pending{animation:none;color:#ea580c}}
+            .escalation-summary .q-btn__content{display:block;width:100%;min-width:0;text-align:left}
+            .escalation-requests{color:#78716c;flex-shrink:0}
+            .escalation-requests.pending{animation:escalation-pulse 2s ease-in-out infinite alternate}
+            @keyframes escalation-pulse{from{color:#ea580c}to{color:#dc2626}}
+            @media(prefers-reduced-motion:reduce){.escalation-requests.pending{animation:none;color:#ea580c}}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
@@ -611,8 +616,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             sync_composer()
             sync_run_details()
             parts = list(history_parts(restored))
-            parts.extend(('notice', 'Compute offering request declined') for _ in service.store.all(
-                "SELECT id FROM compute_offering_requests WHERE conversation_id=? AND status='deferred' ORDER BY updated",
+            parts.extend(('notice', 'Escalation request declined') for _ in service.store.all(
+                "SELECT id FROM escalation_requests WHERE conversation_id=? AND status='deferred' ORDER BY updated",
                 (restored['id'],)))
             keys = [(kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
                     if kind == 'activity' else (kind, index)
@@ -645,65 +650,95 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             transcript_scroll.scroll_to(percent=1)
             state['activity_token'] = None
 
-        offering_rows = []
-        deciding_offerings = set()
-        with ui.dialog() as offering_dialog, ui.card().classes('w-full max-w-xl gap-4'):
-            ui.label('Compute offering requests').classes('text-xl font-semibold')
-            offering_content = ui.column().classes('w-full gap-4')
-            ui.button('Close', on_click=offering_dialog.close).props('flat')
+        escalation_rows = []
+        deciding_escalations = set()
+        detail_request_id = None
+        with ui.dialog() as escalation_dialog, ui.card().classes('w-full max-w-xl gap-4'):
+            ui.label('Escalation requests').classes('text-xl font-semibold')
+            escalation_content = ui.column().classes('w-full min-w-0 gap-2')
+            ui.button('Close', on_click=escalation_dialog.close).props('flat')
+        with ui.dialog() as escalation_detail_dialog, ui.card().classes('w-full max-w-xl min-w-0 gap-4'):
+            escalation_detail_content = ui.column().classes('w-full min-w-0 gap-4')
+            ui.button('Back to requests', on_click=escalation_detail_dialog.close).props('flat')
 
-        async def decide_offering(request_id, approve):
-            if request_id in deciding_offerings:
+        async def decide_escalation(request_id, approve):
+            if request_id in deciding_escalations:
                 return
-            deciding_offerings.add(request_id)
-            render_offerings()
+            deciding_escalations.add(request_id)
+            render_escalation_detail()
             try:
-                await service.decide_compute_offering(await actor(), request_id, approve)
+                await service.decide_escalation(await actor(), request_id, approve)
                 if approve:
-                    await runtime.deliver_offering_decisions()
+                    await runtime.deliver_escalation_decisions()
             finally:
-                deciding_offerings.discard(request_id)
-                await refresh_offerings(await actor())
+                deciding_escalations.discard(request_id)
+                render_escalation_detail()
+                await refresh_escalations(await actor())
 
-        def render_offerings():
-            offering_content.clear()
-            with offering_content:
-                if not offering_rows:
-                    ui.label('No compute offering requests.')
-                for row in offering_rows:
-                    with ui.card().classes('w-full min-w-0'):
-                        ui.label(agents.get(row['agent_id'], {}).get('name', row['agent_id'])).classes('font-semibold break-all')
-                        ui.label('Dismissed' if row['status'] == 'deferred' else row['status'].capitalize()).classes('text-sm')
-                        ui.label(json.dumps(row['params'], indent=2, ensure_ascii=False)).classes(
-                            'w-full whitespace-pre-wrap break-all font-mono text-xs')
-                        if row['status'] == 'pending':
-                            with ui.row():
-                                approve = ui.button('Approve', on_click=lambda _, request_id=row['id']: protect(
-                                    lambda: decide_offering(request_id, True)))
-                                deny = ui.button('Deny', on_click=lambda _, request_id=row['id']: protect(
-                                    lambda: decide_offering(request_id, False))).props('outline')
-                                approve.set_enabled(row['id'] not in deciding_offerings)
-                                deny.set_enabled(row['id'] not in deciding_offerings)
-                        if row.get('result'):
-                            ui.label(json.dumps(row['result'], indent=2, ensure_ascii=False)).classes(
-                                'w-full whitespace-pre-wrap break-all text-xs')
+        def render_escalation_detail():
+            escalation_detail_content.clear()
+            row = next((row for row in escalation_rows if row['id'] == detail_request_id), None)
+            with escalation_detail_content:
+                if not row:
+                    ui.label('Request unavailable.')
+                    return
+                ui.label(agents.get(row['agent_id'], {}).get('name', row['agent_id'])).classes('font-semibold break-all')
+                ui.label('Dismissed' if row['status'] == 'deferred' else row['status'].capitalize()).classes('text-sm')
+                ui.label('Goal: ' + row['description']).classes('w-full whitespace-pre-wrap break-words font-semibold')
+                ui.label('Permission needed: ' + row['reason']).classes('w-full whitespace-pre-wrap break-words text-sm')
+                ui.label(row['command']).classes('w-full font-mono font-semibold break-all')
+                ui.label(json.dumps(row['params'], indent=2, ensure_ascii=False)).classes(
+                    'w-full whitespace-pre-wrap break-all font-mono text-xs')
+                if row['status'] == 'pending':
+                    with ui.row():
+                        approve = ui.button('Approve', on_click=lambda: protect(
+                            lambda: decide_escalation(row['id'], True)))
+                        dismiss = ui.button('Dismiss', on_click=lambda: protect(
+                            lambda: decide_escalation(row['id'], False))).props('outline')
+                        approve.set_enabled(row['id'] not in deciding_escalations)
+                        dismiss.set_enabled(row['id'] not in deciding_escalations)
+                if row.get('result'):
+                    ui.label(json.dumps(row['result'], indent=2, ensure_ascii=False)).classes(
+                        'w-full whitespace-pre-wrap break-all text-xs')
 
-        async def refresh_offerings(current):
-            nonlocal offering_rows
+        async def open_escalation_detail(request_id):
+            nonlocal detail_request_id
+            await refresh_escalations(await actor())
+            detail_request_id = request_id
+            render_escalation_detail()
+            escalation_detail_dialog.open()
+
+        def render_escalations():
+            escalation_content.clear()
+            with escalation_content:
+                if not escalation_rows:
+                    ui.label('No escalation requests.')
+                for row in escalation_rows:
+                    with ui.button(color=None, on_click=lambda _, request_id=row['id']: protect(
+                            lambda: open_escalation_detail(request_id))).props(
+                                'flat no-caps aria-haspopup="dialog"').classes(
+                                    'escalation-summary w-full min-w-0 p-3 border rounded'):
+                        with ui.column().classes('w-full min-w-0 gap-1'):
+                            ui.label(row['description']).classes('w-full truncate text-left text-base font-bold')
+                            ui.label(row['reason']).classes('w-full truncate text-left text-sm text-stone-600')
+            render_escalation_detail()
+
+        async def refresh_escalations(current):
+            nonlocal escalation_rows
             if current.get('type') != 1:
                 return
-            rows = await service.list_compute_offering_requests(current)
+            rows = await service.list_escalation_requests(current)
             count = sum(row['status'] == 'pending' for row in rows)
-            offering_button.props(f'aria-label="Compute offering requests: {count} pending"')
-            offering_button.classes(add='pending' if count else '', remove='' if count else 'pending')
-            if rows != offering_rows:
-                offering_rows = rows
-                render_offerings()
+            escalation_button.props(f'aria-label="Escalation requests: {count} pending"')
+            escalation_button.classes(add='pending' if count else '', remove='' if count else 'pending')
+            if rows != escalation_rows:
+                escalation_rows = rows
+                render_escalations()
 
-        async def open_offerings():
-            await refresh_offerings(await actor())
-            render_offerings()
-            offering_dialog.open()
+        async def open_escalations():
+            await refresh_escalations(await actor())
+            render_escalations()
+            escalation_dialog.open()
 
         async def poll_activity():
             if client.is_deleted or not state['agent'] or state['submitting']:
@@ -711,12 +746,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             agent_id, conversation_id = state['agent'], state['conversation']
             try:
                 current = await actor()
-                await refresh_offerings(current)
+                await refresh_escalations(current)
                 await histories()
                 rows = conversation_activity(service.store, current['userid'], list(agents))
                 selected = next((row for row in rows if row['id'] == conversation_id), None)
                 if selected:
-                    declines = tuple((row['id'], row['updated']) for row in offering_rows
+                    declines = tuple((row['id'], row['updated']) for row in escalation_rows
                                      if row['conversation_id'] == conversation_id and row['status'] == 'deferred')
                     activity_token = (selected['operation_id'], selected['status'], selected['updated'], declines)
                     if activity_token != state['activity_token']:
@@ -991,11 +1026,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if not key_access['allowed']:
                     owner_key_enabled.disable()
                     ui.label('Disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
-                offering_access = await service.compute_offering_access(agent)
-                offering_enabled = ui.checkbox('Request compute offerings', value=offering_access['selected'] and offering_access['allowed'])
-                if not offering_access['allowed']:
-                    offering_enabled.disable()
-                    ui.label('Compute offering requests disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
+                escalation_access = await service.escalation_access(agent)
+                escalation_enabled = ui.checkbox('Request permission escalation', value=escalation_access['selected'] and escalation_access['allowed'])
+                if not escalation_access['allowed']:
+                    escalation_enabled.disable()
+                    ui.label('Escalation requests disabled by an ancestor. The saved selection is retained.').classes('text-sm text-stone-600')
                 provider_access = await service.provider_configuration(current, agent['id'])
                 enabled_providers = ui.select(options, label='Enabled providers', multiple=True,
                     value=provider_access['selected']).classes('w-full')
@@ -1173,8 +1208,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
                 async def save():
                     options = {'enabled_providers': enabled_providers.value}
-                    if offering_access['allowed']:
-                        options['compute_offering_requests_enabled'] = offering_enabled.value
+                    if escalation_access['allowed']:
+                        options['escalation_requests_enabled'] = escalation_enabled.value
                     if key_access['allowed']:
                         options['owner_ssh_key_enabled'] = owner_key_enabled.value
                     if automatic.value and (type(auto_percent.value) not in {int, float}
@@ -1354,9 +1389,16 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ui.label('Browser-accessible private URL. CloudStack uses its own login; blank hides the link.').classes('text-sm')
                 owner_key = ui.textarea('Owner SSH public key', value=service.owner_ssh_key(current)).classes('w-full')
                 ui.label('Added alongside agent access to compatible new managed VMs.').classes('text-sm')
+                request_limit = ui.number('Open escalation requests per agent', value=service.escalation_request_limit(),
+                                          min=1, step=1, precision=0).classes('w-full')
+                ui.label('Global limit across all conversations. Pending requests and commands being applied count as open.').classes('text-sm')
                 async def save():
                     actor_identity = await actor()
+                    if (type(request_limit.value) not in {int, float} or not math.isfinite(request_limit.value)
+                            or request_limit.value < 1 or int(request_limit.value) != request_limit.value):
+                        raise ValueError('Open escalation requests per agent must be a positive whole number')
                     await service.save_owner_ssh_key(actor_identity, owner_key.value or '')
+                    service.save_escalation_request_limit(actor_identity, int(request_limit.value))
                     service.save_dashboard_url(actor_identity, url.value or '')
                     value = service.dashboard_url(actor_identity)
                     for link in dashboard_links:

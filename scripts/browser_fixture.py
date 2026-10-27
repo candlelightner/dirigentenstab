@@ -92,13 +92,14 @@ def fake_api(state):
             elif command == 'listDomains':
                 value = {'domain': [d for d in DOMAINS if not params.get('id') or d['id'] == params['id']]}
             elif command == 'listApis':
-                value = {'api': [{'name': 'createServiceOffering', 'params': [
-                    {'name': name, 'type': kind} for name, kind in [('name', 'string'),
-                    ('displaytext', 'string'), ('cpunumber', 'integer'), ('cpuspeed', 'integer'),
-                    ('memory', 'integer'), ('domainid', 'uuid')]], 'isasync': False}]}
-            elif command == 'createServiceOffering':
-                (state / 'offering-created.json').write_text(json.dumps(params))
-                value = {'serviceoffering': {'id': 'fixture-offering', 'name': params['name']}}
+                value = {'api': [{'name': 'updateVirtualMachine', 'params': [
+                    {'name': 'id', 'type': 'uuid', 'required': True},
+                    {'name': 'name', 'type': 'string'}], 'isasync': False}]}
+            elif command == 'updateVirtualMachine':
+                (state / 'escalation-executed.json').write_text(json.dumps({
+                    'command': command, 'params': {key: value for key, value in params.items()
+                    if key not in {'command', 'response', 'sessionkey'}}}))
+                value = {'virtualmachine': {'id': params['id'], 'name': params['name']}}
             elif command == 'logout':
                 value = {'success': True}
             else:
@@ -169,15 +170,18 @@ async def fake_model(messages, info):
                    if part.part_kind == 'user-prompt'), '')
     if 'Summarize the user request' in str(info.instructions):
         yield 'Summarized Chat Title'
-    elif 'offering fixture' in prompt:
-        requested = any(part.part_kind == 'tool-return' and part.tool_name == 'request_compute_offering'
+    elif 'escalation fixture' in prompt:
+        requested = any(part.part_kind == 'tool-return' and part.tool_name == 'request_escalation'
                         for message in messages for part in message.parts)
         if requested:
-            yield 'Offering requested.'
+            yield 'Escalation requested.'
         else:
-            yield {0: DeltaToolCall(name='request_compute_offering', json_args=json.dumps({'params': {
-                'name': 'Browser compute', 'displaytext': 'Browser compute', 'cpunumber': 2,
-                'cpuspeed': 2000, 'memory': 4096}}), tool_call_id='offering-fixture')}
+            yield {0: DeltaToolCall(name='request_escalation', json_args=json.dumps({
+                'description': 'Rename the research VM so the owner can identify the production analysis workspace',
+                'reason': 'My current CloudStack account cannot update this VM because its native role does not allow updateVirtualMachine',
+                'command': 'updateVirtualMachine', 'params': {
+                'id': '00000000-0000-0000-0000-000000000004', 'name': 'Research revised'}}),
+                tool_call_id='escalation-fixture')}
     elif 'heartbeat fixture' in prompt:
         loop = asyncio.get_running_loop()
         deadline, index = loop.time() + 40, 0
@@ -274,6 +278,7 @@ def main():
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
     service = FixtureService(store, settings)
+
     async def discover_mcp(self, identity, agent_id, server_id):
         configuration = await self.configuration(identity, agent_id)
         server = next((row for row in configuration['servers'] if row['id'] == server_id and row['enabled']), None)
