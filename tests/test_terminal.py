@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import asyncssh
@@ -38,93 +40,19 @@ def service_and_store(tmp_path):
     return srv, store
 
 
-async def test_user_ssh_key_encrypted_persistence_and_no_plaintext_in_db(service_and_store):
-    service, store = service_and_store
-    identity = {'userid': 'human-owner', 'type': 1, 'account': 'admin', 'domainid': 'domain-1'}
-
-    raw_key = asyncssh.generate_private_key('ssh-ed25519')
-    private_key_text = raw_key.export_private_key().decode()
-    expected_public_key = raw_key.export_public_key().decode().strip()
-    passphrase = 'super-secret-passphrase'
-
-    # Save key
-    saved = await service.save_user_ssh_key(identity, private_key_text, passphrase=passphrase)
-    assert saved['public_key'] == expected_public_key
-
-    # Check database row
-    row = store.one('SELECT * FROM user_ssh_keys WHERE user_id=?', (identity['userid'],))
-    assert row is not None
-    assert row['public_key'] == expected_public_key
-
-    # Ciphertext verification
-    assert row['private_key'].startswith(b'gAAAA')  # Fernet header
-    assert row['passphrase'].startswith(b'gAAAA')
-    assert private_key_text.encode() not in row['private_key']
-    assert passphrase.encode() not in row['passphrase']
-
-    # Verify raw database file on disk has NO plaintext of private key or passphrase
-    db_bytes = store.path.read_bytes()
-    assert private_key_text.encode() not in db_bytes
-    assert b'super-secret-passphrase' not in db_bytes
-    assert b'PRIVATE KEY' not in db_bytes
-
-    # Retrieve through public API
-    retrieved = service.user_ssh_key(identity)
-    assert retrieved['public_key'] == expected_public_key
-    assert 'private_key' not in retrieved
-    assert 'passphrase' not in retrieved
-
-    # Check audit log
-    audit_rows = store.all('SELECT * FROM audit WHERE actor=?', (identity['userid'],))
-    assert any(a['operation'] == 'configure-user-ssh-key' for a in audit_rows)
-    for a in audit_rows:
-        assert 'super-secret-passphrase' not in str(a)
-        assert 'PRIVATE KEY' not in str(a)
-
-
-async def test_user_ssh_key_validation_replacement_and_deletion(service_and_store):
-    service, store = service_and_store
-    identity = {'userid': 'human-owner', 'type': 1}
-
-    # Invalid private key
-    with pytest.raises(ValueError, match='Invalid SSH private key'):
-        await service.save_user_ssh_key(identity, 'not-a-private-key')
-
-    # Valid key 1
-    key1 = asyncssh.generate_private_key('ssh-ed25519')
-    await service.save_user_ssh_key(identity, key1.export_private_key().decode())
-
-    # Mock an active terminal session for this user
-    closed_sessions = []
-    dummy_session = SimpleNamespace(
-        user_id='human-owner',
-        close=lambda: closed_sessions.append('closed-session-1'),
-    )
-    service.register_terminal_session(dummy_session)
-    assert id(dummy_session) in service._terminal_sessions
-
-    # Replacing key must close active terminal sessions
-    key2 = asyncssh.generate_private_key('ssh-ed25519')
-    await service.save_user_ssh_key(identity, key2.export_private_key().decode())
-    assert 'closed-session-1' in closed_sessions
-    assert id(dummy_session) not in service._terminal_sessions
-    assert service.user_ssh_key(identity)['public_key'] == key2.export_public_key().decode().strip()
-
-    # Register another session
-    dummy_session2 = SimpleNamespace(
-        user_id='human-owner',
-        close=lambda: closed_sessions.append('closed-session-2'),
-    )
-    service.register_terminal_session(dummy_session2)
-
-    # Deleting key must delete from DB and close active terminal sessions
-    await service.delete_user_ssh_key(identity)
-    assert 'closed-session-2' in closed_sessions
-    assert id(dummy_session2) not in service._terminal_sessions
-    assert service.user_ssh_key(identity) is None
-
-    audit_ops = [a['operation'] for a in store.all('SELECT * FROM audit WHERE actor=?', (identity['userid'],))]
-    assert 'delete-user-ssh-key' in audit_ops
+def test_migration_drops_stored_owner_private_keys(tmp_path):
+    key = tmp_path / 'master'
+    key.write_bytes(Fernet.generate_key())
+    path = tmp_path / 'old.db'
+    conn = sqlite3.connect(path)
+    for n in range(1, 21):
+        conn.executescript((Path(__file__).parent.parent / 'dirigentenstab/migrations' / f'{n:03}.sql').read_text())
+    conn.execute("INSERT INTO user_ssh_keys(user_id,private_key,public_key,created,updated) VALUES('u',x'00','p',0,0)")
+    conn.execute('PRAGMA user_version=20')
+    conn.commit()
+    conn.close()
+    store = Store(str(path), str(key))
+    assert store.one("SELECT name FROM sqlite_master WHERE name='user_ssh_keys'") is None
 
 
 async def test_target_vm_authorization_and_ownership_enforcement(service_and_store, monkeypatch):
@@ -208,7 +136,6 @@ async def test_host_key_pinning_and_terminal_interactive_lifecycle(service_and_s
     identity = {'userid': 'owner', 'type': 1, '_session': 'sess'}
 
     user_key = asyncssh.generate_private_key('ssh-ed25519')
-    await service.save_user_ssh_key(identity, user_key.export_private_key().decode())
 
     server_host_key = asyncssh.generate_private_key('ssh-ed25519')
 
@@ -235,7 +162,7 @@ async def test_host_key_pinning_and_terminal_interactive_lifecycle(service_and_s
         # Target VM configured with pinned host key matching the server
         record = {
             'username': 'dirigent',
-            'private_key': store.seal('agent-key'),
+            'private_key': store.seal(user_key.export_private_key().decode()),
             'host_key': server_host_key.export_public_key().decode(),
             'port': port,
             'owner_agent': 'agent-1',
@@ -250,6 +177,7 @@ async def test_host_key_pinning_and_terminal_interactive_lifecycle(service_and_s
         # 1. Successful connection with pinned host key
         conn, connected_vm = await service.open_vm_terminal_connection(identity, 'vm-1')
         assert connected_vm['name'] == 'echo-vm'
+        assert store.one("SELECT 1 FROM audit WHERE actor='owner' AND operation='open-vm-terminal'")
 
         # Establish session with dummy terminal
         received_data = []
@@ -286,6 +214,38 @@ async def test_host_key_pinning_and_terminal_interactive_lifecycle(service_and_s
         record['host_key'] = wrong_host_key
         with pytest.raises((asyncssh.Error, OSError)):
             await service.open_vm_terminal_connection(identity, 'vm-1')
+
+
+async def test_terminal_fails_closed_without_authorization_or_access(service_and_store, monkeypatch):
+    service, store = service_and_store
+    identity = {'userid': 'owner', 'type': 2, '_session': 'sess'}
+    host_key = asyncssh.generate_private_key('ssh-ed25519').export_public_key().decode()
+    store.execute(
+        'INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
+        ('vm-1', 'agent-1', 'dirigent', store.seal('k'), host_key, 22),
+    )
+    store.execute(
+        'INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
+        ('vm-nohost', 'agent-1', 'dirigent', store.seal('k'), None, 22),
+    )
+
+    async def human_call(ident, command, params=None):
+        return {'domain': []}
+
+    connects = []
+
+    async def connect(*args, **kwargs):
+        connects.append(args)
+
+    monkeypatch.setattr(service, 'human_call', human_call)
+    monkeypatch.setattr(asyncssh, 'connect', connect)
+    with pytest.raises(PermissionError):
+        await service.open_vm_terminal_connection(identity, 'vm-1')
+    with pytest.raises(ValueError, match='trusted host key'):
+        await service.open_vm_terminal_connection(identity, 'vm-nohost')
+    with pytest.raises(ValueError, match='trusted host key'):
+        await service.open_vm_terminal_connection(identity, 'missing')
+    assert not connects
 
 
 async def test_auth_logout_closes_terminal_sessions(service_and_store, monkeypatch):
