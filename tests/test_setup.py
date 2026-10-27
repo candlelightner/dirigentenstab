@@ -190,7 +190,9 @@ def test_test_runner_manifest_computation_and_invalidation(tmp_path):
 
     # Changing version in pyproject.toml does NOT invalidate manifest
     pyproj = (tmp_path / 'pyproject.toml').read_text(encoding='utf-8')
-    (tmp_path / 'pyproject.toml').write_text(pyproj.replace('version = "0.1.14"', 'version = "0.1.15"'))
+    version_bump = re.sub(r'^version = "[^"]+"$', 'version = "999.0.0"', pyproj, flags=re.MULTILINE)
+    assert version_bump != pyproj
+    (tmp_path / 'pyproject.toml').write_text(version_bump)
     bumped = test_runner.compute_manifest(tmp_path)
     assert bumped['manifest_sha256'] == base['manifest_sha256']
     assert bumped['tag'] == base['tag']
