@@ -330,8 +330,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             escalation_button = ui.button(icon='approval', color=None, on_click=lambda: protect(open_escalations)).props(
                 'flat round aria-label="Escalation requests: 0 pending"').classes('escalation-requests').mark('escalation_requests')
             escalation_button.set_visibility(identity.get('type') == 1)
-            ui.button(icon='vpn_key', on_click=lambda: protect(open_ssh_key_dialog)).props(
-                'flat round aria-label="SSH key"').mark('header_ssh_key_button')
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
@@ -420,7 +418,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                             autoscroll = ui.switch('Chat autoscroll',
                                 value=not autoscroll_setting or autoscroll_setting['value'] != 'false',
                                 on_change=lambda: protect(save_autoscroll)).mark('chat_autoscroll')
-                            ssh_key_button = ui.button('SSH key', icon='vpn_key').props('flat no-caps align=left').classes('w-full').mark('ssh_key_button')
                             if identity.get('type') == 1:
                                 providers_button = ui.button('Model providers', icon='settings').props('flat no-caps align=left').classes('w-full')
                                 platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('flat no-caps align=left').classes('w-full')
@@ -701,9 +698,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             term.write('\x1bc')
             try:
                 current = await actor()
-                key_row = service.user_ssh_key(current) if hasattr(service, 'user_ssh_key') else None
-                if not key_row:
-                    raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
                 conn, vm = await service.open_vm_terminal_connection(current, vm_id)
                 if request != ssh_request or state.get('current_vm') != vm_id:
                     conn.close()
@@ -884,55 +878,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 if agent:
                     agent_heading.set_text(agent_label(agent))
                     agent_heading.enable()
-
-        async def open_ssh_key_dialog():
-            current = await actor()
-            existing = service.user_ssh_key(current) if hasattr(service, 'user_ssh_key') else None
-            with ui.dialog() as ssh_dialog, ui.card().classes('w-full max-w-lg p-4 gap-3'):
-                ui.label('SSH Key Configuration').classes('text-lg font-semibold')
-                ui.label('Configure your personal SSH private key for in-browser VM terminals. Stored encrypted at rest.').classes('text-xs text-stone-500')
-                pub_label = ui.label('Current public key (authorized on VMs):').classes('text-xs font-medium text-stone-700')
-                pub_display = ui.textarea(value=existing['public_key'] if existing else 'No key configured').props('readonly autogrow dense').classes('w-full font-mono text-xs')
-                if not existing:
-                    pub_label.set_visibility(False)
-                    pub_display.set_visibility(False)
-                priv_input = ui.textarea('Private key', placeholder='-----BEGIN OPENSSH PRIVATE KEY-----\n...').props('autogrow rows=4 dense').classes('w-full font-mono text-xs').mark('ssh_private_key_input')
-                pass_input = ui.input('Passphrase (optional)', password=True, password_toggle_button=True).props('dense').classes('w-full').mark('ssh_passphrase_input')
-                with ui.row().classes('w-full items-center justify-between no-wrap gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        save_btn = ui.button('Save key').mark('ssh_key_save')
-                        if existing:
-                            del_btn = ui.button('Delete key', color='negative').props('outline').mark('ssh_key_delete')
-                        else:
-                            del_btn = None
-                    ui.button('Close', on_click=ssh_dialog.close).props('flat').mark('ssh_key_close')
-
-                async def save_key():
-                    val = (priv_input.value or '').strip()
-                    if not val:
-                        ui.notify('Private key is required', type='warning')
-                        return
-                    res = await service.save_user_ssh_key(current, val, passphrase=pass_input.value)
-                    pub_display.set_value(res['public_key'])
-                    pub_label.set_visibility(True)
-                    pub_display.set_visibility(True)
-                    priv_input.set_value('')
-                    pass_input.set_value('')
-                    ui.notify('SSH key saved successfully', type='positive')
-                    ssh_dialog.close()
-
-                async def delete_key():
-                    await service.delete_user_ssh_key(current)
-                    pub_display.set_value('No key configured')
-                    pub_label.set_visibility(False)
-                    pub_display.set_visibility(False)
-                    ui.notify('SSH key removed', type='info')
-                    ssh_dialog.close()
-
-                save_btn.on_click(lambda: protect(save_key))
-                if del_btn:
-                    del_btn.on_click(lambda: protect(delete_key))
-            ssh_dialog.open()
 
         def update_sidebar_view():
             has_vms = 'VMs' in (sidebar_select.value or [])
@@ -2096,8 +2041,6 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 alias_switch.enable()
 
         ui.timer(0.01, lambda: protect(restore_sidebar), once=True)
-        if ssh_key_button is not None:
-            ssh_key_button.on_click(lambda: protect(lambda: open_dialog(open_ssh_key_dialog)))
         if providers_button is not None:
             providers_button.on_click(lambda: protect(lambda: open_dialog(provider_dialog)))
         if platform_button is not None:

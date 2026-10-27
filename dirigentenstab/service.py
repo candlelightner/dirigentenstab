@@ -986,46 +986,6 @@ class Service:
                 'cloudstack_url': base + '#/vm/' + quote(vm['id'], safe='') if base else ''})
         return machines
 
-    def user_ssh_key(self, identity):
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        row = self.store.one('SELECT public_key, created, updated FROM user_ssh_keys WHERE user_id=?',
-                             (identity['userid'],))
-        return dict(row) if row else None
-
-    async def save_user_ssh_key(self, identity, private_key_str, passphrase=None):
-        import asyncssh
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        if not isinstance(private_key_str, str) or not private_key_str.strip() or len(private_key_str) > 65536:
-            raise ValueError('Valid SSH private key required')
-        passphrase_val = (passphrase.strip() if passphrase and isinstance(passphrase, str) and passphrase.strip() else None)
-        try:
-            imported = asyncssh.import_private_key(private_key_str.strip(), passphrase=passphrase_val)
-        except (asyncssh.KeyImportError, ValueError) as exc:
-            raise ValueError('Invalid SSH private key or incorrect passphrase') from exc
-        public_key = imported.export_public_key().decode().strip()
-        now = time.time()
-        self.store.execute(
-            'INSERT INTO user_ssh_keys(user_id, private_key, passphrase, public_key, created, updated) '
-            'VALUES(?,?,?,?,?,?) '
-            'ON CONFLICT(user_id) DO UPDATE SET private_key=excluded.private_key, '
-            'passphrase=excluded.passphrase, public_key=excluded.public_key, updated=excluded.updated',
-            (identity['userid'], self.store.seal(private_key_str.strip()),
-             self.store.seal(passphrase_val) if passphrase_val else None,
-             public_key, now, now)
-        )
-        self.store.audit(identity['userid'], 'configure-user-ssh-key')
-        self.close_user_terminal_sessions(identity['userid'])
-        return {'public_key': public_key}
-
-    async def delete_user_ssh_key(self, identity):
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        self.store.execute('DELETE FROM user_ssh_keys WHERE user_id=?', (identity['userid'],))
-        self.store.audit(identity['userid'], 'delete-user-ssh-key')
-        self.close_user_terminal_sessions(identity['userid'])
-
     def register_terminal_session(self, session):
         self._terminal_sessions[id(session)] = session
 
@@ -1105,13 +1065,8 @@ class Service:
     async def open_vm_terminal_connection(self, identity, vm_id):
         import asyncssh
         address, record, vm = await self.target_vm(identity, vm_id)
-        key_row = self.store.one('SELECT private_key, passphrase FROM user_ssh_keys WHERE user_id=?',
-                                 (identity['userid'],))
-        if not key_row:
-            raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
-        priv_key_str = self.store.open(key_row['private_key'])
-        passphrase_str = self.store.open(key_row['passphrase']) if key_row['passphrase'] else None
-        client_key = asyncssh.import_private_key(priv_key_str, passphrase=passphrase_str)
+        self.store.audit(identity['userid'], 'open-vm-terminal', vm_id)
+        client_key = asyncssh.import_private_key(self.store.open(record['private_key']))
         host_key = asyncssh.import_public_key(record['host_key'])
         known_hosts = ([host_key], [], [])
         conn = await asyncssh.connect(
