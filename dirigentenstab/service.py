@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -889,6 +889,21 @@ class Service:
         except FileNotFoundError:
             pass
         return str(address), record, vm
+
+    async def vm_console_url(self, identity, vm_id):
+        # CloudStack authorizes the signed-in human for this VM; tickets are short-lived, so fetch per use.
+        result = (await self.human_call(identity, 'createConsoleEndpoint', {'virtualmachineid': vm_id})).get('consoleendpoint', {})
+        url = result.get('url', '')
+        try:
+            parsed = urlparse(url) if isinstance(url, str) else None
+            valid = (parsed is not None and parsed.scheme in {'https', 'http'} and parsed.hostname
+                     and parsed.port != 0 and parsed.username is None and parsed.password is None
+                     and not any(c.isspace() or ord(c) < 32 for c in url) and '\\' not in url)
+        except ValueError:
+            valid = False
+        if not result.get('success') or not valid:
+            raise ValueError('Console unavailable: ' + str(result.get('details') or 'CloudStack returned no console URL'))
+        return url
 
     async def open_vm_terminal_connection(self, identity, vm_id):
         import asyncssh

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -1089,6 +1090,7 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         # Check sidebar selector exists
         sidebar_select = page.locator('.q-drawer .sidebar-view-select')
         await sidebar_select.wait_for()
+        await playwright.expect(sidebar_select).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
 
         # Check alias switch is initially hidden
         alias_switch = page.locator('.q-drawer .sidebar-show-aliases')
@@ -1141,6 +1143,51 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         # VMs remains selected, research-vm still visible
         await vm_node.wait_for()
 
+        # The selected view and aliases survive a full page reload.
+        await alias_switch.click()
+        await alias_node.wait_for()
+        await page.reload()
+        await playwright.expect(sidebar_select).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
+        await page.get_by_role('button', name='Agent details', exact=True).wait_for()
+        if not await search.is_visible():
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await alias_node.wait_for()
+        await playwright.expect(alias_switch).to_have_attribute('aria-checked', 'true')
+        await playwright.expect(sidebar_select).to_contain_text('VMs')
+        await playwright.expect(sidebar_select).not_to_contain_text('Agents')
+        await alias_switch.click()
+        await vm_node.wait_for()
+
+        await page.reload()
+        await playwright.expect(sidebar_select).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
+        await page.get_by_role('button', name='Agent details', exact=True).wait_for()
+        if not await search.is_visible():
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await vm_node.wait_for()
+        await playwright.expect(alias_switch).to_have_attribute('aria-checked', 'false')
+        # Persist Agents alone, then both views, while retaining aliases off.
+        for option, expected in [('Agents', ('Agents', 'VMs')), ('VMs', ('Agents',)),
+                                 ('VMs', ('Agents', 'VMs'))]:
+            await sidebar_select.click()
+            await page.get_by_role('option', name=option, exact=True).click()
+            await page.keyboard.press('Escape')
+            await page.wait_for_function(
+                'expected => JSON.stringify(JSON.parse(localStorage.getItem("dirigentenstab.sidebar.'
+                '00000000-0000-0000-0000-000000000003")).view.sort()) === JSON.stringify(expected.sort())',
+                arg=list(expected))
+            await page.reload()
+            await playwright.expect(sidebar_select).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
+            await page.get_by_role('button', name='Agent details', exact=True).wait_for()
+            if not await search.is_visible():
+                await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            for label in expected:
+                await playwright.expect(sidebar_select).to_contain_text(label)
+            if expected == ('Agents',):
+                await playwright.expect(alias_switch).not_to_be_visible()
+            else:
+                await playwright.expect(alias_switch).to_have_attribute('aria-checked', 'false')
+        await vm_node.wait_for()
+
         # Click the VM node to open terminal pane
         await vm_node.click()
 
@@ -1149,20 +1196,86 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         await terminal_pane.wait_for()
 
         # Terminal status should indicate connection attempt / status
-        status = page.locator('.terminal-pane [role="status"]')
+        status = page.locator('.terminal-pane [role="status"]').filter(visible=True)
         await status.wait_for()
 
         # Terminal controls visible
         await page.locator('.terminal-pane').get_by_role('button', name='Reconnect', exact=True).wait_for()
         await page.locator('.terminal-pane').get_by_role('button', name='Disconnect', exact=True).wait_for()
 
+        frame = page.locator('iframe[title="VM console"]')
+        (state / 'console-error').touch()
+        await terminal_pane.get_by_role('button', name='Console', exact=True).click()
+        await terminal_pane.get_by_text('Console unavailable', exact=True).wait_for()
+        await terminal_pane.get_by_text('Console unavailable: Console fixture denied', exact=True).wait_for()
+        (state / 'console-error').unlink()
+        await terminal_pane.get_by_role('button', name='Reconnect', exact=True).click()
+        await playwright.expect(frame).to_have_attribute('src', re.compile(r'^/vm-console/[^/]+/vnc.html\?'))
+        embedded_url = await frame.get_attribute('src')
+        response = await context.request.get(url + embedded_url)
+        assert response.status == 200
+        assert response.headers['x-frame-options'] == 'SAMEORIGIN'
+        assert 'ticket-2' not in embedded_url
+        await frame.content_frame.get_by_text('Connected through console proxy', exact=True).wait_for()
+        box = await frame.bounding_box()
+        assert box and box['height'] > 300 and box['width'] <= width
+        await page.screenshot(path=str(state / f'console-{width}x{height}.png'), full_page=True)
+        async with page.expect_popup() as popup_info:
+            await terminal_pane.get_by_role('button', name='Open console in new tab', exact=True).click()
+        popup = await popup_info.value
+        await popup.wait_for_load_state()
+        assert popup.url.startswith(url + '/vm-console/') and popup.url != url + embedded_url
+        await popup.get_by_text('Connected through console proxy', exact=True).wait_for()
+        await popup.close()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
+
+        # Disconnect invalidates a pending endpoint, including a request for the same VM.
+        (state / 'console-delay').touch()
+        await terminal_pane.get_by_role('button', name='Reconnect', exact=True).click()
+        await terminal_pane.get_by_text('Opening console: research-vm…', exact=True).wait_for()
+        await terminal_pane.get_by_role('button', name='Disconnect', exact=True).click()
+        await terminal_pane.get_by_text('Console closed', exact=True).wait_for()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
+        (state / 'console-delay').unlink()
+        await terminal_pane.get_by_role('button', name='Reconnect', exact=True).click()
+        await frame.content_frame.get_by_text('Connected through console proxy', exact=True).wait_for()
+        reconnected_url = await frame.get_attribute('src')
+        assert reconnected_url != embedded_url
+        await page.wait_for_timeout(1100)
+        await playwright.expect(frame).to_have_attribute('src', reconnected_url)
+        await terminal_pane.get_by_role('button', name='SSH', exact=True).click()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
+        await playwright.expect(frame).not_to_be_visible()
+        await terminal_pane.get_by_role('button', name='Console', exact=True).click()
+        await frame.content_frame.get_by_text('Connected through console proxy', exact=True).wait_for()
+        # Selecting an agent tears down the iframe, even without using Close.
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await search.fill('Research Admin')
+        await page.locator('.q-tree').get_by_text('Research Admin', exact=True).click()
+        await search.wait_for(state='hidden')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
+        await playwright.expect(page.locator('.q-tree')).not_to_have_attribute('aria-disabled', 'true')
+        await page.get_by_label('Message', exact=True).wait_for()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
+        await playwright.expect(terminal_pane).not_to_be_visible()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await search.fill('research-vm')
+        await vm_node.click()
+        await terminal_pane.wait_for()
+
         # Verify zero horizontal overflow on both desktop and mobile
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
 
+        # Reopening a VM retains SSH as the default; closing an active console tears it down.
+        await page.locator('.terminal-container').wait_for()
+        await playwright.expect(frame).not_to_be_visible()
+        await terminal_pane.get_by_role('button', name='Console', exact=True).click()
+        await frame.content_frame.get_by_text('Connected through console proxy', exact=True).wait_for()
         # Close terminal pane to return to chat
         await page.locator('.terminal-pane').get_by_role('button', name='Close terminal', exact=True).click()
         await page.get_by_label('Message', exact=True).wait_for()
         await playwright.expect(terminal_pane).not_to_be_visible()
+        await playwright.expect(frame).to_have_attribute('src', 'about:blank')
 
         # Verify zero horizontal overflow again
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')

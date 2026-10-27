@@ -137,7 +137,8 @@ class SessionGuard:
             if message['type'] == 'http.response.start':
                 message.setdefault('headers', []).extend([
                     (b'cache-control', b'no-store'), (b'x-content-type-options', b'nosniff'),
-                    (b'referrer-policy', b'same-origin'), (b'x-frame-options', b'DENY'),
+                    (b'referrer-policy', b'same-origin'),
+                    (b'x-frame-options', b'SAMEORIGIN' if path.startswith('/vm-console/') else b'DENY'),
                     (b'permissions-policy', b'camera=(), microphone=(), geolocation=()'),
                 ])
             await send(message)
