@@ -206,7 +206,7 @@ class Service:
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'configure_agent',
                           'list_skills', 'get_skill', 'save_skill', 'share_skill']
-                         + (['request_escalation', 'request_skill_global'] if (await self.escalation_access(agent))['enabled'] else []),
+                         + (['request_escalation', 'request_skill_global', 'remove_skill'] if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
 
@@ -744,6 +744,12 @@ class Service:
         return await self.request_escalation(agent_id, 'Share skill globally: ' + skill['name'], reason,
                                              'shareSkillGlobally', params, **context)
 
+    async def remove_skill(self, agent_id, skill_id, reason, **context):
+        skill = await self.get_skill({'_agent_id': agent_id}, skill_id)
+        params = {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}
+        return await self.request_escalation(agent_id, 'Remove skill: ' + skill['name'], reason,
+                                             'removeSkill', params, **context)
+
     def escalation_request_limit(self):
         row = self.store.one("SELECT value FROM platform_settings WHERE name='escalation_request_limit'")
         return int(row['value']) if row else 3
@@ -782,17 +788,17 @@ class Service:
         if (not isinstance(description, str) or not description.strip() or len(description) > 500
                 or not isinstance(reason, str) or not reason.strip() or len(reason) > 1000):
             raise ValueError('Supply a description (1–500 characters) and reason (1–1000 characters)')
-        if command == 'shareSkillGlobally':
+        if command in {'shareSkillGlobally', 'removeSkill'}:
             if not isinstance(params, dict) or not isinstance(params.get('id'), str):
-                raise ValueError('Invalid skill publication request')
+                raise ValueError('Invalid skill approval request')
             skill = await self.get_skill({'_agent_id': agent_id}, params['id'])
-            if not skill['can_edit']:
+            if command == 'shareSkillGlobally' and not skill['can_edit']:
                 raise PermissionError('Only skill editors may request global sharing')
             if params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}:
                 raise ValueError('Review the exact current skill revision')
         else:
             validate(None, params)
-        if len(json.dumps(params)) > (400000 if command == 'shareSkillGlobally' else 65536):
+        if len(json.dumps(params)) > (400000 if command in {'shareSkillGlobally', 'removeSkill'} else 65536):
             raise ValueError('Escalation parameters are too large')
         description, reason = self.redact(description.strip()), self.redact(reason.strip())
         now, request_id = time.time(), str(uuid.uuid4())
@@ -845,20 +851,22 @@ class Service:
         if row['status'] != 'pending':
             return self._escalation_request(row)
         command, params = row['command'], self.store.open(row['params'])
-        if command == 'shareSkillGlobally':
+        if command in {'shareSkillGlobally', 'removeSkill'}:
             if approve:
                 if not (await self.escalation_access(agent))['enabled']:
                     raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
                 skill = await self.get_skill({'_agent_id': agent['id']}, params['id'])
-                if not skill['can_edit'] or params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}:
+                if (command == 'shareSkillGlobally' and not skill['can_edit']
+                        or params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}):
                     raise ValueError('Skill changed; request approval for its current revision')
             with self.store.connect() as conn:
                 conn.execute('BEGIN IMMEDIATE')
                 pending = conn.execute("SELECT id FROM escalation_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
                 if pending:
                     if approve:
-                        changed = conn.execute('UPDATE skills SET global_revision=revision WHERE id=? AND revision=?',
-                                               (params['id'], params['revision'])).rowcount
+                        statement = ('DELETE FROM skills WHERE id=? AND revision=?' if command == 'removeSkill' else
+                                     'UPDATE skills SET global_revision=revision WHERE id=? AND revision=?')
+                        changed = conn.execute(statement, (params['id'], params['revision'])).rowcount
                         if not changed:
                             raise ValueError('Skill changed; request approval for its current revision')
                     conn.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',

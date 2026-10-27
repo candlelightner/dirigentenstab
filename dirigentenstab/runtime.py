@@ -644,6 +644,7 @@ class Runtime:
                           'Available skills list names and short descriptions only; request get_skill explicitly when relevant. '
                           'Use save_skill to create or edit skills, share_skill for selected descendants, '
                           'and request_skill_global for human approval of the exact revision. '
+                          'remove_skill queues removal of a skill you can read; removal always requires human approval. '
                           'For the native installation prefer its Dirigentenstab-small offering when available; '
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
@@ -749,6 +750,17 @@ class Runtime:
                         run_id=budget['operation_id'], call_id=ctx.tool_call_id)
                     return {'request_id': row['id'], 'status': row['status']}
                 enqueue.__name__ = 'request_skill_global'
+                return await invoke(enqueue, agent_id, skill_id, reason, call_id=ctx.tool_call_id)
+
+            @agent.tool(sequential=True)
+            async def remove_skill(ctx: RunContext, skill_id: str, reason: str) -> dict:
+                """Request human approval to remove an available skill's exact revision. This never deletes it immediately."""
+                async def enqueue(acting_agent, selected_skill, explanation):
+                    row = await self.service.remove_skill(
+                        acting_agent, selected_skill, explanation, conversation_id=conversation_id,
+                        run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+                    return {'request_id': row['id'], 'status': row['status']}
+                enqueue.__name__ = 'remove_skill'
                 return await invoke(enqueue, agent_id, skill_id, reason, call_id=ctx.tool_call_id)
 
         @agent.tool_plain(sequential=True)
