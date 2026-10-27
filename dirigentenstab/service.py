@@ -511,32 +511,58 @@ class Service:
             conn.execute("UPDATE vm_deployments SET vm_id=?,phase='complete',updated=? WHERE id=?",
                          (vm_id, time.time(), op_id))
 
+    async def _owned_matches(self, op):
+        agent = await self.agent(op['agent_id'])
+        cloud = await self.cloud_client(agent)
+        accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
+        account = next((value for value in accounts if value.get('id') == agent['account_id']
+                        and value.get('domainid') == agent['domain_id'] and value.get('name')), None)
+        if not account:
+            raise CloudError(f"Cannot verify the owning CloudStack account for deployment {op['id']}")
+        response = await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})
+        return [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
+                and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
+
     async def recover_deployments(self, operation_id=None):
         query = "SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"
         for op in self.store.all(query + (' AND id=?' if operation_id else ''), (operation_id,) if operation_id else ()):
-            agent = await self.agent(op['agent_id'])
-            cloud = await self.cloud_client(agent)
-            accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
-            account = next((value for value in accounts if value.get('id') == agent['account_id']
-                            and value.get('domainid') == agent['domain_id'] and value.get('name')), None)
-            if not account:
-                raise CloudError(f"Cannot verify the owning CloudStack account for deployment {op['id']}")
-            response = await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})
-            matches = [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
-                       and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
+            matches = await self._owned_matches(op)
             if len(matches) == 1 and matches[0].get('state') in {'Running', 'Stopped'}:
                 self._bind_vm(op['id'], matches[0]['id'])
             else:
                 self.store.audit(op['agent_id'], 'deployment-recovery-needs-review', op['id'], 'pending')
         # Absence is not proof that dispatch never reached CloudStack. Never create a second VM here.
 
-    async def recover_operation(self, agent_id, operation_id):
+    async def recover_operation(self, agent_id, operation_id, abandon=False):
         await self.agent(agent_id)
         deployment = self.store.one('SELECT * FROM vm_deployments WHERE id=? AND agent_id=?', (operation_id, agent_id))
         template = self.store.one('SELECT * FROM template_creations WHERE id=? AND agent_id=?', (operation_id, agent_id))
+        if abandon and (deployment or template) and not (deployment and deployment['phase'] in {'prepared', 'dispatched', 'failed'}):
+            raise ValueError('Only an unresolved managed VM deployment can be abandoned')
         if deployment:
             await self.recover_deployments(operation_id=operation_id)
             current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
+            if abandon and current['phase'] != 'complete':
+                saved = self.store.open(deployment['params'])
+                jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
+                if jobid:
+                    cloud = await self.cloud_client(await self.agent(agent_id))
+                    if (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0:
+                        raise CloudError('Deployment job still running; wait and recover', operation_id=operation_id)
+                live = [vm.get('id') for vm in await self._owned_matches(deployment)
+                        if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]
+                if live:
+                    raise CloudError(f'VM {", ".join(map(str, live))} matches this deployment; inspect and clean it up '
+                                     'natively before abandoning the operation', operation_id=operation_id)
+                with self.store.connect() as conn:
+                    if conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=? "
+                                    "AND phase IN ('prepared','dispatched','failed')",
+                                    (time.time(), operation_id)).rowcount != 1:
+                        raise CloudError('Deployment changed during abandon; re-run recover_operation', operation_id=operation_id)
+                    conn.execute('DELETE FROM vm_access WHERE vm_id=?', ('pending-' + operation_id,))
+                    conn.execute('INSERT INTO audit(created,actor,operation,target,status) VALUES(?,?,?,?,?)',
+                                 (time.time(), agent_id, 'deployment-abandoned-by-agent', operation_id, 'ok'))
+                current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
             return {'operation_id': operation_id, **current, 'request': self.redact(self.store.open(deployment['params']))}
         if template:
             if template['phase'] == 'dispatched':
@@ -960,46 +986,6 @@ class Service:
                 'cloudstack_url': base + '#/vm/' + quote(vm['id'], safe='') if base else ''})
         return machines
 
-    def user_ssh_key(self, identity):
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        row = self.store.one('SELECT public_key, created, updated FROM user_ssh_keys WHERE user_id=?',
-                             (identity['userid'],))
-        return dict(row) if row else None
-
-    async def save_user_ssh_key(self, identity, private_key_str, passphrase=None):
-        import asyncssh
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        if not isinstance(private_key_str, str) or not private_key_str.strip() or len(private_key_str) > 65536:
-            raise ValueError('Valid SSH private key required')
-        passphrase_val = (passphrase.strip() if passphrase and isinstance(passphrase, str) and passphrase.strip() else None)
-        try:
-            imported = asyncssh.import_private_key(private_key_str.strip(), passphrase=passphrase_val)
-        except (asyncssh.KeyImportError, ValueError) as exc:
-            raise ValueError('Invalid SSH private key or incorrect passphrase') from exc
-        public_key = imported.export_public_key().decode().strip()
-        now = time.time()
-        self.store.execute(
-            'INSERT INTO user_ssh_keys(user_id, private_key, passphrase, public_key, created, updated) '
-            'VALUES(?,?,?,?,?,?) '
-            'ON CONFLICT(user_id) DO UPDATE SET private_key=excluded.private_key, '
-            'passphrase=excluded.passphrase, public_key=excluded.public_key, updated=excluded.updated',
-            (identity['userid'], self.store.seal(private_key_str.strip()),
-             self.store.seal(passphrase_val) if passphrase_val else None,
-             public_key, now, now)
-        )
-        self.store.audit(identity['userid'], 'configure-user-ssh-key')
-        self.close_user_terminal_sessions(identity['userid'])
-        return {'public_key': public_key}
-
-    async def delete_user_ssh_key(self, identity):
-        if not identity or not identity.get('userid'):
-            raise PermissionError('User authentication required')
-        self.store.execute('DELETE FROM user_ssh_keys WHERE user_id=?', (identity['userid'],))
-        self.store.audit(identity['userid'], 'delete-user-ssh-key')
-        self.close_user_terminal_sessions(identity['userid'])
-
     def register_terminal_session(self, session):
         self._terminal_sessions[id(session)] = session
 
@@ -1079,13 +1065,8 @@ class Service:
     async def open_vm_terminal_connection(self, identity, vm_id):
         import asyncssh
         address, record, vm = await self.target_vm(identity, vm_id)
-        key_row = self.store.one('SELECT private_key, passphrase FROM user_ssh_keys WHERE user_id=?',
-                                 (identity['userid'],))
-        if not key_row:
-            raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
-        priv_key_str = self.store.open(key_row['private_key'])
-        passphrase_str = self.store.open(key_row['passphrase']) if key_row['passphrase'] else None
-        client_key = asyncssh.import_private_key(priv_key_str, passphrase=passphrase_str)
+        self.store.audit(identity['userid'], 'open-vm-terminal', vm_id)
+        client_key = asyncssh.import_private_key(self.store.open(record['private_key']))
         host_key = asyncssh.import_public_key(record['host_key'])
         known_hosts = ([host_key], [], [])
         conn = await asyncssh.connect(

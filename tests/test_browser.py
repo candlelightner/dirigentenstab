@@ -585,6 +585,9 @@ async def test_browser_header_agent_details_and_sidebar_selection_on_desktop_and
             await opener.click()
             await configure.wait_for()
             await subgroup.wait_for()
+            conf_box = await configure.bounding_box()
+            sub_box = await subgroup.bounding_box()
+            assert conf_box and sub_box and abs(conf_box['y'] - sub_box['y']) <= 1
             await details.get_by_text('Domain administrator', exact=True).wait_for()
             await details.get_by_text('Model: Local fixture / fixture-model', exact=True).wait_for()
             await details.get_by_text('Domain details', exact=True).click()

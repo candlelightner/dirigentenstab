@@ -884,7 +884,121 @@ async def test_recovery_requires_the_original_ssh_record_and_matching_owner(fail
     assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'failed', 'vm_id': None}
 
 
-async def test_confirmed_rejection_cli_is_the_only_resolution_for_a_legacy_failed_op_without_a_vm(failed_deployment):
+def _vm(name, state, vm_id='gone-vm'):
+    return {'id': vm_id, 'name': name, 'account': 'parent-service', 'domainid': 'parent-domain', 'state': state}
+
+
+@pytest.mark.parametrize('phase', ['prepared', 'dispatched', 'failed'])
+@pytest.mark.parametrize('state', [None, 'Destroyed', 'Expunging', 'Expunged', 'Error'])
+async def test_agent_can_abandon_a_deployment_with_no_usable_vm_to_unblock_new_ones(failed_deployment, phase, state):
+    service, cloud, operation_id, name = failed_deployment
+    service.store.execute('UPDATE vm_deployments SET phase=?', (phase,))
+    cloud.vms = [_vm(name, state)] if state else []
+    agent = await service.agent('parent')
+    with pytest.raises(CloudError, match='needs recovery'):
+        await service._deploy_managed(agent, cloud, {})
+    result = await service.recover_operation('parent', operation_id, abandon=True)
+    assert result['phase'] == 'rejected' and result['vm_id'] is None
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'rejected', 'vm_id': None}
+    assert service.store.all('SELECT * FROM vm_access') == []
+    assert service.store.one('SELECT actor,operation,target FROM audit WHERE operation=?', ('deployment-abandoned-by-agent',)) == {
+        'actor': 'parent', 'operation': 'deployment-abandoned-by-agent', 'target': operation_id}
+    assert all(command in {'listAccounts', 'listVirtualMachines', 'queryAsyncJobResult'} for command, _ in cloud.calls)
+
+    class NoCatalogue:
+        async def catalogue(self):
+            return {}
+
+    with pytest.raises(PermissionError, match='unavailable'):
+        await service._deploy_managed(agent, NoCatalogue(), {})
+
+
+@pytest.mark.parametrize('state', ['Running', 'Stopped', 'Starting', 'Stopping', 'Migrating', 'Unknown', None])
+async def test_abandon_is_refused_while_a_matching_owned_vm_may_be_live(failed_deployment, state):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, state, 'one'), _vm(name, state, 'two')] if state in {'Running', 'Stopped'} else [_vm(name, state)]
+    before = service.store.all('SELECT * FROM vm_access')
+    with pytest.raises(CloudError, match='inspect and clean it up natively'):
+        await service.recover_operation('parent', operation_id, abandon=True)
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'failed', 'vm_id': None}
+    assert service.store.all('SELECT * FROM vm_access') == before
+    assert not service.store.all('SELECT * FROM audit WHERE operation=?', ('deployment-abandoned-by-agent',))
+
+
+async def test_abandon_binds_a_usable_vm_instead_of_abandoning(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Running', 'owned-vm')]
+    result = await service.recover_operation('parent', operation_id, abandon=True)
+    assert (result['phase'], result['vm_id']) == ('complete', 'owned-vm')
+    assert service.store.one('SELECT vm_id FROM vm_access')['vm_id'] == 'owned-vm'
+    assert not service.store.all('SELECT * FROM audit WHERE operation=?', ('deployment-abandoned-by-agent',))
+
+
+def _with_job(service, cloud, operation_id, name, jobstatus):
+    service.store.execute('UPDATE vm_deployments SET params=?', (service.store.seal(
+        {'request': {'name': name}, 'result': {'jobid': 'job-1'}}),))
+    original = cloud.raw
+
+    async def raw(command, params):
+        if command == 'queryAsyncJobResult':
+            cloud.calls.append((command, params.copy()))
+            return {'jobstatus': jobstatus}
+        return await original(command, params)
+
+    cloud.raw = raw
+
+
+async def test_abandon_is_refused_while_the_deployment_job_is_still_running(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, 0)
+    before = service.store.all('SELECT * FROM vm_access')
+    with pytest.raises(CloudError, match='still running'):
+        await service.recover_operation('parent', operation_id, abandon=True)
+    assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == 'failed'
+    assert service.store.all('SELECT * FROM vm_access') == before
+
+
+@pytest.mark.parametrize('jobstatus', [1, 2])
+async def test_abandon_proceeds_once_the_deployment_job_has_finished_without_a_vm(failed_deployment, jobstatus):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, jobstatus)
+    assert (await service.recover_operation('parent', operation_id, abandon=True))['phase'] == 'rejected'
+    assert ('queryAsyncJobResult', {'jobid': 'job-1'}) in cloud.calls
+    assert service.store.all('SELECT * FROM vm_access') == []
+
+
+async def test_abandon_does_not_overwrite_a_deployment_resolved_concurrently(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    original, seen = service._owned_matches, []
+
+    async def matches(op):
+        result = await original(op)
+        seen.append(op)
+        if len(seen) == 2:  # the abandon re-check, after recovery found nothing
+            service.store.execute(
+                "UPDATE vm_deployments SET phase='complete',vm_id='late-vm'")
+        return result
+
+    service._owned_matches = matches
+    before = service.store.all('SELECT * FROM vm_access')
+    with pytest.raises(CloudError, match='changed during abandon'):
+        await service.recover_operation('parent', operation_id, abandon=True)
+    assert service.store.one('SELECT phase,vm_id FROM vm_deployments') == {'phase': 'complete', 'vm_id': 'late-vm'}
+    assert service.store.all('SELECT * FROM vm_access') == before
+    assert not service.store.all('SELECT * FROM audit WHERE operation=?', ('deployment-abandoned-by-agent',))
+
+
+@pytest.mark.parametrize('phase', ['complete', 'rejected'])
+async def test_abandon_of_a_resolved_deployment_is_an_error(failed_deployment, phase):
+    service, cloud, operation_id, _ = failed_deployment
+    service.store.execute('UPDATE vm_deployments SET phase=?', (phase,))
+    with pytest.raises(ValueError, match='unresolved'):
+        await service.recover_operation('parent', operation_id, abandon=True)
+    assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == phase
+    assert not cloud.calls
+
+
+async def test_confirmed_rejection_cli_resolves_a_legacy_failed_op_without_a_vm(failed_deployment):
     from scripts.admin import perform
 
     service, cloud, operation_id, _ = failed_deployment

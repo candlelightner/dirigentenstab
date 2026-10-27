@@ -21,9 +21,6 @@ class AgentCapabilities:
         def all(*args):
             return []
 
-    def user_ssh_key(self, identity):
-        return None
-
     def register_terminal_session(self, session):
         pass
 

@@ -225,15 +225,19 @@ current compaction settings.
   not manufacture an SSH credential for an arbitrary existing machine.
 - Configure the owner's SSH public key centrally once and add it to newly
   created VMs alongside agent access. Do not require per-VM manual SSH setup for
-  compatible managed deployments or store the owner's private SSH key.
+  compatible managed deployments. VM enrollment never needs the owner's private
+  SSH key. The embedded SSH terminal uses the VM's managed access key after native
+  authorization; the hub stores no owner private key.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.
 - Preserve verified guest host keys and protected agent credentials. Guest
   administrator access is not permission to execute arbitrary commands on the
   physical host running the hub or CloudStack.
-- V1 supplies connection details and CloudStack links. Embedded terminals and
-  embedded noVNC consoles are possible V2 work, not V1 requirements.
+- V1 supplies connection details, CloudStack links, an embedded SSH terminal,
+  and CloudStack's native noVNC console (embedded or in a new tab). Console
+  endpoints are requested just in time through the signed-in owner's own
+  CloudStack session; the hub does not implement its own VNC service.
 
 ## vGPU support: explicit host-level exception
 
@@ -276,7 +280,6 @@ guest licensing service, or development-workload orchestration to V1.
 - Artificial task spending, request, tool-call, or elapsed-time caps.
 - Additional human-user product workflows or a separate authentication system.
 - Duplicate CloudStack permission enforcement or a replacement CloudStack dashboard.
-- Embedded SSH terminals or embedded VM consoles.
 - Direct VM lifecycle buttons in the hub's informational VM list.
 - External notification integrations.
 - Full GPU passthrough.
