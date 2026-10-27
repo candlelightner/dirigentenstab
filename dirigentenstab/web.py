@@ -1166,7 +1166,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     if client.is_deleted or generation != render_generation or state['conversation'] != restored['id']:
                         return
             if autoscroll.value:
-                transcript_scroll.scroll_to(percent=1)
+                ui.run_javascript(
+                    f'requestAnimationFrame(() => {{ const c = getHtmlElement({transcript_scroll.id})'
+                    '?.querySelector(".q-scrollarea__container"); if (c) c.scrollTop = c.scrollHeight; })'
+                )
             state['activity_token'] = None
 
         escalation_rows = []
