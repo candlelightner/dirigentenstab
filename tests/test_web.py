@@ -21,6 +21,15 @@ class AgentCapabilities:
         def all(*args):
             return []
 
+    def user_ssh_key(self, identity):
+        return None
+
+    def register_terminal_session(self, session):
+        pass
+
+    def unregister_terminal_session(self, session):
+        pass
+
     async def vm_overview(self, identity, agent_id):
         return []
 

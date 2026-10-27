@@ -1068,3 +1068,67 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await page.screenshot(path=str(state / 'escalation-mobile.png'), full_page=True, animations='disabled')
         await browser.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, width, height):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        page = await context.new_page()
+        await login(page, url)
+
+        # Open drawer if search/hierarchy is hidden
+        search = page.get_by_label('Search agents and domains', exact=True)
+        if not await search.is_visible():
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await search.wait_for()
+
+        # Check sidebar selector exists
+        sidebar_select = page.locator('.q-drawer').get_by_text('Agents', exact=True).first
+        await sidebar_select.wait_for()
+
+        # Open sidebar selector menu to switch to "Agents and VMs"
+        await sidebar_select.click()
+        await page.get_by_role('option', name='Agents and VMs', exact=True).click()
+        await page.wait_for_timeout(300)
+
+        # Under Research Admin, research-vm should be visible
+        vm_node = page.locator('.q-drawer').get_by_text('research-vm', exact=True)
+        await vm_node.wait_for()
+
+        # Switch to "VMs" mode
+        await page.locator('.q-drawer').get_by_text('Agents and VMs', exact=True).first.click()
+        await page.get_by_role('option', name='VMs', exact=True).click()
+        await page.wait_for_timeout(300)
+
+        # In VMs mode, research-vm is still visible under Research Admin
+        await vm_node.wait_for()
+
+        # Click the VM node to open terminal pane
+        await vm_node.click()
+
+        # Terminal pane should be visible
+        terminal_pane = page.locator('.terminal-pane')
+        await terminal_pane.wait_for()
+
+        # Terminal status should indicate connection attempt / status
+        status = page.locator('.terminal-pane [role="status"]')
+        await status.wait_for()
+
+        # Terminal controls visible
+        await page.locator('.terminal-pane').get_by_role('button', name='Reconnect', exact=True).wait_for()
+        await page.locator('.terminal-pane').get_by_role('button', name='Disconnect', exact=True).wait_for()
+
+        # Verify zero horizontal overflow on both desktop and mobile
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+
+        # Close terminal pane to return to chat
+        await page.locator('.terminal-pane').get_by_role('button', name='Close terminal', exact=True).click()
+        await page.get_by_label('Message', exact=True).wait_for()
+        await playwright.expect(terminal_pane).not_to_be_visible()
+
+        # Verify zero horizontal overflow again
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await browser.close()

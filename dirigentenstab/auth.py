@@ -83,6 +83,8 @@ class Auth:
                 raise PermissionError('CloudStack role changed; log in again')
         except (PermissionError, CloudError, httpx.HTTPError):
             self.store.execute('DELETE FROM sessions WHERE token_hash=?', (hashed,))
+            if hasattr(self.service, 'close_user_terminal_sessions') and identity.get('userid'):
+                self.service.close_user_terminal_sessions(identity['userid'])
             raise PermissionError('CloudStack session no longer valid') from None
         return identity
 
@@ -98,6 +100,8 @@ class Auth:
         self.store.execute('DELETE FROM sessions WHERE token_hash=?', (hashed,))
         if session:
             private = self.store.open(session['identity'])
+            if hasattr(self.service, 'close_user_terminal_sessions') and private.get('userid'):
+                self.service.close_user_terminal_sessions(private['userid'])
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     await client.post(self.service.settings.cloudstack_url,
