@@ -79,6 +79,14 @@ async def select_agent(page, name):
     await page.get_by_role('button', name='Agent details', exact=True).get_by_text(name, exact=True).wait_for()
 
 
+async def ensure_navigation_open(page):
+    # After a reload the drawer follows show-if-above: open on desktop, closed on mobile.
+    close = page.get_by_role('button', name='Close agent hierarchy', exact=True)
+    if not await close.is_visible():
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+    await close.wait_for()
+
+
 async def open_configuration(page):
     await page.get_by_role('button', name='Agent details', exact=True).click()
     await page.locator('.agent-details').get_by_role('button', name='Configure', exact=True).click()
@@ -168,10 +176,9 @@ async def test_browser_remembers_last_open_conversation_per_agent(browser_app):
         await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
         assert await page.get_by_text('Second research conversation', exact=True).count() == 0
         await page.reload()
-        await page.get_by_text('Main conversation', exact=True).last.wait_for()
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.locator('.q-message').get_by_text('First research conversation', exact=True).wait_for()
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await ensure_navigation_open(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Sign out', exact=True).click()
         await page.get_by_role('button', name='Sign in', exact=True).wait_for()
@@ -195,7 +202,7 @@ async def test_browser_remembers_last_open_conversation_per_agent(browser_app):
         await playwright.expect(message).to_have_value('New draft')
         assert await page.locator('.q-message').count() == 0
         await page.reload()
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         assert await page.locator('.q-message').count() == 0
         await browser.close()
 
@@ -252,7 +259,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await page.get_by_role('dialog').wait_for(state='hidden')
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Team 2 Level 3')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Team 2 Level 3', exact=True).wait_for()
         await open_configuration(page)
         await page.get_by_label('Model ID', exact=True).wait_for()
         await playwright.expect(page.get_by_label('Model ID', exact=True)).to_have_value('custom-private-model')
@@ -680,7 +687,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         assert store.one("SELECT thinking FROM agents WHERE id='research'")['thinking'] == 'max'
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await open_configuration(page)
         await page.get_by_text('Levels advertised by the provider model API.', exact=True).wait_for()
         await thinking.click()
@@ -714,7 +721,7 @@ async def test_browser_thinking_settings_follow_model_metadata_and_pending_anima
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         assert not await indicator.is_visible()
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill('thinking indicator')
         await page.get_by_role('option', name='thinking indicator', exact=True).click()
         await page.get_by_text('Pending response complete.', exact=True).wait_for()
@@ -742,7 +749,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
             if restored:
                 await page.reload()
                 await page.wait_for_function('window.socket?.connected && window.did_handshake')
-                await select_agent(page, 'Research Admin')
+                await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
                 await page.get_by_label('Conversation', exact=True).fill(title)
                 await page.get_by_role('option', name=title, exact=True).click()
                 await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
@@ -801,7 +808,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
                             'auto_compact_percent': 75, 'context_window': 65536}
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await open_configuration(page)
         await page.get_by_text('Manual context-window override.', exact=False).wait_for()
         assert await model.input_value() == 'second-model'
@@ -830,7 +837,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         assert tool_budget['usable_tokens'] == 57344
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
         await playwright.expect(meter).not_to_be_visible()
@@ -846,7 +853,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         store.execute('UPDATE chat_runs SET checkpoint=? WHERE id=?', (store.seal(checkpoint), run['id']))
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill(title)
         await page.get_by_role('option', name=title, exact=True).click()
         await page.get_by_role('button', name='Run details', exact=True).click()
@@ -1045,7 +1052,7 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         await page.get_by_text('Escalation result available.', exact=True).wait_for()
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_text('Escalation result available.', exact=True).wait_for()
         await page.get_by_role('button', name='New conversation', exact=True).click()
         await page.get_by_label('Message', exact=True).fill('escalation fixture')
@@ -1409,9 +1416,9 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await page.keyboard.press('Escape')
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
-        await select_agent(page, 'Research Admin')
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.locator('.messages table').wait_for()
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await ensure_navigation_open(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         await playwright.expect(toggle).not_to_be_checked()
         await page.keyboard.press('Escape')
@@ -1433,4 +1440,82 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_visible()
         await page.wait_for_function("""() => { const el = document.querySelector('.messages .q-scrollarea__container');
             return el.scrollTop > 100 && el.scrollHeight - el.clientHeight - el.scrollTop < 5; }""")
+        await browser.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_browser_reload_restores_open_agent_vm_mode_and_skill(browser_app, width, height):
+    url, state = browser_app
+    from dirigentenstab.store import Store
+
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    store.execute('INSERT INTO skills(id,creator_agent_id,name,description,text,created,updated) VALUES(?,?,?,?,?,?,?)',
+                  ('restore-skill', 'research', 'Restorable skill', 'Summary', store.seal('Restorable skill text'), 1, 1))
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        page = await context.new_page()
+        await login(page, url)
+        heading = page.get_by_role('button', name='Agent details', exact=True)
+        pane = page.locator('.terminal-pane')
+        frame = page.locator('iframe[title="VM console"]')
+
+        async def reloaded():
+            await page.reload()
+            await page.wait_for_function('window.socket?.connected && window.did_handshake')
+
+        async def open_node(label):
+            search = page.get_by_label('Search agents and domains', exact=True)
+            await ensure_navigation_open(page)
+            await playwright.expect(page.locator('.q-drawer .sidebar-view-select')).not_to_have_class(
+                re.compile(r'.*q-field--disabled.*'))
+            await search.fill(label)
+            await page.locator('.q-tree').get_by_text(label, exact=True).click()
+
+        # A non-default agent and its open conversation come back after a reload.
+        await select_agent(page, 'Research Admin')
+        await page.get_by_label('Message', exact=True).fill('Restored conversation')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        await page.wait_for_function('location.search === "?agent=research"')
+        await reloaded()
+        await heading.get_by_text('Research Admin', exact=True).wait_for()
+        await page.locator('.q-message').get_by_text('Restored conversation', exact=True).wait_for()
+
+        # A bogus id falls back to the default agent without an error toast.
+        await page.goto(url + '/?agent=nope')
+        await heading.get_by_text('Main Agent', exact=True).wait_for()
+        assert await page.locator('.q-notification').count() == 0
+
+        # Show every sidebar view, then open the VM in SSH and Console mode.
+        await page.evaluate(
+            'localStorage.setItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003", '
+            'JSON.stringify({view: ["Agents", "VMs", "Skills"], aliases: false}))')
+        await reloaded()
+        await open_node('research-vm')
+        await pane.wait_for()
+        await page.wait_for_function('/^\\?vm=[^&]+&mode=ssh$/.test(location.search)')
+        vm_query = await page.evaluate('location.search')
+        await reloaded()
+        await pane.wait_for()
+        await playwright.expect(frame).not_to_be_visible()
+        await page.locator('.terminal-container').wait_for()
+        await pane.get_by_role('button', name='Console', exact=True).click()
+        await page.wait_for_function('location.search.endsWith("&mode=console")')
+        await reloaded()
+        await pane.wait_for()
+        await playwright.expect(frame).to_have_attribute('src', re.compile(r'^/vm-console/'))
+        assert await page.evaluate('location.search') == vm_query.replace('mode=ssh', 'mode=console')
+        assert 'ticket' not in await page.evaluate('location.href')
+
+        # An open skill editor comes back too; closing it returns the URL to the main pane target.
+        await open_node('Restorable skill')
+        await playwright.expect(page.get_by_label('Full text', exact=True)).to_have_value('Restorable skill text')
+        await page.wait_for_function('location.search === "?skill=restore-skill"')
+        await reloaded()
+        await playwright.expect(page.get_by_label('Full text', exact=True)).to_have_value('Restorable skill text')
+        await page.get_by_role('dialog').get_by_role('button', name='Close', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        await page.wait_for_function('/^\\?agent=[^&]+$/.test(location.search)')
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await browser.close()

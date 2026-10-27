@@ -3,6 +3,7 @@ import html
 import json
 import math
 import os
+from urllib.parse import urlencode
 
 import asyncssh
 import httpx
@@ -580,6 +581,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 (f'last_conversation:{identity["userid"]}:{state["agent"]}', conversation_id or ''),
             )
 
+        def sync_url(skill_id=None):
+            # Keep the main pane target in the query string so a reload restores it; ids only, never secrets.
+            query = ({'skill': skill_id} if skill_id else {'vm': state['current_vm'], 'mode': terminal_mode.value}
+                     if state.get('current_vm') else {'agent': state['agent']} if state['agent'] else {})
+            ui.run_javascript('history.replaceState(null, "", ' + json.dumps('?' + urlencode(query)) + ')')
+
         async def render_agent(agent_id, *, close_navigation=True):
             close_active_terminal()
             set_console_src()
@@ -596,6 +603,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 prompt.enable()
             prompt.set_value(state['drafts'].get((agent_id, None), ''))
             state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, activity_token=None)
+            sync_url()
             sync_composer()
             prompt.enable()
             conversation_card.props(remove='data-operation-id')
@@ -829,6 +837,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         async def switch_terminal_mode(mode):
             console = mode == 'console'
+            sync_url()
             terminal_error.set_text('')
             terminal_error.set_visibility(False)
             if console:
@@ -873,6 +882,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             terminal_pane.set_visibility(False)
             conversation_controls.set_visibility(True)
             conversation_card.set_visibility(True)
+            sync_url()
             if state.get('agent'):
                 agent = agents.get(state['agent'])
                 if agent:
@@ -984,6 +994,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                             field.on_value_change(changed)
                     ui.button('Close', on_click=skill_dialog.close).props('flat')
             drawer.run_method('hide')
+            sync_url(skill_id)
+            skill_dialog.on('hide', lambda: sync_url())
             skill_dialog.open()
 
         async def select_node(event):
@@ -2052,8 +2064,25 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             gpu_button.on_click(lambda: protect(lambda: open_dialog(gpu_dialog)))
 
         main = next((a for a in agents.values() if a.get('is_main')), None)
-        if main:
+        query = request.query_params
+        requested = query.get('agent')
+        if requested in agents:
+            try:
+                await show_agent(requested, close_navigation=False)
+            except Exception:
+                pass  # Unavailable ids fall back to the default below.
+        if main and not state['agent']:
             await show_agent(main['id'], close_navigation=False)
+        vm_id, skill_id = query.get('vm'), query.get('skill')
+        if vm_id and any(v['id'] == vm_id for v in state['data'].get('vms', [])):
+            await show_vm(vm_id)
+            if query.get('mode') == 'console':
+                terminal_mode.set_value('console')
+        elif skill_id and any(s['id'] == skill_id for s in state['data'].get('skills', [])):
+            try:
+                await open_skill(skill_id)
+            except Exception:
+                pass
 
     return runtime
 
