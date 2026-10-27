@@ -19,6 +19,10 @@ def env(tmp_path):
         store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
                       (aid, aid, aid + '-domain', 'account', 'user', store.seal({})))
     service = Service(store, SimpleNamespace())
+    domains = [{'id': aid + '-domain', 'level': len(path)-1,
+                'parentdomainid': path[-2] + '-domain' if len(path)>1 else None}
+               for aid,path in paths.items()]
+    calls = []
 
     async def chain(agent):
         return [await service.agent(aid) for aid in paths[agent['id']]]
@@ -30,17 +34,25 @@ def env(tmp_path):
         if command == 'listAccounts':
             return {'account': [{'name': 'admin', 'domainid': 'root-domain', 'accounttype': 1, 'state': 'enabled'}]}
         if command == 'listDomains':
-            return {'domain': [{'id': aid + '-domain'} for aid in paths]}
+            calls.append(('human', command, params))
+            return {'domain': domains}
         raise AssertionError('Skill approval must never execute a native command')
 
-    service.agent_chain, service.human_call = chain, human_call
+    async def cloud_client(agent):
+        async def raw(command, params):
+            assert command == 'listDomains'
+            calls.append((agent['id'], command, params))
+            return {'domain': domains}
+        return SimpleNamespace(raw=raw)
+
+    service.agent_chain, service.human_call, service.cloud_client = chain, human_call, cloud_client
     owner = {'userid': 'owner', 'account': 'admin', 'domainid': 'root-domain', 'type': 1}
     store.execute('INSERT INTO sessions VALUES(?,?,?,?)', ('session', 'csrf', store.seal(owner), 99999999999))
     store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                   ('conversation', 'creator', 'owner', 'Skill', 1, store.seal([])))
     store.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
                   ('run', 'conversation', 'running', 'creator', 1, 1, store.seal([])))
-    return SimpleNamespace(store=store, service=service, owner={**owner, '_session': 'session'},
+    return SimpleNamespace(store=store, service=service, domains=domains, calls=calls, owner={**owner, '_session': 'session'},
                            creator={'_agent_id': 'creator'}, child={'_agent_id': 'child'}, sibling={'_agent_id': 'sibling'})
 
 
@@ -187,3 +199,73 @@ async def test_selected_recipient_loses_access_when_moved_out_of_creator_subtree
 
     monkeypatch.setattr(e.service, 'agent_chain', moved)
     assert await e.service.list_skills(e.child) == []
+
+
+@pytest.mark.parametrize('human', [False, True])
+async def test_editor_descendants_use_one_native_snapshot_for_many_agents(env, monkeypatch, human):
+    e = env
+    skill = await create(e)
+    for index in range(40):
+        aid = f'extra-{index}'
+        e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                        (aid, aid, aid+'-domain', 'account', 'user', e.store.seal({})))
+        e.domains.append({'id': aid+'-domain', 'parentdomainid': 'creator-domain', 'level': 2})
+    original = e.service.agent_chain
+    checked = []
+
+    async def chain(agent):
+        checked.append(agent['id'])
+        return await original(agent)
+
+    monkeypatch.setattr(e.service, 'agent_chain', chain)
+    e.calls.clear()
+    result = await e.service.get_skill(e.owner if human else e.creator, skill['id'])
+    assert len(result['shareable_agents']) == 42
+    snapshots = [call for call in e.calls if 'id' not in call[2]]
+    assert len(snapshots) == 1
+    assert snapshots[0][0] == ('human' if human else 'creator')
+    assert set(checked) <= {'creator'}
+
+
+@pytest.mark.parametrize('fault', ['disabled', 'missing', 'level', 'cycle'])
+async def test_batched_descendants_require_complete_enabled_managed_ancestry(env, fault):
+    e = env
+    skill = await create(e)
+    child = next(d for d in e.domains if d['id'] == 'child-domain')
+    if fault == 'disabled':
+        e.store.execute("UPDATE agents SET enabled=0 WHERE id='child'")
+    elif fault == 'missing':
+        e.domains.remove(child)
+    elif fault == 'level':
+        child['level'] = 9
+    else:
+        child['parentdomainid'] = 'grandchild-domain'
+    available = await e.service.get_skill(e.creator, skill['id'])
+    assert not {'child', 'grandchild'} & {a['id'] for a in available['shareable_agents']}
+    with pytest.raises(PermissionError, match='descendants'):
+        await e.service.share_skill(e.creator, skill['id'], ['grandchild'])
+
+
+async def test_share_rechecks_native_snapshot_after_domain_move(env):
+    e = env
+    skill = await create(e)
+    assert 'child' in {a['id'] for a in (await e.service.get_skill(e.creator, skill['id']))['shareable_agents']}
+    child = next(d for d in e.domains if d['id'] == 'child-domain')
+    child['parentdomainid'] = 'sibling-domain'
+    with pytest.raises(PermissionError, match='descendants'):
+        await e.service.share_skill(e.creator, skill['id'], ['child'])
+
+
+async def test_global_skill_sharing_keeps_main_agent_as_a_separate_root(env):
+    from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
+    e = env
+    e.store.execute("DELETE FROM agents WHERE id='root'")
+    for aid,domain in [(GLOBAL_ADMIN_AGENT, 'root-domain'), (APP_ROOT_AGENT, 'main-domain'),
+                       ('main-child', 'main-child-domain')]:
+        e.store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) VALUES(?,?,?,?,?,?)',
+                        (aid, aid, domain, 'account', 'user', e.store.seal({})))
+    e.domains.extend([{'id': 'main-domain', 'parentdomainid': 'root-domain', 'level': 1},
+                      {'id': 'main-child-domain', 'parentdomainid': 'main-domain', 'level': 2}])
+    skill = await e.service.save_skill(e.owner, GLOBAL_ADMIN_AGENT, 'Global setup', 'Setup notes', 'Full text')
+    loaded = await e.service.get_skill(e.owner, skill['id'])
+    assert not {APP_ROOT_AGENT, 'main-child'} & {a['id'] for a in loaded['shareable_agents']}

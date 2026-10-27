@@ -68,22 +68,23 @@ def agent_label(agent):
 def hierarchy_nodes(data, mode='Agents', show_aliases=False):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
     selected = set(mode) if isinstance(mode, (list, tuple, set)) else set(mode.split(' and '))
-    skill_nodes = [{'id': 'skill:' + skill['id'], 'label': skill['name'], 'icon': 'description', 'children': []}
-                   for skill in data.get('skills', [])] if 'Skills' in selected else []
-    if not selected & {'Agents', 'VMs'}:
-        return skill_nodes
-    mode = 'Agents and VMs' if {'Agents', 'VMs'} <= selected else 'VMs' if 'VMs' in selected else 'Agents'
-    global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
-    agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
-    vms_by_agent = {}
-    if mode in {'VMs', 'Agents and VMs'}:
-        for vm in data.get('vms', []):
-            if vm.get('owner_agent'):
-                vms_by_agent.setdefault(vm['owner_agent'], []).append(vm)
 
     def vm_label(vm):
         alias = vm.get('displayname')
         return alias if (show_aliases and alias and alias != vm.get('name')) else (vm.get('name') or vm['id'])
+
+    global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
+    agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
+    resources_by_agent = {}
+    if 'VMs' in selected:
+        for vm in data.get('vms', []):
+            if vm.get('owner_agent'):
+                resources_by_agent.setdefault(vm['owner_agent'], []).append({
+                    'id': 'vm:' + vm['id'], 'label': vm_label(vm), 'icon': 'dns', 'children': []})
+    if 'Skills' in selected:
+        for skill in data.get('skills', []):
+            resources_by_agent.setdefault(skill['creator_agent_id'], []).append({
+                'id': 'skill:' + skill['id'], 'label': skill['name'], 'icon': 'description', 'children': []})
 
     domains, roots = {}, []
     for domain in data.get('domains', []):
@@ -91,11 +92,7 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
         node_id = 'agent:' + agent['id'] if agent else 'domain:' + domain['id']
         label = agent_label(agent) if agent else domain['name']
         icon = 'smart_toy' if agent else 'folder'
-        children = []
-        if agent and agent['id'] in vms_by_agent:
-            for vm in vms_by_agent[agent['id']]:
-                children.append({'id': 'vm:' + vm['id'], 'label': vm_label(vm),
-                                 'icon': 'dns', 'children': []})
+        children = list(resources_by_agent.get(agent['id'], [])) if agent else []
         domains[domain['id']] = {'id': node_id, 'label': label, 'icon': icon, 'children': children}
 
     for domain in data.get('domains', []):
@@ -112,33 +109,29 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
                     (d['name'] == 'ROOT' and not d.get('parentdomainid'))}
     global_nodes = []
     for agent in global_agents:
-        children = []
-        if agent['id'] in vms_by_agent:
-            for vm in vms_by_agent[agent['id']]:
-                children.append({'id': 'vm:' + vm['id'], 'label': vm_label(vm),
-                                 'icon': 'dns', 'children': []})
+        children = list(resources_by_agent.get(agent['id'], []))
         global_nodes.append({'id': 'agent:' + agent['id'], 'label': agent_label(agent),
                              'icon': 'admin_panel_settings', 'children': children})
 
     all_nodes = global_nodes + [
         child for node in roots for child in
-        (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])
+        (node['children'] if node['id'].startswith('domain:') and node['id'].removeprefix('domain:') in native_roots else [node])
     ]
 
-    if mode == 'VMs':
+    if 'Agents' not in selected:
         def prune_and_mark(node):
             valid_children = []
-            has_vm_in_sub = False
+            has_resource_in_sub = False
             for c in node.get('children', []):
-                if c['id'].startswith('vm:'):
+                if c['id'].startswith(('vm:', 'skill:')):
                     valid_children.append(c)
-                    has_vm_in_sub = True
+                    has_resource_in_sub = True
                 else:
-                    child_pruned, child_has_vm = prune_and_mark(c)
-                    if child_has_vm:
+                    child_pruned, child_has_resource = prune_and_mark(c)
+                    if child_has_resource:
                         valid_children.append(child_pruned)
-                        has_vm_in_sub = True
-            if has_vm_in_sub:
+                        has_resource_in_sub = True
+            if has_resource_in_sub:
                 new_node = dict(node)
                 new_node['children'] = valid_children
                 new_node['selectable'] = False
@@ -147,12 +140,12 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
 
         pruned = []
         for n in all_nodes:
-            p, has_vm = prune_and_mark(n)
-            if has_vm:
+            p, has_resource = prune_and_mark(n)
+            if has_resource:
                 pruned.append(p)
-        return pruned + skill_nodes
+        return pruned
 
-    return all_nodes + skill_nodes
+    return all_nodes
 
 
 def tool_label(event):
@@ -936,7 +929,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             tree.props['nodes'] = hierarchy_nodes(
                 state.get('data', {}), mode=sidebar_select.value, show_aliases=alias_switch.value
             )
-            if has_vms:
+            if has_vms or 'Skills' in (sidebar_select.value or []):
                 tree.expand()
             tree.update()
 
@@ -949,6 +942,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             tree.props['nodes'] = hierarchy_nodes(
                 updated, mode=sidebar_select.value, show_aliases=alias_switch.value
             )
+            if set(sidebar_select.value or []) & {'VMs', 'Skills'}:
+                tree.expand()
             tree.update()
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 

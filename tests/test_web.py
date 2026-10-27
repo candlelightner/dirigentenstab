@@ -977,14 +977,56 @@ def test_history_displays_generic_escalation_notice_without_machine_instructions
     assert list(history_parts(history)) == [('notice', 'Escalation result available.')] * 2
 
 
-def test_sidebar_skills_show_names_without_loading_full_text():
-    data = {'domains': [{'id': 'domain', 'name': 'Research'}],
-            'agents': [{'id': 'agent', 'domain_id': 'domain', 'name': 'Research Admin'}],
-            'skills': [{'id': 'skill', 'name': 'GPU setup', 'description': 'Prepare GPU capacity',
-                        'text': 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR'}]}
-    skill_node = {'id': 'skill:skill', 'label': 'GPU setup', 'icon': 'description', 'children': []}
-    assert hierarchy_nodes(data, mode=['Skills']) == [skill_node]
-    assert hierarchy_nodes(data, mode=['Agents', 'Skills'])[-1] == skill_node
-    assert hierarchy_nodes(data, mode=['VMs', 'Skills']) == [skill_node]
-    assert 'GPU setup' not in str(hierarchy_nodes(data, mode=['Agents']))
-    assert 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR' not in str(hierarchy_nodes(data, mode=['Agents', 'VMs', 'Skills']))
+@pytest.mark.parametrize('mode', [
+    ['Agents'], ['VMs'], ['Skills'], ['Agents', 'VMs'], ['Agents', 'Skills'],
+    ['VMs', 'Skills'], ['Agents', 'VMs', 'Skills'],
+])
+def test_sidebar_resources_remain_under_creators_and_keep_only_needed_ancestors(mode):
+    data = {
+        'domains': [{'id': 'root', 'name': 'ROOT', 'level': 0},
+                    {'id': 'parent', 'name': 'Parent', 'parentdomainid': 'root'},
+                    {'id': 'child', 'name': 'Child', 'parentdomainid': 'parent'},
+                    {'id': 'vm-owner', 'name': 'VM owner', 'parentdomainid': 'parent'},
+                    {'id': 'empty', 'name': 'Empty', 'parentdomainid': 'parent'}],
+        'agents': [{'id': aid, 'domain_id': aid, 'name': aid} for aid in ('parent', 'child', 'vm-owner', 'empty')],
+        'vms': [{'id': 'vm', 'name': 'Worker', 'owner_agent': 'vm-owner'}],
+        'skills': [{'id': 'skill', 'creator_agent_id': 'child', 'name': 'GPU setup',
+                    'description': 'Prepare GPU capacity', 'text': 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR'}],
+    }
+    nodes = hierarchy_nodes(data, mode=mode)
+    parent = nodes[0]
+    assert parent['id'] == 'agent:parent'
+    expected = ['agent:child', 'agent:vm-owner', 'agent:empty'] if 'Agents' in mode else [
+        *(['agent:child'] if 'Skills' in mode else []), *(['agent:vm-owner'] if 'VMs' in mode else [])]
+    assert [child['id'] for child in parent['children']] == expected
+    children = {child['id']: child for child in parent['children']}
+    if 'Skills' in mode:
+        assert children['agent:child']['children'] == [
+            {'id': 'skill:skill', 'label': 'GPU setup', 'icon': 'description', 'children': []}]
+    else:
+        assert 'GPU setup' not in str(nodes)
+    if 'VMs' in mode:
+        assert children['agent:vm-owner']['children'] == [
+            {'id': 'vm:vm', 'label': 'Worker', 'icon': 'dns', 'children': []}]
+    else:
+        assert 'Worker' not in str(nodes)
+    for node in [parent, *parent['children']]:
+        assert node.get('selectable', True) == ('Agents' in mode)
+    assert 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR' not in str(nodes)
+    assert 'Prepare GPU capacity' not in str(nodes)
+
+
+@pytest.mark.parametrize('mode', [['Skills'], ['Agents', 'Skills'], ['VMs', 'Skills'], ['Agents', 'VMs', 'Skills']])
+def test_skills_preserve_creator_agent_on_native_root_and_separate_global_admin(mode):
+    nodes = hierarchy_nodes({
+        'domains': [{'id': 'root', 'name': 'ROOT', 'level': 0}],
+        'agents': [{'id': 'root-creator', 'domain_id': 'root', 'name': 'Root creator'},
+                   {'id': 'global', 'domain_id': 'root', 'name': 'Global', 'is_global': True}],
+        'skills': [{'id': 'root-skill', 'name': 'Root skill', 'creator_agent_id': 'root-creator'},
+                   {'id': 'global-skill', 'name': 'Global skill', 'creator_agent_id': 'global'}],
+    }, mode=mode)
+    assert [node['id'] for node in nodes] == ['agent:global', 'agent:root-creator']
+    assert nodes[0]['children'] == [
+        {'id': 'skill:global-skill', 'label': 'Global skill', 'icon': 'description', 'children': []}]
+    assert nodes[1]['children'] == [
+        {'id': 'skill:root-skill', 'label': 'Root skill', 'icon': 'description', 'children': []}]
