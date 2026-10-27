@@ -15,19 +15,14 @@ permissions:
 
 jobs:
   chromium:
-    name: chromium (shard ${{ matrix.shard }}/2)
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
+    name: chromium
     runs-on: ubuntu-24.04
     timeout-minutes: 9
     container:
-      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-8825ff7ccb75b371@sha256:624e2bbe4eb7f7067a86184b16972283399956f288b26bea5de0db1f345db7ba
+      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-027d0634fd9b8aa8@sha256:07b8dd13c915960c17c5f5919919b05a575f1a2b298f2243a60d8e1d1f6c2bf3
       options: --shm-size=1g
     env:
       HOME: /root
-      BROWSER_SHARD: ${{ matrix.shard }}/2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,11 +54,11 @@ jobs:
       - name: Browser tests
         if: steps.changes.outputs.code == 'true'
         timeout-minutes: 8
-        run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
+        run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py -n 4 --timeout=120 --basetemp=browser-results
       - uses: actions/upload-artifact@v4
         if: always() && steps.changes.outputs.code == 'true'
         with:
-          name: playwright-browser-results-${{ matrix.shard }}
+          name: playwright-browser-results
           path: |
             browser-results/**/browser-server.log
             browser-results/**/*.png
