@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 9
     container:
-      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-027d0634fd9b8aa8@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-027d0634fd9b8aa8@sha256:07b8dd13c915960c17c5f5919919b05a575f1a2b298f2243a60d8e1d1f6c2bf3
       options: --shm-size=1g
     env:
       HOME: /root
