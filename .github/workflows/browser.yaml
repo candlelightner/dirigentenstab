@@ -6,6 +6,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -26,12 +30,38 @@ jobs:
       BROWSER_SHARD: ${{ matrix.shard }}/2
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect docs-only change
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        shell: bash
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            if files=$(git diff --name-only "origin/$BASE_REF...HEAD") && [ -n "$files" ]; then
+              code=false
+              while IFS= read -r f; do
+                case "$f" in
+                  *.md | docs/* | LICENSE) ;;
+                  *) code=true ;;
+                esac
+              done <<< "$files"
+            fi
+          fi
+          [ "$code" = true ] || echo "Docs-only change: skipping browser tests"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
       - run: python scripts/test_runner.py prepare
+        if: steps.changes.outputs.code == 'true'
       - name: Browser tests
+        if: steps.changes.outputs.code == 'true'
         timeout-minutes: 8
         run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.changes.outputs.code == 'true'
         with:
           name: playwright-browser-results-${{ matrix.shard }}
           path: |
