@@ -975,3 +975,16 @@ def test_history_displays_generic_escalation_notice_without_machine_instructions
         {'part_kind': 'user-prompt', 'content': '<system>[System notification: escalation decision] private result</system>'},
     ]}]}
     assert list(history_parts(history)) == [('notice', 'Escalation result available.')] * 2
+
+
+def test_sidebar_skills_show_names_without_loading_full_text():
+    data = {'domains': [{'id': 'domain', 'name': 'Research'}],
+            'agents': [{'id': 'agent', 'domain_id': 'domain', 'name': 'Research Admin'}],
+            'skills': [{'id': 'skill', 'name': 'GPU setup', 'description': 'Prepare GPU capacity',
+                        'text': 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR'}]}
+    skill_node = {'id': 'skill:skill', 'label': 'GPU setup', 'icon': 'description', 'children': []}
+    assert hierarchy_nodes(data, mode=['Skills']) == [skill_node]
+    assert hierarchy_nodes(data, mode=['Agents', 'Skills'])[-1] == skill_node
+    assert hierarchy_nodes(data, mode=['VMs', 'Skills']) == [skill_node]
+    assert 'GPU setup' not in str(hierarchy_nodes(data, mode=['Agents']))
+    assert 'FULL-TEXT-MUST-NOT-BE-IN-SIDEBAR' not in str(hierarchy_nodes(data, mode=['Agents', 'VMs', 'Skills']))

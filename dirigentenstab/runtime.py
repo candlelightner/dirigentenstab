@@ -579,7 +579,7 @@ class Runtime:
                 raise ConfigurationChanged()
             await self.service.authorize(identity, agent_id)
             tool = operation.__name__
-            read_only = (tool in {'search_api', 'describe_api', 'recover_operation'} or
+            read_only = (tool in {'search_api', 'describe_api', 'recover_operation', 'list_skills', 'get_skill'} or
                          tool == 'configure_agent' and args[2] is None or
                          tool == 'execute' and args[1].startswith(('list', 'get', 'query')))
             invocation_key = [agent_id, tool, args, kwargs]
@@ -591,7 +591,7 @@ class Runtime:
             await self._gate(agent_id).wait()
             now = time.time()
             if state:
-                if read_only and key in state['cache'] and state['cache'][key]['expires'] > now:
+                if read_only and tool not in {'list_skills', 'get_skill'} and key in state['cache'] and state['cache'][key]['expires'] > now:
                     state['cache_hits'] += 1
                     return copy.deepcopy(state['cache'][key]['result'])
                 if not read_only:
@@ -603,16 +603,16 @@ class Runtime:
                         # A fresh model tool call is an explicit retry; interrupted pending calls are never replayed.
                         key = hashlib.sha256(json.dumps([key, call_id]).encode()).hexdigest()
                     state['mutations'][key] = {'status': 'running', 'tool': tool, 'agent_id': agent_id,
-                                               'args': self.service.redact(args), 'kwargs': self.service.redact(kwargs),
+                                               'args': self.service.redact(args[:4] if tool == 'save_skill' else args), 'kwargs': self.service.redact(kwargs),
                                                'call_id': call_id, 'run_id': budget['operation_id']}
                     budget['save']()
             try:
                 result = self.service.redact(await operation(*args, **kwargs))
                 if state:
-                    if read_only:
+                    if read_only and tool not in {'list_skills', 'get_skill'}:
                         ttl = METADATA_TTL if tool in {'search_api', 'describe_api'} else INVENTORY_TTL
                         state['cache'][key] = {'expires': now + ttl, 'result': copy.deepcopy(result)}
-                    else:
+                    elif not read_only:
                         state['cache'].clear()
                         if isinstance(result, dict) and result.get('executed') and result.get('exit_code') is None:
                             state['mutations'][key].update(status='uncertain', result=copy.deepcopy(result))
@@ -641,6 +641,9 @@ class Runtime:
                           'Prefer exact available_api_names instead of repeated searches for known commands. '
                           'Discovery is informational: an absent API name does not prove a permission denial. '
                           'Use execute_api to let CloudStack authorize the request with this account. '
+                          'Available skills list names and short descriptions only; request get_skill explicitly when relevant. '
+                          'Use save_skill to create or edit skills, share_skill for selected descendants, '
+                          'and request_skill_global for human approval of the exact revision. '
                           'For the native installation prefer its Dirigentenstab-small offering when available; '
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
@@ -709,6 +712,44 @@ class Runtime:
                     return result
                 return {'request_id': result['id'], 'status': result['status'],
                         'message': 'Queued for owner approval; the command has not executed.'}
+
+        @agent.tool_plain
+        async def list_skills() -> list[dict]:
+            """List available skill names and short descriptions without loading their full text."""
+            return await invoke(self.service.list_skills, identity)
+
+        @agent.tool_plain
+        async def get_skill(skill_id: str) -> dict:
+            """Explicitly load the full text of an available skill when relevant to your work."""
+            return await invoke(self.service.get_skill, identity, skill_id)
+
+        @agent.tool(sequential=True)
+        async def save_skill(ctx: RunContext, name: str, description: str, text: str, skill_id: str | None = None) -> dict:
+            """Create a named skill or edit one you created or inherited from a descendant. Edits revoke global publication."""
+            creator = agent_id
+            if skill_id:
+                metadata = next((s for s in await self.service.list_skills(identity) if s['id'] == skill_id), None)
+                if not metadata:
+                    return {'error': 'Skill is unavailable'}
+                creator = metadata['creator_agent_id']
+            return await invoke(self.service.save_skill, identity, creator, name, description, text, skill_id, call_id=ctx.tool_call_id)
+
+        @agent.tool(sequential=True)
+        async def share_skill(ctx: RunContext, skill_id: str, agent_ids: list[str]) -> dict:
+            """Share a skill with selected descendants of its creator, replacing its selected recipients. No approval needed."""
+            return await invoke(self.service.share_skill, identity, skill_id, agent_ids, call_id=ctx.tool_call_id)
+
+        if (await self.service.escalation_access(record))['enabled']:
+            @agent.tool(sequential=True)
+            async def request_skill_global(ctx: RunContext, skill_id: str, reason: str) -> dict:
+                """Request explicit human approval to share this exact skill revision globally. Finish other work before pause_work."""
+                async def enqueue(acting_agent, selected_skill, explanation):
+                    row = await self.service.request_skill_global(
+                        acting_agent, selected_skill, explanation, conversation_id=conversation_id,
+                        run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+                    return {'request_id': row['id'], 'status': row['status']}
+                enqueue.__name__ = 'request_skill_global'
+                return await invoke(enqueue, agent_id, skill_id, reason, call_id=ctx.tool_call_id)
 
         @agent.tool_plain(sequential=True)
         async def create_subgroup(name: str, model: str | None = None, instructions: str | None = None,

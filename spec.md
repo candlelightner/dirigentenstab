@@ -176,6 +176,19 @@ creation.
 - Retain existing model-capability discovery and thinking-level configuration;
   no new model-management platform is required.
 
+## Skills
+
+- Skills have a required name, short description, and full text. Metadata appears
+  in each eligible agent's context; full text is loaded only through `get_skill`.
+- The creator and its ancestors can read and edit a skill, as can the human owner.
+  Editors may share it with selected descendants of the creator without approval;
+  recipients can read it but cannot edit or reshare it.
+- Global sharing requires explicit human approval of the exact revision, either
+  in the existing escalation queue or in the human skill editor. Editing removes
+  global visibility until the new revision receives approval.
+- The sidebar's existing view selector includes Skills. Selecting a skill opens
+  a minimal editor; names and descriptions are listed without loading full text.
+
 ## Context compaction
 
 Retain current configurable automatic compaction behavior, including:

@@ -67,9 +67,12 @@ def agent_label(agent):
 
 def hierarchy_nodes(data, mode='Agents', show_aliases=False):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
-    if isinstance(mode, (list, tuple, set)):
-        s = set(mode)
-        mode = 'Agents and VMs' if {'Agents', 'VMs'} <= s else 'VMs' if 'VMs' in s else 'Agents'
+    selected = set(mode) if isinstance(mode, (list, tuple, set)) else set(mode.split(' and '))
+    skill_nodes = [{'id': 'skill:' + skill['id'], 'label': skill['name'], 'icon': 'description', 'children': []}
+                   for skill in data.get('skills', [])] if 'Skills' in selected else []
+    if not selected & {'Agents', 'VMs'}:
+        return skill_nodes
+    mode = 'Agents and VMs' if {'Agents', 'VMs'} <= selected else 'VMs' if 'VMs' in selected else 'Agents'
     global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
     agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
     vms_by_agent = {}
@@ -147,9 +150,9 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
             p, has_vm = prune_and_mark(n)
             if has_vm:
                 pruned.append(p)
-        return pruned
+        return pruned + skill_nodes
 
-    return all_nodes
+    return all_nodes + skill_nodes
 
 
 def tool_label(event):
@@ -389,7 +392,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ':model-value="null"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
-                    sidebar_select = ui.select(['Agents', 'VMs'], multiple=True, value=['Agents']).props(
+                    sidebar_select = ui.select(['Agents', 'VMs', 'Skills'], multiple=True, value=['Agents']).props(
                         'dense options-dense').classes('sidebar-view-select text-base font-semibold min-w-[140px] max-w-[180px]').mark('sidebar_view_select')
                     sidebar_select.disable()
                     ui.space()
@@ -399,6 +402,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     'sidebar-show-aliases text-xs text-stone-600').mark('sidebar_show_aliases')
                 alias_switch.disable()
                 alias_switch.set_visibility('VMs' in (sidebar_select.value or []))
+                new_skill_button = ui.button('New skill', icon='add', on_click=lambda: protect(lambda: open_skill())).props('outline').classes('w-full')
+                new_skill_button.set_visibility(False)
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
                     tree = ui.tree(hierarchy_nodes(data, mode=sidebar_select.value, show_aliases=alias_switch.value)).classes('w-full').mark('hierarchy')
@@ -925,6 +930,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         def update_sidebar_view():
             has_vms = 'VMs' in (sidebar_select.value or [])
             alias_switch.set_visibility(has_vms)
+            new_skill_button.set_visibility('Skills' in (sidebar_select.value or []))
             ui.run_javascript(f'try {{ localStorage.setItem({sidebar_key}, '
                               + json.dumps(json.dumps({'view': sidebar_select.value, 'aliases': alias_switch.value})) + ') } catch (_) {}')
             tree.props['nodes'] = hierarchy_nodes(
@@ -946,10 +952,90 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             tree.update()
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
+        async def open_skill(skill_id=None):
+            tree.props['selected'] = None
+            tree.update()
+            current = await actor()
+            skill = await service.get_skill(current, skill_id) if skill_id else {
+                'creator_agent_id': state['agent'], 'name': '', 'description': '', 'text': '',
+                'shared_agent_ids': [], 'can_edit': True, 'shareable_agents': [], 'global_shared': False,
+            }
+            if not skill['creator_agent_id']:
+                raise ValueError('Select an agent before creating a skill')
+            editable = skill['can_edit']
+            with ui.dialog() as skill_dialog, ui.card().classes('w-full max-w-2xl min-w-0 gap-3').style(
+                    'max-height:90vh;overflow:auto'):
+                ui.label('Skill' if skill_id else 'New skill').classes('text-xl font-semibold')
+                creator = agents.get(skill['creator_agent_id'])
+                ui.label('Creator: ' + (agent_label(creator) if creator else skill['creator_agent_id'])).classes('text-sm text-stone-600')
+                name = ui.input('Skill name', value=skill['name']).props('maxlength=100').classes('w-full')
+                description = ui.textarea('Short description', value=skill['description']).props(
+                    'rows=2 maxlength=500').classes('w-full')
+                text = ui.textarea('Full text', value=skill['text']).props('rows=8 maxlength=60000').classes('w-full')
+                for field in (name, description, text):
+                    field.set_enabled(editable)
+                sharing = ui.select({agent['id']: agent['name'] for agent in skill['shareable_agents']},
+                                    multiple=True, value=skill['shared_agent_ids'],
+                                    label='Share with children').classes('w-full')
+                sharing.set_visibility(bool(skill_id and editable and skill['shareable_agents']))
+                if skill['global_shared']:
+                    ui.label('This revision is shared globally. Editing requires approval again.').classes(
+                        'text-sm text-stone-600')
+
+                async def save():
+                    saved = skill
+                    if not skill_id or (name.value, description.value, text.value) != (
+                            skill['name'], skill['description'], skill['text']):
+                        saved = await service.save_skill(await actor(), skill['creator_agent_id'], name.value or '',
+                                                         description.value or '', text.value or '', skill_id=skill_id)
+                    if skill_id:
+                        await service.share_skill(await actor(), saved['id'], sharing.value or [])
+                    await refresh()
+                    skill_dialog.close()
+                    ui.notify('Skill saved', type='positive')
+
+                async def review_global():
+                    with ui.dialog() as approval_dialog, ui.card().classes('w-full max-w-2xl min-w-0 gap-3').style(
+                            'max-height:90vh;overflow:auto'):
+                        ui.label('Approve global sharing').classes('text-xl font-semibold')
+                        ui.label('Revision ' + str(skill['revision'])).classes('text-sm')
+                        ui.label(skill['name']).classes('font-semibold break-all')
+                        ui.label(skill['description']).classes('whitespace-pre-wrap break-words')
+                        ui.label(skill['text']).classes('w-full whitespace-pre-wrap break-words')
+                        ui.label('All agents can read this revision. Edits require a new approval.').classes('text-sm')
+
+                        async def approve():
+                            await service.approve_skill_global(await actor(), skill_id, skill['revision'])
+                            await refresh()
+                            approval_dialog.close()
+                            skill_dialog.close()
+                            ui.notify('Skill shared globally', type='positive')
+
+                        with ui.row():
+                            ui.button('Approve', on_click=lambda: protect(approve))
+                            ui.button('Cancel', on_click=approval_dialog.close).props('flat')
+                    approval_dialog.open()
+
+                with ui.row().classes('w-full items-center gap-2'):
+                    if editable:
+                        ui.button('Save skill', on_click=lambda: protect(save))
+                    if skill_id and editable and current.get('type') == 1 and not skill['global_shared']:
+                        global_button = ui.button('Approve global sharing', on_click=lambda: protect(review_global)).props('outline')
+
+                        def changed():
+                            global_button.set_enabled((name.value, description.value, text.value) == (
+                                skill['name'], skill['description'], skill['text']))
+
+                        for field in (name, description, text):
+                            field.on_value_change(changed)
+                    ui.button('Close', on_click=skill_dialog.close).props('flat')
+            drawer.run_method('hide')
+            skill_dialog.open()
+
         async def select_node(event):
             if selection_lock.locked() or not event.value:
                 return
-            if set(sidebar_select.value or []) == {'VMs'} and not event.value.startswith('vm:'):
+            if 'Agents' not in (sidebar_select.value or []) and not event.value.startswith(('vm:', 'skill:')):
                 return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
@@ -979,6 +1065,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 domain_dialog.open()
             elif kind == 'vm':
                 await show_vm(identifier)
+            elif kind == 'skill':
+                await open_skill(identifier)
 
         async def choose_history(event):
             nonlocal history_generation
@@ -1970,7 +2058,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         def select_sidebar_view(e):
             nonlocal last_view
-            val = [x for x in (e.value or []) if x in {'Agents', 'VMs'}]
+            val = [x for x in (e.value or []) if x in {'Agents', 'VMs', 'Skills'}]
             if not val:
                 sidebar_select.set_value(last_view)
                 return
@@ -1986,7 +2074,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 saved = json.loads(await ui.run_javascript(
                     f'try {{ return localStorage.getItem({sidebar_key}) }} catch (_) {{ return null }}') or '{}')
                 raw_view = saved.get('view')
-                view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs'}]
+                view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs', 'Skills'}]
                         if isinstance(raw_view, list) else [])
                 alias_switch.set_value(saved.get('aliases') is True)
                 if view:

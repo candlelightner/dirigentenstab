@@ -1493,3 +1493,64 @@ async def test_escalation_queue_limit_is_clear_to_requesting_agent(service, monk
     result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Need a privileged action')
     assert result['output'] == 'Waiting for existing decisions'
     assert len(service.store.all('SELECT * FROM escalation_requests')) == 3
+
+
+async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(service, monkeypatch):
+    from types import MethodType
+    from dirigentenstab.service import Service
+
+    for name in ('_skill_metadata', 'list_skills', 'get_skill', 'save_skill', 'share_skill'):
+        setattr(service, name, MethodType(getattr(Service, name), service))
+
+    async def chain(agent):
+        return [await service.agent('parent'), agent] if agent['id'] == 'child' else [agent]
+
+    async def context(agent):
+        return {'skills': await service.list_skills({'_agent_id': agent['id']})}
+
+    service.agent_chain, service.context = chain, context
+    step, skill_id, reads = 0, None, 0
+    original_get = service.get_skill
+
+    async def get_skill(*args):
+        nonlocal reads
+        reads += 1
+        return await original_get(*args)
+
+    service.get_skill = get_skill
+    text = 'Full skill text must load only on demand'
+
+    async def model(messages, info):
+        nonlocal step, skill_id
+        assert text not in info.instructions
+        if step:
+            returned = messages[-1].parts[0].content
+            assert 'error' not in returned
+            if step == 1:
+                skill_id = returned['id']
+        actions = [
+            ('save_skill', {'name': 'Setup', 'description': 'Guest setup', 'text': text}),
+            ('share_skill', {'skill_id': skill_id, 'agent_ids': ['child']}),
+            ('share_skill', {'skill_id': skill_id, 'agent_ids': []}),
+            ('share_skill', {'skill_id': skill_id, 'agent_ids': ['child']}),
+            ('save_skill', {'name': 'Setup', 'description': 'Guest setup', 'text': 'Other text', 'skill_id': skill_id}),
+            ('save_skill', {'name': 'Setup', 'description': 'Guest setup', 'text': text, 'skill_id': skill_id}),
+            ('get_skill', {'skill_id': skill_id}),
+            ('get_skill', {'skill_id': skill_id}),
+        ]
+        if step == len(actions):
+            assert returned['text'] == text
+            yield 'Done'
+            return
+        name, args = actions[step]
+        step += 1
+        yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=f'skill-{step}')}
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Write and share a skill')
+    assert result['status'] == 'completed'
+    row = service.store.one('SELECT * FROM skills')
+    assert json.loads(row['shared_agent_ids']) == ['child']
+    assert row['revision'] == 3 and service.store.open(row['text']) == text
+    # Three edits/shares inspect the skill, and both explicit reads must reach the service.
+    assert reads == 7
