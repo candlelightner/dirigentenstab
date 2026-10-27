@@ -307,6 +307,7 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         await message.focus()
         await page.set_viewport_size({'width': 390, 'height': 480})
         await page.locator('.agent-details').wait_for(state='hidden')
+        await page.wait_for_function('() => { const r = document.querySelector(".composer")?.getBoundingClientRect(); return r && r.bottom <= 480; }')
         box = await message.bounding_box()
         await page.screenshot(path=str(state / 'mobile-keyboard.png'), full_page=True)
         assert box and box['y'] + box['height'] <= 480, await page.evaluate('''() => ({
