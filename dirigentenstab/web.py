@@ -625,7 +625,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                              else 'Domain administrator', color='primary')
                     ui.space()
                     ui.button(icon='close', on_click=details_menu.close).props('flat round aria-label="Close agent details"')
-                with ui.row().classes('w-full items-center justify-end gap-3'):
+                with ui.row().classes('w-full items-center justify-end gap-2 no-wrap'):
                     ui.button('Configure', icon='tune', on_click=lambda: protect(configure_agent)).props('flat')
                     if await service.subgroup_capability(agent_id):
                         ui.button('Create subgroup', icon='create_new_folder',
