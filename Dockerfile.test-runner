@@ -19,20 +19,20 @@ ENV VIRTUAL_ENV=/opt/venv \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY requirements.lock pyproject.toml /opt/test-runner/
-COPY scripts/test_runner.py /opt/test-runner/test_runner.py
+COPY scripts/test_runner.py /opt/test-runner/scripts/test_runner.py
 COPY Dockerfile.test-runner /opt/test-runner/Dockerfile.test-runner
 
 RUN python -m venv /opt/venv \
     && pip install --no-cache-dir "setuptools>=75" wheel \
     && pip install --no-cache-dir -r /opt/test-runner/requirements.lock \
-    && python /opt/test-runner/test_runner.py extras-requirements /opt/test-runner/extras.txt --root /opt/test-runner \
+    && python /opt/test-runner/scripts/test_runner.py extras-requirements /opt/test-runner/extras.txt --root /opt/test-runner \
     && pip install --no-cache-dir -c /opt/test-runner/requirements.lock -r /opt/test-runner/extras.txt \
     && pip check
 
 RUN python -m playwright install --with-deps --only-shell --no-remove chromium firefox \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python /opt/test-runner/test_runner.py write-manifest /opt/test-runner/manifest.json --root /opt/test-runner
+RUN python /opt/test-runner/scripts/test_runner.py write-manifest /opt/test-runner/manifest.json --root /opt/test-runner
 
 RUN git config --system --add safe.directory '*' \
     && chmod -R a+rX /ms-playwright /opt/test-runner \
