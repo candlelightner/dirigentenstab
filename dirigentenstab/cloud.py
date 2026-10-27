@@ -44,6 +44,16 @@ def redact(value, secrets=()):
     return value
 
 
+def error_detail(detail, params, secrets=()):
+    hidden = [*secrets, *(str(value) for key, value in params.items()
+              if SENSITIVE_FIELD.search(key) or len(str(value)) > 64)]
+    detail = str(detail)
+    for value in sorted(set(hidden), key=len, reverse=True):
+        if value:
+            detail = detail.replace(value, '[redacted]')
+    return ' '.join(str(redact(detail)).split())[:400]
+
+
 def validate(metadata: dict | None, params: dict):
     if not isinstance(params, dict) or len(params) > 128:
         raise ValueError('Parameters must be an object with at most 128 entries')
@@ -85,6 +95,30 @@ def validate(metadata: dict | None, params: dict):
         # Other paths/URLs are literal remote API values; CloudStack authorizes their use.
 
 
+async def wait_for_job(call, result, detail_for):
+    if result.get('jobid'):
+        job_id = result['jobid']
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            try:
+                job = await call('queryAsyncJobResult', {'jobid': job_id})
+            except (CloudError, PermissionError):
+                raise CloudError(f'CloudStack job status unavailable; job ID {job_id}. '
+                                 'Check status before retrying') from None
+            if job.get('jobstatus') == 1:
+                return job.get('jobresult', {})
+            if job.get('jobstatus') == 2:
+                failure = job.get('jobresult')
+                if not isinstance(failure, dict):
+                    failure = {}
+                detail = detail_for(failure.get('errortext', 'Native operation rejected'))
+                raise CloudError(f"CloudStack asynchronous operation failed ({failure.get('errorcode', 'unknown')}): "
+                                 f'{detail}; job ID {job_id}', public_detail=f'{detail}; job ID {job_id}'[:500])
+            await asyncio.sleep(2)
+        raise CloudError(f'CloudStack job remains pending; job ID {job_id}. Check status before retrying')
+    return result
+
+
 class Cloud:
     def __init__(self, settings, credentials):
         self.settings = settings
@@ -96,13 +130,7 @@ class Cloud:
         self._limit = asyncio.Semaphore(4)
 
     def _error_detail(self, detail, params):
-        hidden = [*self.credentials.values(), *(str(value) for key, value in params.items()
-                  if SENSITIVE_FIELD.search(key) or len(str(value)) > 64)]
-        detail = str(detail)
-        for value in sorted(set(hidden), key=len, reverse=True):
-            if value:
-                detail = detail.replace(value, '[redacted]')
-        return ' '.join(str(redact(detail)).split())[:400]
+        return error_detail(detail, params, self.credentials.values())
 
     async def _process(self, directory, args, max_bytes):
         env = {k: v for k, v in os.environ.items()
@@ -256,24 +284,4 @@ class Cloud:
             if exc.rejected:
                 self._metadata = None
             raise
-        if result.get('jobid'):
-            job_id = result['jobid']
-            deadline = time.monotonic() + 600
-            while time.monotonic() < deadline:
-                try:
-                    job = await self.raw('queryAsyncJobResult', {'jobid': job_id})
-                except CloudError:
-                    raise CloudError(f'CloudStack job status unavailable; job ID {job_id}. '
-                                     'Check status before retrying') from None
-                if job.get('jobstatus') == 1:
-                    return job.get('jobresult', {})
-                if job.get('jobstatus') == 2:
-                    failure = job.get('jobresult')
-                    if not isinstance(failure, dict):
-                        failure = {}
-                    detail = self._error_detail(failure.get('errortext', 'Native operation rejected'), params)
-                    raise CloudError(f"CloudStack asynchronous operation failed ({failure.get('errorcode', 'unknown')}): "
-                                     f'{detail}; job ID {job_id}', public_detail=f'{detail}; job ID {job_id}'[:500])
-                await asyncio.sleep(2)
-            raise CloudError(f'CloudStack job remains pending; job ID {job_id}. Check status before retrying')
-        return result
+        return await wait_for_job(self.raw, result, lambda detail: self._error_detail(detail, params))

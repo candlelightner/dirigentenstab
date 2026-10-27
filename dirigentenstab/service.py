@@ -11,8 +11,9 @@ from urllib.parse import quote
 
 import httpx
 
-from .cloud import Cloud, CloudError, redact, validate
+from .cloud import Cloud, CloudError, NAME, error_detail, redact, validate, wait_for_job
 from .settings import endpoint, dashboard_endpoint
+from .diagnostics import OperationError
 from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
@@ -96,7 +97,15 @@ class Service:
         try:
             data = response.json()
             value = next(iter(data.values()))
-            if response.is_error or 'errorcode' in value:
+            if 'errorcode' in value:
+                code = int(value['errorcode'])
+                if code in {401, 403}:
+                    raise PermissionError('CloudStack session no longer authorized')
+                detail = self.redact(error_detail(value.get('errortext', ''), params or {},
+                                                  [private['sessionkey'], *private['cookies'].values()]))
+                raise CloudError(f'CloudStack error {code}: {detail}',
+                                 rejected=code in {400, 431, 435, 436, 531, 535}, public_detail=detail)
+            if response.is_error:
                 raise PermissionError('CloudStack session no longer authorized')
             return value
         except (ValueError, StopIteration, TypeError):
@@ -173,7 +182,7 @@ class Service:
                 'approved_guest_assets': await self.guest_assets(agent['id']),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'transfer_vm_file', 'configure_agent']
-                         + (['request_compute_offering'] if (await self.compute_offering_access(agent))['enabled'] else []),
+                         + (['request_escalation'] if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
 
@@ -581,117 +590,143 @@ class Service:
             if paused:
                 await runtime.resume_agents(new_ids)
 
-    async def compute_offering_access(self, agent):
+    def escalation_request_limit(self):
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='escalation_request_limit'")
+        return int(row['value']) if row else 3
+
+    def save_escalation_request_limit(self, identity, value):
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Platform administrator required')
+        if type(value) is not int or value < 1:
+            raise ValueError('Open escalation request limit must be a positive whole number')
+        self.store.execute("INSERT INTO platform_settings VALUES('escalation_request_limit',?) "
+                           'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (str(value),))
+        self.store.audit(identity['userid'], 'configure-escalation-request-limit')
+
+    async def escalation_access(self, agent):
         chain = await self.agent_chain(agent)
-        selected = bool(agent['compute_offering_requests_enabled'])
-        allowed = all(member['compute_offering_requests_enabled'] for member in chain[:-1])
+        selected = bool(agent['escalation_requests_enabled'])
+        allowed = all(member['escalation_requests_enabled'] for member in chain[:-1])
         return {'selected': selected, 'allowed': allowed, 'enabled': selected and allowed}
 
-    def _offering_request(self, row):
+    def _escalation_request(self, row):
         return self.redact({**row, 'params': self.store.open(row['params']),
                             'result': self.store.open(row['result']) if row['result'] else None})
 
-    async def _validate_offering_gpu(self, agent_id, params, run_id):
-        # Indexed native map keys must not hide legacy passthrough/vGPU details.
-        if any(any(legacy in key.lower() for legacy in ('pcidevice', 'vgputype'))
-               or key.lower().startswith('details[') and key.lower().endswith('.key')
-               and str(value).lower() in {'pcidevice', 'vgputype'} for key, value in params.items()):
-            raise PermissionError('Use a native mediated vGPU profile, not legacy GPU details')
-        units = gpu_count(params)
-        if units:
-            if type(params.get('gpucount')) is not int or not params.get('vgpuprofileid'):
-                raise PermissionError('GPU offering requests require a native vGPU profile and positive integer GPU count')
-            await helper_call(self.settings, 'validate_offering', session=None, agent_id=agent_id,
-                              params=params, run_id=run_id)
-
-    async def request_compute_offering(self, agent_id, params, *, conversation_id, run_id, call_id):
+    async def request_escalation(self, agent_id, description, reason, command, params, *, conversation_id, run_id, call_id):
         agent = await self.agent(agent_id)
-        if not (await self.compute_offering_access(agent))['enabled']:
-            raise PermissionError('Compute offering requests are disabled by this agent or an ancestor')
+        if not (await self.escalation_access(agent))['enabled']:
+            raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
         run = self.store.one('SELECT r.agent_id,r.conversation_id,c.human_id FROM chat_runs r '
                              "JOIN conversations c ON c.id=r.conversation_id WHERE r.id=? AND c.agent_id=? AND r.status='running'",
                              (run_id, agent_id))
         if (not run or run['agent_id'] != agent_id or run['conversation_id'] != conversation_id
                 or not isinstance(call_id, str) or not call_id or len(call_id) > 512):
-            raise PermissionError('Compute offering request must belong to the active conversation')
+            raise PermissionError('Escalation request must belong to the active conversation')
+        if not isinstance(command, str) or not NAME.fullmatch(command):
+            raise ValueError('Use the exact native CloudStack command name')
+        if (not isinstance(description, str) or not description.strip() or len(description) > 500
+                or not isinstance(reason, str) or not reason.strip() or len(reason) > 1000):
+            raise ValueError('Supply a description (1–500 characters) and reason (1–1000 characters)')
         validate(None, params)
         if len(json.dumps(params)) > 65536:
-            raise ValueError('Compute offering request parameters are too large')
-        if not isinstance(params.get('name'), str) or not params['name'].strip():
-            raise ValueError('A compute offering name is required')
-        if params.get('domainid', agent['domain_id']) != agent['domain_id']:
-            raise PermissionError('Requested offering must be scoped to the requesting agent domain')
-        params = {**params, 'domainid': agent['domain_id']}
-        await self._validate_offering_gpu(agent_id, params, run_id)
+            raise ValueError('Escalation parameters are too large')
+        description, reason = self.redact(description.strip()), self.redact(reason.strip())
         now, request_id = time.time(), str(uuid.uuid4())
         with self.store.connect() as conn:
-            conn.execute('INSERT INTO compute_offering_requests '
-                         '(id,agent_id,conversation_id,run_id,call_id,human_id,params,status,created,updated) '
-                         "VALUES(?,?,?,?,?,?,?,'pending',?,?) ON CONFLICT(run_id,call_id) DO NOTHING",
-                         (request_id, agent_id, conversation_id, run_id, call_id, run['human_id'],
-                          self.store.seal(params), now, now))
-            row = dict(conn.execute('SELECT * FROM compute_offering_requests WHERE run_id=? AND call_id=?',
-                                    (run_id, call_id)).fetchone())
-        if self.store.open(row['params']) != params:
-            raise ValueError('Tool call already requested a different offering')
-        return self._offering_request(row)
+            conn.execute('BEGIN IMMEDIATE')
+            existing = conn.execute('SELECT * FROM escalation_requests WHERE run_id=? AND call_id=?',
+                                    (run_id, call_id)).fetchone()
+            if existing:
+                row = dict(existing)
+            else:
+                setting = conn.execute("SELECT value FROM platform_settings WHERE name='escalation_request_limit'").fetchone()
+                limit = int(setting['value']) if setting else 3
+                count = conn.execute("SELECT COUNT(*) FROM escalation_requests WHERE agent_id=? AND status IN ('pending','applying')",
+                                     (agent_id,)).fetchone()[0]
+                if count >= limit:
+                    raise OperationError('escalation', f'This agent already has {count} open escalation requests (limit {limit}); wait for a decision before requesting another.', run_id)
+                conn.execute('INSERT INTO escalation_requests '
+                             '(id,agent_id,conversation_id,run_id,call_id,human_id,command,description,reason,params,status,created,updated) '
+                             "VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?)",
+                             (request_id, agent_id, conversation_id, run_id, call_id, run['human_id'], command,
+                              description, reason, self.store.seal(params), now, now))
+                row = dict(conn.execute('SELECT * FROM escalation_requests WHERE id=?', (request_id,)).fetchone())
+        if (row['command'], row['description'], row['reason'], self.store.open(row['params'])) != (command, description, reason, params):
+            raise ValueError('Tool call already requested a different escalation')
+        return self._escalation_request(row)
 
-    async def list_compute_offering_requests(self, identity):
+    async def list_escalation_requests(self, identity):
         if identity.get('_agent_id') or identity.get('type') != 1:
-            raise PermissionError('Compute offering decisions require the human owner')
+            raise PermissionError('Escalation decisions require the human platform administrator')
         domains = (await self.human_call(identity, 'listDomains', {'listall': 'true'})).get('domain', [])
         visible = {domain['id'] for domain in domains}
-        return [self._offering_request(row) for row in self.store.all(
-            'SELECT r.*,a.name AS agent_name,a.domain_id FROM compute_offering_requests r '
+        return [self._escalation_request(row) for row in self.store.all(
+            'SELECT r.*,a.name AS agent_name,a.domain_id FROM escalation_requests r '
             'JOIN agents a ON a.id=r.agent_id WHERE r.human_id=? ORDER BY r.created DESC',
             (identity['userid'],)) if row['domain_id'] in visible]
 
-    async def decide_compute_offering(self, identity, request_id, approve):
+    async def decide_escalation(self, identity, request_id, approve):
+        from .auth import Auth
         if identity.get('_agent_id') or identity.get('type') != 1:
-            raise PermissionError('Compute offering decisions require the human owner')
+            raise PermissionError('Escalation decisions require the human platform administrator')
         if type(approve) is not bool:
             raise ValueError('Approval must be a boolean')
-        row = self.store.one('SELECT * FROM compute_offering_requests WHERE id=?', (request_id,))
-        if not row or row['human_id'] != identity['userid']:
-            raise PermissionError('Compute offering request is unavailable to this owner')
-        agent = await self.authorize(identity, row['agent_id'])
+        current = await Auth(self).identity_from_session(identity.get('_session'))
+        if current['type'] != 1 or current['userid'] != identity['userid']:
+            raise PermissionError('A current human platform administrator session is required')
+        row = self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,))
+        if not row or row['human_id'] != current['userid']:
+            raise PermissionError('Escalation request is unavailable to this owner')
+        agent = await self.authorize(current, row['agent_id'])
         if row['status'] != 'pending':
-            return self._offering_request(row)
-        params = self.store.open(row['params'])
+            return self._escalation_request(row)
+        command, params = row['command'], self.store.open(row['params'])
         if approve:
-            if not (await self.compute_offering_access(agent))['enabled']:
-                raise PermissionError('Compute offering requests are disabled by this agent or an ancestor')
-            params['domainid'] = agent['domain_id']
-            apis = (await self.human_call(identity, 'listApis', {'name': 'createServiceOffering'})).get('api', [])
-            metadata = next((api for api in apis if api.get('name') == 'createServiceOffering'), None)
+            if not (await self.escalation_access(agent))['enabled']:
+                raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
+            if not isinstance(command, str) or not NAME.fullmatch(command):
+                raise ValueError('Use the exact native CloudStack command name')
+            validate(None, params)
+            apis = (await self.human_call(current, 'listApis', {'name': command})).get('api', [])
+            metadata = next((api for api in apis if api.get('name') == command), None)
             if not metadata:
-                raise PermissionError('Native createServiceOffering API is unavailable to the owner')
+                raise PermissionError('Requested native API is unavailable to the approving administrator')
             validate(metadata, params)
-            await self._validate_offering_gpu(agent['id'], params, row['run_id'])
         status = 'applying' if approve else 'deferred'
-        changed = self.store.execute("UPDATE compute_offering_requests SET status=?,updated=? WHERE id=? AND status='pending'",
+        changed = self.store.execute("UPDATE escalation_requests SET status=?,updated=? WHERE id=? AND status='pending'",
                                      (status, time.time(), request_id))
         if changed and approve:
+            result = {}
             try:
-                result = await self.human_call(identity, 'createServiceOffering', params)
-                offering = first(result, 'serviceoffering')
-                if not isinstance(offering, dict) or not isinstance(offering.get('id'), str) or not offering['id']:
-                    raise CloudError('CloudStack did not return a valid created compute offering ID')
+                result = await self.human_call(current, command, params)
+                if result.get('jobid'):
+                    self.store.execute('UPDATE escalation_requests SET result=?,updated=? WHERE id=?',
+                                       (self.store.seal(self.redact(result)), time.time(), request_id))
+                async def call(native_command, native_params):
+                    response = await self.human_call(current, native_command, native_params)
+                    if native_command == 'queryAsyncJobResult' and response.get('jobstatus') == 2:
+                        failure = self.redact(response.get('jobresult', {}))
+                        if isinstance(failure, dict) and 'errortext' in failure:
+                            failure['errortext'] = self.redact(error_detail(failure['errortext'], params))
+                        result.update(jobstatus=2, jobresult=failure)
+                    return response
+                result = await wait_for_job(call, result, lambda detail: self.redact(error_detail(detail, params)))
                 status = 'approved'
             except BaseException as exc:
-                # A lost response may hide a created offering; never dispatch this request twice.
-                status = 'failed' if isinstance(exc, CloudError) and exc.rejected else 'uncertain'
-                result = {'error': self.redact(str(exc)) or 'Offering creation was interrupted; inspect native offerings'}
-                self.store.execute('UPDATE compute_offering_requests SET status=?,result=?,updated=? WHERE id=?',
-                                   (status, self.store.seal(result), time.time(), request_id))
+                # A lost response may hide an applied mutation; never dispatch this request twice.
+                status = 'failed' if result.get('jobstatus') == 2 or isinstance(exc, CloudError) and exc.rejected else 'uncertain'
+                result = {**result, 'error': self.redact(error_detail(str(exc), params)) or 'Native request interrupted; inspect state'}
+                self.store.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',
+                                   (status, self.store.seal(self.redact(result)), time.time(), request_id))
                 if not isinstance(exc, Exception):
                     raise
             else:
-                self.store.execute('UPDATE compute_offering_requests SET status=?,result=?,updated=? WHERE id=?',
-                                   (status, self.store.seal(result), time.time(), request_id))
+                self.store.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',
+                                   (status, self.store.seal(self.redact(result)), time.time(), request_id))
         if changed:
-            self.store.audit(identity['userid'], 'decide-compute-offering', request_id, status)
-        return self._offering_request(self.store.one('SELECT * FROM compute_offering_requests WHERE id=?', (request_id,)))
+            self.store.audit(current['userid'], 'decide-escalation', request_id, status)
+        return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
 
     async def owner_ssh_key_access(self, agent):
         chain = await self.agent_chain(agent)
@@ -751,12 +786,12 @@ class Service:
                     'thinking', 'compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window')},
                     'enabled_providers': providers['selected'], 'allowed_providers': providers['allowed'],
                     'providers': providers['providers'], 'mcp_servers': mcp['servers'],
-                    'compute_offering_access': await self.compute_offering_access(target),
+                    'escalation_access': await self.escalation_access(target),
                     'owner_ssh_key_access': key_access, 'owner_ssh_public_key': owner_key['value'] if owner_key else None}
         if not isinstance(settings, dict) or not settings:
             raise ValueError('Supply agent settings')
         allowed = {'provider_id', 'model', 'instructions', 'thinking', 'compaction_provider_id',
-                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'mcp_tools', 'owner_ssh_key_enabled', 'compute_offering_requests_enabled'}
+                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'mcp_tools', 'owner_ssh_key_enabled', 'escalation_requests_enabled'}
         if set(settings) - allowed:
             raise ValueError('Unsupported agent setting')
         if actor_id == target_id and set(settings) != {'instructions'}:
@@ -807,7 +842,7 @@ class Service:
 
     async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None,
                            *, thinking=None, compaction_provider_id=_UNSET, compaction_model=_UNSET,
-                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, owner_ssh_key_enabled=_UNSET, compute_offering_requests_enabled=_UNSET):
+                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, owner_ssh_key_enabled=_UNSET, escalation_requests_enabled=_UNSET):
         agent = await self.authorize(identity, agent_id)
         if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
             raise ValueError('Provider missing')
@@ -845,19 +880,19 @@ class Service:
         chain = await self.agent_chain(agent)
         actor_id = identity.get('_agent_id')
         if actor_id == agent_id and (provider_id != agent['provider_id'] or model != agent['model'] or
-                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or owner_ssh_key_enabled is not _UNSET or compute_offering_requests_enabled is not _UNSET or any(
+                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or owner_ssh_key_enabled is not _UNSET or escalation_requests_enabled is not _UNSET or any(
                     value is not _UNSET for value in (compaction_provider_id, compaction_model, auto_compact_percent, context_window))):
             raise PermissionError('An agent may only edit its own system prompt')
         if actor_id and actor_id != agent_id and actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]}:
             raise PermissionError('Only an ancestor agent may configure descendants')
-        if compute_offering_requests_enabled is not _UNSET:
-            if type(compute_offering_requests_enabled) is not bool:
-                raise ValueError('Compute offering request access must be a boolean')
+        if escalation_requests_enabled is not _UNSET:
+            if type(escalation_requests_enabled) is not bool:
+                raise ValueError('Escalation request access must be a boolean')
             ancestors = chain[:-1]
             if actor_id and actor_id != agent_id:
                 ancestors = [*ancestors, *(await self.agent_chain(await self.agent(actor_id)))]
-            if compute_offering_requests_enabled and not all(member['compute_offering_requests_enabled'] for member in ancestors):
-                raise PermissionError('Compute offering request access cannot widen ancestor access')
+            if escalation_requests_enabled and not all(member['escalation_requests_enabled'] for member in ancestors):
+                raise PermissionError('Escalation request access cannot widen ancestor access')
         if owner_ssh_key_enabled is not _UNSET:
             if type(owner_ssh_key_enabled) is not bool:
                 raise ValueError('Owner SSH public key access must be a boolean')
@@ -901,13 +936,13 @@ class Service:
         async with self.configuration_change(affected):
             self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking),'
                                'compaction_provider_id=?,compaction_model=?,auto_compact_percent=?,context_window=?,'
-                               'enabled_providers=?,enabled_mcp_servers=?,owner_ssh_key_enabled=?,compute_offering_requests_enabled=? WHERE id=?',
+                               'enabled_providers=?,enabled_mcp_servers=?,owner_ssh_key_enabled=?,escalation_requests_enabled=? WHERE id=?',
                                (provider_id or None, model, instructions, thinking, compaction['compaction_provider_id'],
                                 compaction['compaction_model'], percentage, window,
                                 json.dumps(sorted(selection)) if enabled_providers is not _UNSET else agent.get('enabled_providers'),
                                 json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'),
                                 agent['owner_ssh_key_enabled'] if owner_ssh_key_enabled is _UNSET else owner_ssh_key_enabled,
-                                agent['compute_offering_requests_enabled'] if compute_offering_requests_enabled is _UNSET else compute_offering_requests_enabled, agent_id))
+                                agent['escalation_requests_enabled'] if escalation_requests_enabled is _UNSET else escalation_requests_enabled, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)
 
     async def _key(self, call, user_id, name):

@@ -487,7 +487,7 @@ async def test_real_cloudmonkey_signed_unknown_api_works_when_discovery_is_denie
 async def test_agent_context_discovery_is_informational_for_native_execution():
     from dirigentenstab.service import Service
 
-    record = {'id': 'agent', 'name': 'Agent', 'domain_id': 'owned-domain', 'compute_offering_requests_enabled': 1}
+    record = {'id': 'agent', 'name': 'Agent', 'domain_id': 'owned-domain', 'escalation_requests_enabled': 1}
     cloud = Native({'createServiceOffering'}, discovery_error=CloudError('Discovery denied', rejected=True))
     service = Service(SimpleNamespace(all=lambda *args: [], audit=lambda *args, **kwargs: None),
                       SimpleNamespace(max_output=65536))

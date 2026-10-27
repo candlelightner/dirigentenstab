@@ -10,6 +10,8 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.datastructures import Headers
 
+from .cloud import CloudError
+
 COOKIE = 'ds_session'
 
 
@@ -59,7 +61,9 @@ class Auth:
     async def identity(self, token):
         if not token or len(token) > 100:
             raise PermissionError('Login required')
-        hashed = self.digest(token)
+        return await self.identity_from_session(self.digest(token))
+
+    async def identity_from_session(self, hashed):
         session = self.store.one('SELECT * FROM sessions WHERE token_hash=? AND expires>?', (hashed, time.time()))
         if not session:
             raise PermissionError('Session expired')
@@ -77,7 +81,7 @@ class Auth:
                 raise PermissionError('CloudStack account disabled or revoked')
             if int(account.get('accounttype', -1)) != identity['type']:
                 raise PermissionError('CloudStack role changed; log in again')
-        except (PermissionError, httpx.HTTPError):
+        except (PermissionError, CloudError, httpx.HTTPError):
             self.store.execute('DELETE FROM sessions WHERE token_hash=?', (hashed,))
             raise PermissionError('CloudStack session no longer valid') from None
         return identity
@@ -121,7 +125,7 @@ class SessionGuard:
         if not public:
             try:
                 scope['ds_identity'] = await self.auth.identity(request.cookies.get(COOKIE))
-            except (PermissionError, httpx.HTTPError):
+            except (PermissionError, CloudError, httpx.HTTPError):
                 if scope['type'] == 'http' and path == '/' and scope.get('method') == 'GET':
                     return await RedirectResponse('/login', status_code=303)(scope, receive, send)
                 return await self.reject(scope, receive, send, 401)
