@@ -223,7 +223,7 @@ def test_migration_preserves_existing_agents(environment):
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 18
+    assert store.one('PRAGMA user_version')['user_version'] == 19
     assert all(row['owner_ssh_key_enabled'] == 1 for row in store.all('SELECT * FROM agents'))
 
 

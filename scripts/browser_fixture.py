@@ -91,6 +91,9 @@ def fake_api(state):
                                       'state': 'enabled', 'accounttype': 1}]}
             elif command == 'listDomains':
                 value = {'domain': [d for d in DOMAINS if not params.get('id') or d['id'] == params['id']]}
+            elif command == 'listVirtualMachines':
+                value = {'virtualmachine': [{'id': '00000000-0000-0000-0000-000000000004', 'name': 'research-vm',
+                                             'state': 'Running'}]}
             elif command == 'listApis':
                 value = {'api': [{'name': 'updateVirtualMachine', 'params': [
                     {'name': 'id', 'type': 'uuid', 'required': True},
@@ -274,6 +277,11 @@ def main():
                            'fixture', 'fixture-model'))
         conn.execute('INSERT INTO provisioning(id,name,model,instructions,phase,updated) VALUES(?,?,?,?,?,?)',
                       (APP_ROOT_AGENT, 'Agents', 'fixture-model', '', 'complete', 0))
+        conn.execute(
+            'INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
+            ('00000000-0000-0000-0000-000000000004', AGENT_ID, 'dirigent',
+             store.seal('fixture-vm-key'), 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGSLVRtZbt6j3blQyUYXi5uLqk2MmNJc3wB7hc4PKlkV', 22),
+        )
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')

@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
+from pathlib import Path
 import re
 import time
 import uuid
@@ -39,6 +41,7 @@ class Service:
         self._provision_lock = asyncio.Lock()
         self._deploy_lock = asyncio.Lock()
         self._secrets = set()
+        self._terminal_sessions = {}
         self.gpu_local = False
         self.gpu_deployment_id = None
         for row in store.all('SELECT credentials FROM agents UNION ALL SELECT credentials FROM legacy_agent_credentials'):
@@ -126,9 +129,24 @@ class Service:
         pending = [op for op in self.store.all(
             "SELECT id,parent_id,name,phase FROM provisioning WHERE phase<>'complete'")
             if op['parent_id'] in visible_agents]
+        managed_vms = self.store.all(
+            'SELECT va.vm_id AS id, va.owner_agent, COALESCE(vd.name, va.vm_id) AS name '
+            'FROM vm_access va LEFT JOIN vm_deployments vd ON vd.vm_id = va.vm_id '
+            'WHERE va.vm_id NOT LIKE "pending-%"'
+        )
+        cs_names = {}
+        try:
+            cs_vms = (await self.human_call(identity, 'listVirtualMachines', {'listall': 'true'})).get('virtualmachine', [])
+            cs_names = {vm['id']: vm.get('name') or vm.get('displayname') for vm in cs_vms if 'id' in vm}
+        except Exception:
+            pass
+        vms = [{'id': row['id'], 'owner_agent': row['owner_agent'],
+                'name': cs_names.get(row['id']) or row['name']}
+               for row in managed_vms if row['owner_agent'] in visible_agents]
         return {'domains': domains, 'agents': agents, 'pending_provisioning': pending,
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}
                           for user in users if user.get('domainid') in visible],
+                'vms': vms,
                 'status': 'CloudStack connected'}
 
     async def authorize(self, identity, agent_id, *, include_disabled=False):
@@ -767,6 +785,127 @@ class Service:
                 'port': record['port'] if record else 22,
                 'cloudstack_url': base + '#/vm/' + quote(vm['id'], safe='') if base else ''})
         return machines
+
+    def user_ssh_key(self, identity):
+        if not identity or not identity.get('userid'):
+            raise PermissionError('User authentication required')
+        row = self.store.one('SELECT public_key, created, updated FROM user_ssh_keys WHERE user_id=?',
+                             (identity['userid'],))
+        return dict(row) if row else None
+
+    async def save_user_ssh_key(self, identity, private_key_str, passphrase=None):
+        import asyncssh
+        if not identity or not identity.get('userid'):
+            raise PermissionError('User authentication required')
+        if not isinstance(private_key_str, str) or not private_key_str.strip() or len(private_key_str) > 65536:
+            raise ValueError('Valid SSH private key required')
+        passphrase_val = (passphrase.strip() if passphrase and isinstance(passphrase, str) and passphrase.strip() else None)
+        try:
+            imported = asyncssh.import_private_key(private_key_str.strip(), passphrase=passphrase_val)
+        except (asyncssh.KeyImportError, ValueError) as exc:
+            raise ValueError('Invalid SSH private key or incorrect passphrase') from exc
+        public_key = imported.export_public_key().decode().strip()
+        now = time.time()
+        self.store.execute(
+            'INSERT INTO user_ssh_keys(user_id, private_key, passphrase, public_key, created, updated) '
+            'VALUES(?,?,?,?,?,?) '
+            'ON CONFLICT(user_id) DO UPDATE SET private_key=excluded.private_key, '
+            'passphrase=excluded.passphrase, public_key=excluded.public_key, updated=excluded.updated',
+            (identity['userid'], self.store.seal(private_key_str.strip()),
+             self.store.seal(passphrase_val) if passphrase_val else None,
+             public_key, now, now)
+        )
+        self.store.audit(identity['userid'], 'configure-user-ssh-key')
+        self.close_user_terminal_sessions(identity['userid'])
+        return {'public_key': public_key}
+
+    async def delete_user_ssh_key(self, identity):
+        if not identity or not identity.get('userid'):
+            raise PermissionError('User authentication required')
+        self.store.execute('DELETE FROM user_ssh_keys WHERE user_id=?', (identity['userid'],))
+        self.store.audit(identity['userid'], 'delete-user-ssh-key')
+        self.close_user_terminal_sessions(identity['userid'])
+
+    def register_terminal_session(self, session):
+        self._terminal_sessions[id(session)] = session
+
+    def unregister_terminal_session(self, session):
+        self._terminal_sessions.pop(id(session), None)
+
+    def close_user_terminal_sessions(self, user_id):
+        for sid, session in list(self._terminal_sessions.items()):
+            if getattr(session, 'user_id', None) == user_id:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                self._terminal_sessions.pop(sid, None)
+
+    def close_all_terminal_sessions(self):
+        for sid, session in list(self._terminal_sessions.items()):
+            try:
+                session.close()
+            except Exception:
+                pass
+            self._terminal_sessions.pop(sid, None)
+
+    async def target_vm(self, identity, vm_id):
+        record = self.store.one('SELECT * FROM vm_access WHERE vm_id=?', (vm_id,))
+        if not record or not record['host_key']:
+            raise ValueError('Managed SSH credentials and a trusted host key are required')
+        if record['username'] == 'root':
+            raise ValueError('Root SSH identities are forbidden')
+        agent = await self.authorize(identity, record['owner_agent'])
+        cloud = await self.cloud_client(agent)
+        response = await cloud.raw('listVirtualMachines', {'id': vm_id, 'listall': True})
+        machines = response.get('virtualmachine', [])
+        vm = next((item for item in machines if item.get('id') == vm_id), None)
+        if not vm:
+            raise PermissionError('VM is not accessible or does not exist')
+        state = vm.get('state', '').lower()
+        if state != 'running':
+            raise ValueError(f"VM is {vm.get('state', 'not running')}; must be Running to connect")
+        nics = vm.get('nic', [])
+        nic = next((item for item in nics if item.get('isdefault')), nics[0] if nics else {})
+        ip_str = nic.get('ipaddress', '')
+        try:
+            address = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise PermissionError('VM has no valid IP address') from None
+        networks = [ipaddress.ip_network(value.strip())
+                    for value in self.settings.ssh_networks.split(',') if value.strip()]
+        if (address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified
+                or not any(address in network for network in networks)):
+            raise PermissionError('VM address is outside approved guest networks')
+        local_routes = Path('/proc/net/fib_trie')
+        try:
+            local_ips = re.findall(r'\|-- ([0-9.]+)\n\s+/32 host LOCAL',
+                                   await asyncio.to_thread(local_routes.read_text))
+            if str(address) in local_ips:
+                raise PermissionError('Host addresses cannot be guest SSH targets')
+        except FileNotFoundError:
+            pass
+        return str(address), record, vm
+
+    async def open_vm_terminal_connection(self, identity, vm_id):
+        import asyncssh
+        address, record, vm = await self.target_vm(identity, vm_id)
+        key_row = self.store.one('SELECT private_key, passphrase FROM user_ssh_keys WHERE user_id=?',
+                                 (identity['userid'],))
+        if not key_row:
+            raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
+        priv_key_str = self.store.open(key_row['private_key'])
+        passphrase_str = self.store.open(key_row['passphrase']) if key_row['passphrase'] else None
+        client_key = asyncssh.import_private_key(priv_key_str, passphrase=passphrase_str)
+        host_key = asyncssh.import_public_key(record['host_key'])
+        known_hosts = ([host_key], [], [])
+        conn = await asyncssh.connect(
+            address, port=record['port'], username=record['username'],
+            client_keys=[client_key], known_hosts=known_hosts,
+            config=None, agent_path=None, preferred_auth=['publickey'],
+            connect_timeout=10, login_timeout=10,
+        )
+        return conn, vm
 
     async def configure_agent(self, actor_id, target_id, settings=None):
         identity = await self.execution_identity(actor_id, actor_id)

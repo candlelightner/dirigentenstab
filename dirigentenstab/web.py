@@ -4,6 +4,7 @@ import json
 import math
 import os
 
+import asyncssh
 import httpx
 
 from fastapi import Request
@@ -16,24 +17,76 @@ from .settings import Settings
 from .store import Store
 
 
+class TerminalSession:
+    def __init__(self, user_id, vm_id, conn, chan, term):
+        self.user_id = user_id
+        self.vm_id = vm_id
+        self.conn = conn
+        self.chan = chan
+        self.term = term
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.chan and not self.chan.is_closing():
+                self.chan.close()
+        except Exception:
+            pass
+        try:
+            if self.conn and not self.conn.is_closing():
+                self.conn.close()
+        except Exception:
+            pass
+
+
+class XtermSSHSession(asyncssh.SSHClientSession):
+    def __init__(self, term, on_disconnect):
+        self.term = term
+        self.chan = None
+        self.on_disconnect = on_disconnect
+
+    def connection_made(self, chan):
+        self.chan = chan
+
+    def data_received(self, data, datatype):
+        self.term.write(data)
+
+    def connection_lost(self, exc):
+        self.on_disconnect(str(exc) if exc else None)
+
+
 def agent_label(agent):
     if agent.get('is_global'):
         return 'Global Admin'
     return 'Main Agent' if agent.get('is_main') else agent['name']
 
 
-def hierarchy_nodes(data):
+def hierarchy_nodes(data, mode='Agents'):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
     global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
     agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
+    vms_by_agent = {}
+    if mode in {'VMs', 'Agents and VMs'}:
+        for vm in data.get('vms', []):
+            if vm.get('owner_agent'):
+                vms_by_agent.setdefault(vm['owner_agent'], []).append(vm)
+
     domains, roots = {}, []
     for domain in data.get('domains', []):
         agent = agents.get(domain['id'])
-        domains[domain['id']] = {
-            'id': 'agent:' + agent['id'] if agent else 'domain:' + domain['id'],
-            'label': agent_label(agent) if agent else domain['name'],
-            'icon': 'smart_toy' if agent else 'folder', 'children': [],
-        }
+        node_id = 'agent:' + agent['id'] if agent else 'domain:' + domain['id']
+        label = agent_label(agent) if agent else domain['name']
+        icon = 'smart_toy' if agent else 'folder'
+        children = []
+        if agent and agent['id'] in vms_by_agent:
+            for vm in vms_by_agent[agent['id']]:
+                children.append({'id': 'vm:' + vm['id'], 'label': vm.get('name') or vm['id'],
+                                 'icon': 'dns', 'children': []})
+        domains[domain['id']] = {'id': node_id, 'label': label, 'icon': icon, 'children': children}
+
     for domain in data.get('domains', []):
         node = domains[domain['id']]
         parent = domains.get(domain.get('parentdomainid'))
@@ -41,14 +94,54 @@ def hierarchy_nodes(data):
             roots.append(node)
         else:
             parent['children'].append(node)
+
     # Keep the global identity separate from the native domain hierarchy.
     native_roots = {d['id'] for d in data.get('domains', [])
                     if d.get('path') == 'ROOT' or d.get('level') == 0 or
                     (d['name'] == 'ROOT' and not d.get('parentdomainid'))}
-    return [{'id': 'agent:' + agent['id'], 'label': agent_label(agent),
-             'icon': 'admin_panel_settings', 'children': []} for agent in global_agents] + [
+    global_nodes = []
+    for agent in global_agents:
+        children = []
+        if agent['id'] in vms_by_agent:
+            for vm in vms_by_agent[agent['id']]:
+                children.append({'id': 'vm:' + vm['id'], 'label': vm.get('name') or vm['id'],
+                                 'icon': 'dns', 'children': []})
+        global_nodes.append({'id': 'agent:' + agent['id'], 'label': agent_label(agent),
+                             'icon': 'admin_panel_settings', 'children': children})
+
+    all_nodes = global_nodes + [
         child for node in roots for child in
-        (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])]
+        (node['children'] if node['id'].removeprefix('domain:') in native_roots else [node])
+    ]
+
+    if mode == 'VMs':
+        def prune_and_mark(node):
+            valid_children = []
+            has_vm_in_sub = False
+            for c in node.get('children', []):
+                if c['id'].startswith('vm:'):
+                    valid_children.append(c)
+                    has_vm_in_sub = True
+                else:
+                    child_pruned, child_has_vm = prune_and_mark(c)
+                    if child_has_vm:
+                        valid_children.append(child_pruned)
+                        has_vm_in_sub = True
+            if has_vm_in_sub:
+                new_node = dict(node)
+                new_node['children'] = valid_children
+                new_node['selectable'] = False
+                return new_node, True
+            return None, False
+
+        pruned = []
+        for n in all_nodes:
+            p, has_vm = prune_and_mark(n)
+            if has_vm:
+                pruned.append(p)
+        return pruned
+
+    return all_nodes
 
 
 def tool_label(event):
@@ -220,6 +313,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             escalation_button = ui.button(icon='approval', color=None, on_click=lambda: protect(open_escalations)).props(
                 'flat round aria-label="Escalation requests: 0 pending"').classes('escalation-requests').mark('escalation_requests')
             escalation_button.set_visibility(identity.get('type') == 1)
+            ui.button(icon='vpn_key', on_click=lambda: protect(open_ssh_key_dialog)).props(
+                'flat round aria-label="SSH key"').mark('header_ssh_key_button')
 
         ui.add_css("""
             html,body{overscroll-behavior:none;overflow:hidden}
@@ -234,6 +329,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             @media(prefers-reduced-motion:reduce){.escalation-requests.pending{animation:none;color:#ea580c}}
             .workspace{height:100%;min-height:0;width:100%;padding:12px;gap:10px;flex-wrap:nowrap}
             .conversation{flex:1;min-height:0;width:100%;overflow:hidden;gap:8px}
+            .terminal-pane{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden;gap:6px}
+            .terminal-container{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden}
+            .terminal-container .xterm{width:100%!important;height:100%!important;min-width:0;max-width:100%}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
             .messages .q-scrollarea__container{overflow-x:hidden!important}
             .messages .q-scrollarea__content{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box}
@@ -280,19 +378,20 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ':model-value="null"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
-                    ui.label('Agents').classes('text-lg font-semibold')
+                    sidebar_select = ui.select(['Agents', 'VMs', 'Agents and VMs'], value='Agents').props('dense options-dense').classes('text-base font-semibold min-w-[150px]').mark('sidebar_view_select')
                     ui.space()
                     ui.button(icon='close', on_click=lambda: drawer.run_method('hide')).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
-                    tree = ui.tree(hierarchy_nodes(data)).classes('w-full').mark('hierarchy')
+                    tree = ui.tree(hierarchy_nodes(data, mode=sidebar_select.value)).classes('w-full').mark('hierarchy')
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
                 if identity.get('type') == 1:
                     dashboard_link('dashboard-mobile w-full text-teal-900')
                 with ui.button('Settings', icon='settings').props('outline aria-haspopup="menu"').classes('w-full').mark('settings_button'):
                     with ui.menu().classes('bg-white p-2 min-w-[200px]').mark('settings_menu') as settings_menu:
                         with ui.column().classes('gap-1 p-0 w-full'):
+                            ssh_key_button = ui.button('SSH key', icon='vpn_key').props('flat no-caps align=left').classes('w-full').mark('ssh_key_button')
                             if identity.get('type') == 1:
                                 providers_button = ui.button('Model providers', icon='settings').props('flat no-caps align=left').classes('w-full')
                                 platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('flat no-caps align=left').classes('w-full')
@@ -306,7 +405,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                                     + '"><button type="submit" class="w-full text-left px-3 py-2 rounded hover:bg-stone-100">Sign out</button></form>',
                                     sanitize=False)
         with ui.column().classes('workspace'):
-            with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2'):
+            with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2') as conversation_controls:
                 history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
                 new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
                 with ui.button(icon='info_outline').props(
@@ -337,6 +436,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     send_button = ui.button(icon='send').props('aria-label="Send"').mark('Send')
                     stop_button = ui.button(icon='stop', color='negative',
                                             on_click=lambda: protect(stop_agent)).props('outline aria-label="Stop conversation"').mark('Stop conversation')
+            with ui.card().classes('terminal-pane flex-1 w-full min-h-0 min-w-0 p-2 gap-2 flex flex-col').mark('terminal_pane') as terminal_pane:
+                terminal_pane.set_visibility(False)
+                with ui.row().classes('terminal-controls w-full items-center justify-between no-wrap gap-2'):
+                    terminal_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('terminal_status').props('role=status')
+                    with ui.row().classes('items-center gap-1 no-wrap'):
+                        reconnect_btn = ui.button(icon='refresh', on_click=lambda: protect(reconnect_terminal)).props('flat round dense aria-label="Reconnect"').mark('terminal_reconnect')
+                        disconnect_btn = ui.button(icon='power_settings_new', on_click=lambda: protect(disconnect_terminal)).props('flat round dense aria-label="Disconnect"').mark('terminal_disconnect')
+                        ui.button(icon='close', on_click=lambda: protect(close_terminal_view)).props('flat round dense aria-label="Close terminal"').mark('terminal_close')
+                terminal_error = ui.label('').classes('text-xs text-red-600 truncate').mark('terminal_error')
+                terminal_error.set_visibility(False)
+                with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').mark('terminal_container'):
+                    term = ui.xterm(options={'cursorBlink': True, 'theme': {'background': '#000000'}}).classes('w-full h-full').mark('xterm')
 
         def sync_run_details():
             status_label.set_visibility(bool(status_label.text))
@@ -433,6 +544,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             )
 
         async def render_agent(agent_id, *, close_navigation=True):
+            close_active_terminal()
+            state['current_vm'] = None
+            terminal_pane.set_visibility(False)
+            conversation_controls.set_visibility(True)
+            conversation_card.set_visibility(True)
             state['drafts'][(state['agent'], state['conversation'])] = prompt.value or ''
             prompt.disable()
             try:
@@ -519,22 +635,200 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     except Exception as exc:
                         ui.label(str(diagnose(exc, agent_id=agent_id))).classes('text-sm text-amber-900')
 
+        active_session = None
+
+        def close_active_terminal():
+            nonlocal active_session
+            if active_session:
+                if hasattr(service, 'unregister_terminal_session'):
+                    service.unregister_terminal_session(active_session)
+                active_session.close()
+                active_session = None
+
+        client.on_disconnect(close_active_terminal)
+
+        async def connect_vm(vm_id, vm_name=None):
+            close_active_terminal()
+            terminal_error.set_visibility(False)
+            reconnect_btn.disable()
+            disconnect_btn.disable()
+            terminal_status.set_text(f'Connecting to {vm_name or vm_id}…')
+            term.write('\x1bc')
+            try:
+                current = await actor()
+                key_row = service.user_ssh_key(current) if hasattr(service, 'user_ssh_key') else None
+                if not key_row:
+                    raise ValueError('No SSH key configured. Add your SSH private key in Settings -> SSH key.')
+                conn, vm = await service.open_vm_terminal_connection(current, vm_id)
+                session = TerminalSession(current['userid'], vm_id, conn, None, term)
+                if hasattr(service, 'register_terminal_session'):
+                    service.register_terminal_session(session)
+                nonlocal active_session
+                active_session = session
+
+                def on_disconnect(error_msg=None):
+                    terminal_status.set_text('Disconnected' + (f': {error_msg}' if error_msg else ''))
+                    reconnect_btn.enable()
+                    disconnect_btn.disable()
+                    if error_msg:
+                        terminal_error.set_text(error_msg)
+                        terminal_error.set_visibility(True)
+
+                cols = await term.get_columns() or 80
+                rows = await term.get_rows() or 24
+                chan, ssh_session = await conn.create_session(
+                    lambda: XtermSSHSession(term, on_disconnect),
+                    term_type='xterm-256color',
+                    term_size=(cols, rows),
+                    encoding=None,
+                )
+                session.chan = chan
+                ssh_session.chan = chan
+                terminal_status.set_text(f"Connected: {vm.get('name', vm_id)}")
+                disconnect_btn.enable()
+                reconnect_btn.enable()
+                await term.fit()
+            except Exception as exc:
+                close_active_terminal()
+                error_msg = str(exc)
+                terminal_status.set_text('Disconnected: ' + error_msg[:60])
+                terminal_error.set_text(error_msg)
+                terminal_error.set_visibility(True)
+                term.writeln(f'\r\n\x1b[31mConnection failed: {error_msg}\x1b[0m\r\n')
+                reconnect_btn.enable()
+                disconnect_btn.disable()
+
+        def handle_term_data(e):
+            if active_session and active_session.chan and not active_session.chan.is_closing():
+                data = getattr(e, 'data', None)
+                if data is None:
+                    data = getattr(e, 'args', '')
+                try:
+                    active_session.chan.write(data.encode('utf-8') if isinstance(data, str) else data)
+                except Exception:
+                    pass
+
+        def handle_term_resize(e):
+            cols = getattr(e, 'cols', None) or (e.args.get('cols') if hasattr(e, 'args') and isinstance(e.args, dict) else None)
+            rows = getattr(e, 'rows', None) or (e.args.get('rows') if hasattr(e, 'args') and isinstance(e.args, dict) else None)
+            if active_session and active_session.chan and not active_session.chan.is_closing() and cols and rows:
+                try:
+                    active_session.chan.change_terminal_size(cols, rows)
+                except Exception:
+                    pass
+
+        term.on_data(handle_term_data)
+        term.on_resize(handle_term_resize)
+
+        async def show_vm(vm_id):
+            vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == vm_id), None)
+            vm_name = vm_info.get('name') if vm_info else vm_id
+            state['current_vm'] = vm_id
+            agent_heading.set_text(f"VM: {vm_name}")
+            agent_heading.disable()
+            conversation_controls.set_visibility(False)
+            conversation_card.set_visibility(False)
+            terminal_pane.set_visibility(True)
+            drawer.run_method('hide')
+            await connect_vm(vm_id, vm_name)
+
+        def disconnect_terminal():
+            close_active_terminal()
+            terminal_status.set_text('Disconnected')
+            disconnect_btn.disable()
+            reconnect_btn.enable()
+            term.writeln('\r\n\x1b[33mDisconnected by user.\x1b[0m\r\n')
+
+        async def reconnect_terminal():
+            if state.get('current_vm'):
+                vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == state['current_vm']), None)
+                await connect_vm(state['current_vm'], vm_info.get('name') if vm_info else state['current_vm'])
+
+        async def close_terminal_view():
+            close_active_terminal()
+            state['current_vm'] = None
+            terminal_pane.set_visibility(False)
+            conversation_controls.set_visibility(True)
+            conversation_card.set_visibility(True)
+            if state.get('agent'):
+                agent = agents.get(state['agent'])
+                if agent:
+                    agent_heading.set_text(agent_label(agent))
+                    agent_heading.enable()
+
+        async def open_ssh_key_dialog():
+            current = await actor()
+            existing = service.user_ssh_key(current) if hasattr(service, 'user_ssh_key') else None
+            with ui.dialog() as ssh_dialog, ui.card().classes('w-full max-w-lg p-4 gap-3'):
+                ui.label('SSH Key Configuration').classes('text-lg font-semibold')
+                ui.label('Configure your personal SSH private key for in-browser VM terminals. Stored encrypted at rest.').classes('text-xs text-stone-500')
+                pub_label = ui.label('Current public key (authorized on VMs):').classes('text-xs font-medium text-stone-700')
+                pub_display = ui.textarea(value=existing['public_key'] if existing else 'No key configured').props('readonly autogrow dense').classes('w-full font-mono text-xs')
+                if not existing:
+                    pub_label.set_visibility(False)
+                    pub_display.set_visibility(False)
+                priv_input = ui.textarea('Private key', placeholder='-----BEGIN OPENSSH PRIVATE KEY-----\n...').props('autogrow rows=4 dense').classes('w-full font-mono text-xs').mark('ssh_private_key_input')
+                pass_input = ui.input('Passphrase (optional)', password=True, password_toggle_button=True).props('dense').classes('w-full').mark('ssh_passphrase_input')
+                with ui.row().classes('w-full items-center justify-between no-wrap gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        save_btn = ui.button('Save key').mark('ssh_key_save')
+                        if existing:
+                            del_btn = ui.button('Delete key', color='negative').props('outline').mark('ssh_key_delete')
+                        else:
+                            del_btn = None
+                    ui.button('Close', on_click=ssh_dialog.close).props('flat').mark('ssh_key_close')
+
+                async def save_key():
+                    val = (priv_input.value or '').strip()
+                    if not val:
+                        ui.notify('Private key is required', type='warning')
+                        return
+                    res = await service.save_user_ssh_key(current, val, passphrase=pass_input.value)
+                    pub_display.set_value(res['public_key'])
+                    pub_label.set_visibility(True)
+                    pub_display.set_visibility(True)
+                    priv_input.set_value('')
+                    pass_input.set_value('')
+                    ui.notify('SSH key saved successfully', type='positive')
+                    ssh_dialog.close()
+
+                async def delete_key():
+                    await service.delete_user_ssh_key(current)
+                    pub_display.set_value('No key configured')
+                    pub_label.set_visibility(False)
+                    pub_display.set_visibility(False)
+                    ui.notify('SSH key removed', type='info')
+                    ssh_dialog.close()
+
+                save_btn.on_click(lambda: protect(save_key))
+                if del_btn:
+                    del_btn.on_click(lambda: protect(delete_key))
+            ssh_dialog.open()
+
+        def update_sidebar_view():
+            tree.props['nodes'] = hierarchy_nodes(state.get('data', {}), mode=sidebar_select.value)
+            if sidebar_select.value in {'VMs', 'Agents and VMs'}:
+                tree.expand()
+            tree.update()
+
         async def refresh():
             current = await actor()
             updated = await service.hierarchy(current)
             state['data'] = updated
             agents.clear()
             agents.update({row['id']: row for row in updated.get('agents', [])})
-            tree.props['nodes'] = hierarchy_nodes(updated)
+            tree.props['nodes'] = hierarchy_nodes(updated, mode=sidebar_select.value)
             tree.update()
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
         async def select_node(event):
             if selection_lock.locked() or not event.value:
                 return
+            if sidebar_select.value == 'VMs' and not event.value.startswith('vm:'):
+                return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
-                if identifier != state.get('requested_agent', state['agent']):
+                if identifier != state.get('requested_agent', state['agent']) or terminal_pane.visible:
                     await show_agent(identifier)
                 else:
                     drawer.run_method('hide')
@@ -558,6 +852,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.button('Close', on_click=domain_dialog.close).props('flat')
                 drawer.run_method('hide')
                 domain_dialog.open()
+            elif kind == 'vm':
+                await show_vm(identifier)
 
         async def choose_history(event):
             nonlocal history_generation
@@ -1545,6 +1841,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         refresh_button.on_click(lambda: protect(refresh))
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
+        sidebar_select.on_value_change(lambda _: update_sidebar_view())
+        if ssh_key_button is not None:
+            ssh_key_button.on_click(lambda: protect(lambda: open_dialog(open_ssh_key_dialog)))
         if providers_button is not None:
             providers_button.on_click(lambda: protect(lambda: open_dialog(provider_dialog)))
         if platform_button is not None:
