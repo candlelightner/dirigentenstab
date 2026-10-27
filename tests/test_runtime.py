@@ -1508,7 +1508,15 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
     async def context(agent):
         return {'skills': await service.list_skills({'_agent_id': agent['id']})}
 
-    service.agent_chain, service.context = chain, context
+    async def cloud_client(agent):
+        async def raw(command, params):
+            assert agent['id'] == 'parent' and command == 'listDomains'
+            return {'domain': [{'id': 'parent-domain', 'level': 0},
+                               {'id': 'child-domain', 'parentdomainid': 'parent-domain', 'level': 1},
+                               {'id': 'other-domain', 'level': 0}]}
+        return SimpleNamespace(raw=raw)
+
+    service.agent_chain, service.context, service.cloud_client = chain, context, cloud_client
     step, skill_id, reads = 0, None, 0
     original_get = service.get_skill
 

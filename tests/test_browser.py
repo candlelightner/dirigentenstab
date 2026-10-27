@@ -1285,6 +1285,13 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
 @pytest.mark.parametrize('width', [390, 1440])
 async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, width):
     url, state = browser_app
+    from dirigentenstab.store import Store
+
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    existing_text = 'Existing agent-created skill instructions, loaded only when opened.'
+    store.execute('INSERT INTO skills(id,creator_agent_id,name,description,text,created,updated) VALUES(?,?,?,?,?,?,?)',
+                  ('existing-skill', 'research', 'Existing research skill', 'Existing skill summary',
+                   store.seal(existing_text), 1, 1))
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
         context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': 844})
@@ -1295,15 +1302,43 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         sidebar = page.locator('.q-drawer .sidebar-view-select')
         await playwright.expect(sidebar).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
-        await sidebar.click()
-        await page.get_by_role('option', name='Skills', exact=True).click()
-        await page.wait_for_function(
-            'JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003"))?.view.includes("Skills")')
-        await page.get_by_role('option', name='Agents', exact=True).click()
-        await page.wait_for_function(
-            'expected => JSON.stringify(JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003")).view) === JSON.stringify(expected)',
-            arg=['Skills'])
-        await page.keyboard.press('Escape')
+        async def select_views(expected):
+            if not await search.is_visible():
+                await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            current = await page.evaluate(
+                'JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003"))?.view || ["Agents"]')
+            await sidebar.click()
+            for option in ('Agents', 'VMs', 'Skills'):
+                if (option in current) != (option in expected):
+                    await page.get_by_role('option', name=option, exact=True).click()
+                    current = [item for item in current if item != option] if option in current else current + [option]
+                    await page.wait_for_function(
+                        'expected => JSON.stringify(JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003"))?.view.sort()) === JSON.stringify(expected.sort())',
+                        arg=current)
+            await page.keyboard.press('Escape')
+
+        assert existing_text not in await page.content()
+        views_to_check = [['Agents', 'Skills'], ['Skills']] if width == 1440 else [
+            ['Agents', 'Skills'], ['VMs', 'Skills'], ['Skills'], ['Agents', 'VMs', 'Skills']]
+        for index, views in enumerate(views_to_check):
+            await select_views(views)
+            existing = page.locator('.q-tree').get_by_text('Existing research skill', exact=True)
+            await existing.wait_for()
+            assert 'Research Admin' in await existing.evaluate(
+                "el => el.closest('.q-tree__node').parentElement.closest('.q-tree__node').querySelector('.q-tree__node-header').innerText")
+            await existing.click()
+            await playwright.expect(page.get_by_label('Full text', exact=True)).to_have_value(existing_text)
+            await page.get_by_role('dialog').get_by_role('button', name='Close', exact=True).click()
+            await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            await existing.click()
+            existing_text += f' Edit {index}.'
+            await page.get_by_label('Full text', exact=True).fill(existing_text)
+            await page.get_by_role('button', name='Save skill', exact=True).click()
+            await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+            assert store.open(store.one("SELECT text FROM skills WHERE id='existing-skill'")['text']) == existing_text
+        await select_views(['Skills'])
+        await page.screenshot(path=str(state / 'skills-hierarchy.png'), full_page=True, animations='disabled')
         await page.get_by_role('button', name='New skill', exact=True).click()
         await page.get_by_label('Skill name', exact=True).fill('GPU checklist')
         await page.get_by_label('Short description', exact=True).fill('Prepare a GPU VM')

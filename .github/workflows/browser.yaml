@@ -12,7 +12,7 @@ permissions:
 jobs:
   chromium:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 9
     container:
       image: ghcr.io/candlelightner/dirigentenstab:test-runner-py3.12-pw1.64.1-8825ff7ccb75b371@sha256:624e2bbe4eb7f7067a86184b16972283399956f288b26bea5de0db1f345db7ba
       options: --shm-size=1g
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: python scripts/test_runner.py prepare
       - name: Browser tests
-        timeout-minutes: 7
+        timeout-minutes: 8
         run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
       - uses: actions/upload-artifact@v4
         if: always()

@@ -652,12 +652,32 @@ class Service:
             raise PermissionError('Skill changed; reload its current revision')
         shareable = []
         if metadata['can_edit']:
-            for target in self.store.all('SELECT * FROM agents WHERE enabled=1'):
-                try:
-                    if row['creator_agent_id'] in {a['id'] for a in (await self.agent_chain(target))[:-1]}:
-                        shareable.append({'id': target['id'], 'name': target['name']})
-                except PermissionError:
-                    continue
+            if identity.get('_agent_id'):
+                actor = await self.agent(identity['_agent_id'])
+                native = await (await self.cloud_client(actor)).raw('listDomains', {'listall': True})
+            else:
+                native = await self.human_call(identity, 'listDomains', {'listall': 'true'})
+            domains = {domain['id']: domain for domain in native.get('domain', [])}
+            agents = self.store.all('SELECT id,name,domain_id FROM agents WHERE enabled=1')
+            managed = {agent['domain_id']: agent for agent in agents}
+            for target in agents:
+                domain_id, seen, previous_level = target['domain_id'], set(), None
+                while domain_id in domains and domain_id not in seen:
+                    domain = domains[domain_id]
+                    level = domain.get('level')
+                    member = managed.get(domain_id)
+                    if (not member or type(level) is not int or level < 0
+                            or previous_level is not None and level != previous_level - 1):
+                        break
+                    if member['id'] == row['creator_agent_id']:
+                        if domain_id != target['domain_id']:
+                            shareable.append({'id': target['id'], 'name': target['name']})
+                        break
+                    if member['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:
+                        break
+                    seen.add(domain_id)
+                    previous_level = level
+                    domain_id = domain.get('parentdomainid')
         return metadata | {'text': self.store.open(row['text']), 'shareable_agents': shareable}
 
     async def save_skill(self, identity, creator_agent_id, name, description, text, skill_id=None):

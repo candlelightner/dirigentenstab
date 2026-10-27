@@ -1,7 +1,7 @@
 name: dirigentenstab
 services:
   app:
-    image: ${IMAGE:-ghcr.io/candlelightner/dirigentenstab:0.1.15}
+    image: ${IMAGE:-ghcr.io/candlelightner/dirigentenstab:0.1.16}
     build: .
     restart: unless-stopped
     init: true
