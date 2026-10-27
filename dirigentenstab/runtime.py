@@ -815,8 +815,11 @@ class Runtime:
             return self.service.redact({'actions': state.get('mutations', {}), 'tool_activity': budget.get('events', [])})
 
         @agent.tool_plain(sequential=True)
-        async def recover_operation(operation_id: str) -> dict:
-            """Inspect/bind a saved VM/template operation, or explicitly resume a saved pre-dispatch GPU preparation plan."""
+        async def recover_operation(operation_id: str, abandon: bool = False) -> dict:
+            """Inspect/bind a saved VM/template operation, or explicitly resume a saved pre-dispatch GPU preparation plan.
+            abandon=true closes an unresolved managed VM deployment so new managed deployments are allowed again. Use it
+            only after verifying through native list APIs that the deployment created no usable VM; it refuses while a
+            matching VM is live, never deletes infrastructure and never redeploys."""
             for item in budget.get('state', {}).get('mutations', {}).values():
                 if item.get('gpu_operation_id') == operation_id:
                     async def recover_gpu(acting_agent, run_id, saved_operation):
@@ -824,7 +827,7 @@ class Runtime:
                                                  run_id=run_id, operation_id=saved_operation,
                                                  active_run_id=budget['operation_id'])
                     return await invoke(recover_gpu, agent_id, item['run_id'], operation_id)
-            return await invoke(self.service.recover_operation, agent_id, operation_id)
+            return await invoke(self.service.recover_operation, agent_id, operation_id, abandon)
 
         @agent.tool_plain(sequential=True)
         async def configure_agent(target_agent_id: str, settings: dict | None = None) -> dict:

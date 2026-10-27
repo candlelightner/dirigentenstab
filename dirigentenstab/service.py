@@ -511,32 +511,58 @@ class Service:
             conn.execute("UPDATE vm_deployments SET vm_id=?,phase='complete',updated=? WHERE id=?",
                          (vm_id, time.time(), op_id))
 
+    async def _owned_matches(self, op):
+        agent = await self.agent(op['agent_id'])
+        cloud = await self.cloud_client(agent)
+        accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
+        account = next((value for value in accounts if value.get('id') == agent['account_id']
+                        and value.get('domainid') == agent['domain_id'] and value.get('name')), None)
+        if not account:
+            raise CloudError(f"Cannot verify the owning CloudStack account for deployment {op['id']}")
+        response = await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})
+        return [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
+                and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
+
     async def recover_deployments(self, operation_id=None):
         query = "SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"
         for op in self.store.all(query + (' AND id=?' if operation_id else ''), (operation_id,) if operation_id else ()):
-            agent = await self.agent(op['agent_id'])
-            cloud = await self.cloud_client(agent)
-            accounts = (await cloud.raw('listAccounts', {'id': agent['account_id'], 'listall': True})).get('account', [])
-            account = next((value for value in accounts if value.get('id') == agent['account_id']
-                            and value.get('domainid') == agent['domain_id'] and value.get('name')), None)
-            if not account:
-                raise CloudError(f"Cannot verify the owning CloudStack account for deployment {op['id']}")
-            response = await cloud.raw('listVirtualMachines', {'name': op['name'], 'listall': True})
-            matches = [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
-                       and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
+            matches = await self._owned_matches(op)
             if len(matches) == 1 and matches[0].get('state') in {'Running', 'Stopped'}:
                 self._bind_vm(op['id'], matches[0]['id'])
             else:
                 self.store.audit(op['agent_id'], 'deployment-recovery-needs-review', op['id'], 'pending')
         # Absence is not proof that dispatch never reached CloudStack. Never create a second VM here.
 
-    async def recover_operation(self, agent_id, operation_id):
+    async def recover_operation(self, agent_id, operation_id, abandon=False):
         await self.agent(agent_id)
         deployment = self.store.one('SELECT * FROM vm_deployments WHERE id=? AND agent_id=?', (operation_id, agent_id))
         template = self.store.one('SELECT * FROM template_creations WHERE id=? AND agent_id=?', (operation_id, agent_id))
+        if abandon and (deployment or template) and not (deployment and deployment['phase'] in {'prepared', 'dispatched', 'failed'}):
+            raise ValueError('Only an unresolved managed VM deployment can be abandoned')
         if deployment:
             await self.recover_deployments(operation_id=operation_id)
             current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
+            if abandon and current['phase'] != 'complete':
+                saved = self.store.open(deployment['params'])
+                jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
+                if jobid:
+                    cloud = await self.cloud_client(await self.agent(agent_id))
+                    if (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0:
+                        raise CloudError('Deployment job still running; wait and recover', operation_id=operation_id)
+                live = [vm.get('id') for vm in await self._owned_matches(deployment)
+                        if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]
+                if live:
+                    raise CloudError(f'VM {", ".join(map(str, live))} matches this deployment; inspect and clean it up '
+                                     'natively before abandoning the operation', operation_id=operation_id)
+                with self.store.connect() as conn:
+                    if conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=? "
+                                    "AND phase IN ('prepared','dispatched','failed')",
+                                    (time.time(), operation_id)).rowcount != 1:
+                        raise CloudError('Deployment changed during abandon; re-run recover_operation', operation_id=operation_id)
+                    conn.execute('DELETE FROM vm_access WHERE vm_id=?', ('pending-' + operation_id,))
+                    conn.execute('INSERT INTO audit(created,actor,operation,target,status) VALUES(?,?,?,?,?)',
+                                 (time.time(), agent_id, 'deployment-abandoned-by-agent', operation_id, 'ok'))
+                current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
             return {'operation_id': operation_id, **current, 'request': self.redact(self.store.open(deployment['params']))}
         if template:
             if template['phase'] == 'dispatched':
