@@ -1030,3 +1030,34 @@ def test_skills_preserve_creator_agent_on_native_root_and_separate_global_admin(
         {'id': 'skill:global-skill', 'label': 'Global skill', 'icon': 'description', 'children': []}]
     assert nodes[1]['children'] == [
         {'id': 'skill:root-skill', 'label': 'Root skill', 'icon': 'description', 'children': []}]
+
+
+async def test_unknown_main_pane_query_ids_fall_back_to_default_agent():
+    identity = {'userid': 'owner', 'username': 'owner', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account', 'is_main': True}
+
+    class Auth:
+        async def identity(self, token):
+            return identity
+
+    class Service(AgentCapabilities):
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent], 'vms': [], 'skills': []}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        async def conversations(self, current, agent_id):
+            return []
+
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        for query in ('agent=nope', 'vm=nope&mode=console', 'skill=nope'):
+            await user.open('/?' + query)
+            await user.should_see('Configure')
+            await user.should_not_see('Console')
