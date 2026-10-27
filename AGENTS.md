@@ -4,8 +4,8 @@ Guidelines and conventions for AI assistants working in this repository.
 
 ## 1. Delegation & Subagents
 
-- The main/parent agent coordinates, reviews, and handles user communication and GitHub MCP calls. It must **never** directly edit code/files, run test suites, execute git mutations, or run Docker build/deploy commands itself.
-- Delegate all code edits, test executions, git commits/pushes, and local container rebuilds/restarts to competent smaller-model subagents available to the coordinating provider. Choose by task competence and availability, not a fixed provider: an OpenAI flagship can delegate to GPT-6.1 Sol, Terra, or Luna, a Google flagship to Gemini Flash, and a Claude flagship to Sonnet or Haiku. Keep implementation and verification with subagents; the parent retains coordination and review.
+- The main/parent agent coordinates, reviews, and handles user communication, GitHub MCP calls (PR creation and merging), and escalations from subagents. It must **never** directly edit code/files, run test suites, execute git mutations, or run Docker build/deploy commands itself.
+- Delegate all code edits, test executions, git commits/pushes, CI/CD monitoring, and local container rebuilds/restarts to competent smaller-model subagents available to the coordinating provider. Choose by task competence and availability, not a fixed provider: an OpenAI flagship can delegate to GPT-6.1 Sol, Terra, or Luna, a Google flagship to Gemini Flash, and a Claude flagship to Sonnet or Haiku. Keep implementation and verification with subagents; the parent retains coordination and review.
 
 ## 2. GitHub MCP & Delivery Pipeline
 
@@ -14,7 +14,7 @@ Guidelines and conventions for AI assistants working in this repository.
   1. Branch off `main` (`implementation/<topic>` or `fix/<topic>`).
   2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py` for UI changes.
   3. Commit locally and push branch changes via GitHub MCP (`create_branch` + `push_files`) when shell git credentials are absent.
-  4. Open PR against `main` via GitHub MCP and watch CI (`ci.yaml` and `browser.yaml`, 5-minute browser timeout) until green.
+  4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, 5-minute browser timeout) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
   5. Merge PR into `main` via GitHub MCP.
   6. Pull `origin/main` in `/home/emil/dirigentenstab`, rebuild and restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI.
 
@@ -36,3 +36,8 @@ Guidelines and conventions for AI assistants working in this repository.
 
 - Never modify host SSH configurations or host services outside project boundaries.
 - Preserve encrypted database state (`dirigentenstab_data`), credentials, conversation history, and active runtime settings (e.g. `SESSION_SECONDS`).
+
+## 5. Instruction Files
+
+- `AGENTS.md` is the single source of project rules for every agent and provider. Always add general agentic instructions here, never to provider-specific files (`CLAUDE.md`, `GEMINI.md`, etc.).
+- Provider-specific files only point to `AGENTS.md` and may hold instructions that apply solely to that provider.
