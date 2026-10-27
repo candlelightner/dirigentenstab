@@ -11,16 +11,17 @@ Guidelines and conventions for AI assistants working in this repository.
 
 - Use the **GitHub MCP** (`ServerName="github"`) for all GitHub operations (PR creation, check-run tracking, PR merging, issue/PR inspection).
 - Standard end-to-end workflow (treat implied steps—branching, committing, pushing, PRs, restarting hung CI jobs, merging, and deploying—as pre-approved scope; only stop on genuine blockers):
-  1. Branch off `main` (`implementation/<topic>` or `fix/<topic>`).
+  1. Branch off `main` (`implementation/<topic>` or `fix/<topic>`) in a dedicated git worktree. The main checkout `/home/emil/dirigentenstab` is deploy-only: never edit, commit, or leave uncommitted changes there; only pull `origin/main` and deploy from it.
   2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py` for UI changes.
   3. Commit locally and push branch changes via GitHub MCP (`create_branch` + `push_files`) when shell git credentials are absent.
   4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, 5-minute browser timeout) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
   5. Merge PR into `main` via GitHub MCP.
-  6. Pull `origin/main` in `/home/emil/dirigentenstab`, rebuild and restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI.
+  6. Pull `origin/main` in `/home/emil/dirigentenstab`, build the image tagged `dirigentenstab-local:<7-char short SHA of the deployed main commit>` (never reuse an older tag), set only `IMAGE` in `.env` to it, restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI. Afterwards remove merged worktrees and their branches.
 
 ## 3. Implementation & UI Principles (`ponytail` + `spec.md`)
 
 - Read and respect `spec.md` as the V1 product source of truth (single human owner via CloudStack login, native CloudStack domains/accounts/quotas as sole infrastructure permission authority, independent background conversations surviving logout/restart, interrupt-by-sending + per-conversation Stop, informational VM list without lifecycle buttons, strict ancestor inheritance for owner SSH public key and provider/MCP allowances).
+- When a change adds, removes, or alters behavior that `spec.md` describes or excludes, update `spec.md` (and affected docs) in the same PR. Spec and code must not drift.
 - Apply **Ponytail (`full`)** ("lazy senior dev"): smallest complete diff, reuse existing NiceGUI/Quasar components (`ui.menu`, `ui.dialog`, standard props/classes), zero unrequested wrappers/options/abstractions, update every caller and test touched, don't overthink obvious implied steps, and ask brief clarifying questions up front only when genuinely ambiguous.
 - Before architectural work, infer the actual intent from the conversation and inspect the real failure, existing tools, and execution paths. Reuse or extend the existing owner of a capability: implement it at most once, preferably zero times when it is already covered. Do not add redundant permission layers, workflows, or wrappers. Verify the motivating scenario, not only behavior invented for the implementation. Carry out explicit concrete edits (for example, moving button X to position Y) directly without turning them into architectural discussions.
 - UI layout priorities (desktop `1440x900` and mobile `390x844` + virtual keyboard `visualViewport`):
