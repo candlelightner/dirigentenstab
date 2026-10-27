@@ -77,7 +77,7 @@ class ConsoleProxy:
         self.grants[ticket] = _Grant(session, now + 300, urlunsplit((native.scheme, native.netloc, '', '', '')), upstream)
         public = urlsplit(self.service.settings.origin)
         local_query = {key: query[key][-1] for key in ('autoconnect', 'show_dot') if key in query}
-        local_query.update(host=public.hostname, port=str(public.port or 443), encrypt='1',
+        local_query.update(host=public.hostname, port=str(public.port or 443), encrypt='1', reconnect='false',  # tickets are single-use; the page reconnects with a fresh one
                            path=PREFIX.lstrip('/') + ticket + '/ws', token=ticket)
         return PREFIX + ticket + '/vnc.html?' + urlencode(local_query)
 
@@ -196,7 +196,7 @@ class ConsoleProxy:
                           'client-closed' if isinstance(exc, WebSocketDisconnect) else 'error ' + type(exc).__name__)
                 # Do not expose ticketed upstream URLs in errors sent to the client.
             finally:
-                logger.info('console session ended: %s, upstream close %s %r, %.1f s, %d B up, %d B down',
+                logger.log(logging.INFO if reason == 'client-closed' else logging.WARNING, 'console session ended: %s, upstream close %s %r, %.1f s, %d B up, %d B down',
                             reason, getattr(upstream, 'close_code', None), getattr(upstream, 'close_reason', ''),
                             time.monotonic() - started, *sent)
                 for task in tasks:

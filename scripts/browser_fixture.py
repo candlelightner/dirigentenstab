@@ -53,7 +53,10 @@ for branch in range(12):
 def fake_api(state):
     def echo(socket):
         for message in socket:
-            socket.send(message)
+            if message == 'close-now':  # lets tests simulate the CPVM dropping the console
+                socket.close()
+            else:
+                socket.send(message)
 
     websocket = serve(echo, '127.0.0.1', 0, subprotocols=['binary'])
     websocket_port = websocket.socket.getsockname()[1]
@@ -71,7 +74,8 @@ def fake_api(state):
                 elif self.path == '/resource/noVNC/fixture.js':
                     content = '''const q = new URLSearchParams(location.search);
 const ws = new WebSocket('wss://' + q.get('host') + ':' + q.get('port') + '/' + q.get('path') + '?token=' + q.get('token'), ['binary']);
-ws.onopen = () => ws.send('Connected through console proxy');
+ws.onopen = () => { document.documentElement.classList.add('noVNC_connected'); ws.send('Connected through console proxy'); };
+ws.onclose = () => document.documentElement.classList.remove('noVNC_connected');
 ws.onmessage = e => document.getElementById('status').textContent = e.data;
 '''
                     mime = 'text/javascript'
