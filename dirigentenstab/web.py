@@ -3,6 +3,9 @@ import html
 import json
 import math
 import os
+import posixpath
+import stat
+import time
 from urllib.parse import urlencode
 
 import asyncssh
@@ -13,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from nicegui import app, ui
 
 from .console import ConsoleProxy
+from .files import MAX_UPLOAD, VMFiles, store_upload
 from .runtime import Runtime, provider_models, test_provider
 from .diagnostics import diagnose
 from .settings import Settings
@@ -236,6 +240,8 @@ def build_ui(service, auth, runtime=None):
     runtime = runtime or Runtime(service)
     console_proxy = ConsoleProxy(service)
     console_proxy.install(app)
+    vm_files = VMFiles(service)
+    vm_files.install(app)
 
     @app.get('/login', response_class=HTMLResponse)
     async def login_page(request: Request):
@@ -467,7 +473,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 terminal_pane.set_visibility(False)
                 with ui.row().classes('terminal-controls w-full items-center justify-between gap-2'):
                     with ui.row().classes('items-center gap-2 no-wrap min-w-0'):
-                        terminal_mode = ui.toggle({'ssh': 'SSH', 'console': 'Console'}, value='ssh').props(
+                        terminal_mode = ui.toggle({'ssh': 'SSH', 'console': 'Console', 'files': 'Files'}, value='ssh').props(
                             'dense no-caps aria-label="Connection type"').mark('terminal_mode')
                         terminal_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('terminal_status').props('role=status')
                         console_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('console_status').props('role=status')
@@ -486,6 +492,18 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 console_frame = ui.element('iframe').classes('console-frame bg-black rounded').props(
                     'title="VM console" src="about:blank" allow="clipboard-read; clipboard-write"').mark('console_frame')
                 console_frame.set_visibility(False)
+                with ui.column().classes('files-pane w-full flex-1 min-h-0 min-w-0 gap-1 no-wrap') as files_pane:
+                    with ui.row().classes('w-full items-center gap-1 no-wrap'):
+                        ui.button(icon='arrow_upward', on_click=lambda: protect(lambda: list_dir(posixpath.dirname(files_dir)))).props(
+                            'flat round dense aria-label="Parent directory"').mark('files_up')
+                        files_path = ui.input().props('dense outlined aria-label="Path"').classes('flex-1 min-w-0').mark('files_path')
+                        files_path.on('keydown.enter', lambda: protect(lambda: list_dir(files_path.value)))
+                    files_list = ui.list().props('dense separator').classes('w-full flex-1 min-h-0 overflow-auto').mark('files_list')
+                    files_upload = ui.upload(label='Upload to this folder', multiple=True, auto_upload=True, max_file_size=MAX_UPLOAD,
+                                             on_multi_upload=lambda e: protect(lambda: upload_files(e.files)),
+                                             on_rejected=lambda: terminal_error.set_text('A file exceeds the upload limit') or terminal_error.set_visibility(True),
+                                             ).props('flat bordered dense').classes('w-full max-w-full').mark('files_upload')
+                files_pane.set_visibility(False)
 
         def sync_run_details():
             status_label.set_visibility(bool(status_label.text))
@@ -683,10 +701,15 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         active_session = None
         ssh_request = 0
+        files_conn = files_sftp = None
+        files_dir = '.'
 
         def close_active_terminal():
-            nonlocal active_session, ssh_request
+            nonlocal active_session, ssh_request, files_conn, files_sftp
             ssh_request += 1
+            if files_conn:
+                files_conn.close()
+                files_conn = files_sftp = None
             if active_session:
                 if hasattr(service, 'unregister_terminal_session'):
                     service.unregister_terminal_session(active_session)
@@ -835,20 +858,127 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         async def popout_console():
             await connect_console(popout=True)
 
+        async def list_dir(path):
+            nonlocal files_dir
+            request = ssh_request
+            terminal_error.set_visibility(False)
+            try:
+                full = await files_sftp.realpath(path or '.')
+                entries = await files_sftp.readdir(full)
+                rows = []
+                for entry in entries:
+                    if entry.filename in {'.', '..'}:
+                        continue
+                    mode = entry.attrs.permissions or 0
+                    directory = stat.S_ISDIR(mode) or (stat.S_ISLNK(mode) and await files_sftp.isdir(posixpath.join(full, entry.filename)))
+                    rows.append((not directory, entry.filename.casefold(), entry.filename, entry.attrs.size or 0, entry.attrs.mtime))
+                rows.sort()
+            except Exception as exc:
+                if request == ssh_request:
+                    files_path.set_value(files_dir)
+                    terminal_error.set_text(str(exc))
+                    terminal_error.set_visibility(True)
+                return
+            if request != ssh_request:
+                return
+            files_dir = full
+            files_path.set_value(full)
+            files_list.clear()
+            with files_list:
+                for is_file, _, name, size, mtime in rows:
+                    with ui.item(on_click=None if is_file else (lambda n=name: protect(lambda: list_dir(posixpath.join(files_dir, n))))).props(
+                            '' if is_file else 'clickable').classes('w-full'):
+                        with ui.item_section().props('avatar').classes('min-w-0'):
+                            ui.icon('description' if is_file else 'folder')
+                        with ui.item_section().classes('min-w-0'):
+                            ui.item_label(name).classes('truncate')
+                            ui.item_label((f'{size:,} B · ' if is_file else '') + (
+                                time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime)) if mtime else '')).props('caption')
+                        if is_file:
+                            with ui.item_section().props('side'):
+                                ui.button(icon='download', on_click=lambda n=name: protect(lambda: download_file(n))).props(
+                                    f'flat round dense aria-label="Download {name}"')
+
+        async def connect_files():
+            nonlocal files_conn, files_sftp, files_dir
+            close_active_terminal()
+            request = ssh_request
+            vm_id = state.get('current_vm')
+            if not vm_id:
+                return
+            files_dir = '.'
+            files_list.clear()
+            terminal_error.set_visibility(False)
+            terminal_status.set_text(f'Connecting to {vm_name(vm_id)}…')
+            try:
+                conn, _ = await service.open_vm_connection(await actor(), vm_id)
+                if request != ssh_request:
+                    conn.close()
+                    return
+                files_conn = conn
+                files_sftp = await conn.start_sftp_client()
+                terminal_status.set_text(f'Connected: {vm_name(vm_id)}')
+                await list_dir('.')
+            except Exception as exc:
+                if request == ssh_request:
+                    close_active_terminal()
+                    terminal_status.set_text('Disconnected')
+                    terminal_error.set_text(str(exc))
+                    terminal_error.set_visibility(True)
+
+        async def download_file(name):
+            # ui.download opens a new tab (target=_blank), which browsers sometimes cancel; a same-page anchor is reliable.
+            url = vm_files.grant(await actor(), state['current_vm'], posixpath.join(files_dir, name))
+            ui.run_javascript(f'const a = document.createElement("a"); a.href = {json.dumps(url)}; a.download = ""; a.click()')
+
+        async def upload_files(uploads):
+            vm_id, request = state.get('current_vm'), ssh_request
+            try:
+                if not files_sftp:
+                    raise ConnectionError('Files are not connected')
+                current = await actor()
+                for upload in uploads:
+                    try:
+                        try:
+                            await store_upload(files_sftp, files_dir, upload)
+                        except FileExistsError:
+                            with ui.dialog() as dialog, ui.card():
+                                ui.label(f'Overwrite {upload.name}?')
+                                with ui.row():
+                                    ui.button('Overwrite', on_click=lambda: dialog.submit(True))
+                                    ui.button('Cancel', on_click=lambda: dialog.submit(False)).props('flat')
+                            confirmed = await dialog
+                            dialog.delete()
+                            if not confirmed:
+                                continue
+                            await store_upload(files_sftp, files_dir, upload, overwrite=True)
+                        service.store.audit(current['userid'], 'vm-file-upload', vm_id)
+                    except (OSError, ValueError, asyncssh.Error) as exc:
+                        terminal_error.set_text(f'{upload.name}: {exc}')
+                        terminal_error.set_visibility(True)
+            finally:
+                files_upload.reset()
+            if request == ssh_request:
+                await list_dir(files_dir)
+
         async def switch_terminal_mode(mode):
-            console = mode == 'console'
+            console, files = mode == 'console', mode == 'files'
             sync_url()
             terminal_error.set_text('')
             terminal_error.set_visibility(False)
-            if console:
+            if console or files:
                 close_active_terminal()
             for element in (console_status, console_frame, popout_btn):
                 element.set_visibility(console)
             terminal_status.set_visibility(not console)
-            terminal_container.set_visibility(not console)
+            terminal_container.set_visibility(mode == 'ssh')
+            files_pane.set_visibility(files)
             reconnect_btn.enable()
-            disconnect_btn.set_enabled(console or bool(active_session))
-            if not console:
+            disconnect_btn.set_enabled(console or files or bool(active_session))
+            if files:
+                set_console_src()
+                await connect_files()
+            elif not console:
                 set_console_src()
                 await term.fit()
                 if state.get('current_vm') and not active_session:
@@ -862,6 +992,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 console_status.set_text('Console closed')
                 return
             close_active_terminal()
+            files_list.clear()
             terminal_status.set_text('Disconnected')
             disconnect_btn.disable()
             reconnect_btn.enable()
@@ -872,6 +1003,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 return
             if terminal_mode.value == 'console':
                 await connect_console()
+            elif terminal_mode.value == 'files':
+                await connect_files()
             else:
                 await connect_vm(state['current_vm'], vm_name(state['current_vm']))
 
@@ -2076,8 +2209,8 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         vm_id, skill_id = query.get('vm'), query.get('skill')
         if vm_id and any(v['id'] == vm_id for v in state['data'].get('vms', [])):
             await show_vm(vm_id)
-            if query.get('mode') == 'console':
-                terminal_mode.set_value('console')
+            if query.get('mode') in {'console', 'files'}:
+                terminal_mode.set_value(query['mode'])
         elif skill_id and any(s['id'] == skill_id for s in state['data'].get('skills', [])):
             try:
                 await open_skill(skill_id)
