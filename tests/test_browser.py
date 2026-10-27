@@ -60,6 +60,55 @@ def browser_app(tmp_path):
         log.close()
 
 
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_browser_vm_file_browser_lists_downloads_uploads_and_restores(browser_app, width, height):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        page = await context.new_page()
+        await login(page, url)
+        await page.goto(url + '/?vm=00000000-0000-0000-0000-000000000004&mode=files')
+        pane = page.locator('.terminal-pane')
+        files = pane.locator('.files-pane')
+        await files.get_by_text('docs', exact=True).wait_for()
+        await files.get_by_text(re.compile(r'^long-name-x+\.txt$')).wait_for()
+        await playwright.expect(pane.get_by_label('Path', exact=True)).to_have_value('/')
+        # Directories first, then files.
+        names = await files.locator('.q-item__label:not(.q-item__label--caption)').all_inner_texts()
+        assert names[0] == 'docs'
+        await files.get_by_text('docs', exact=True).click()
+        await playwright.expect(pane.get_by_label('Path', exact=True)).to_have_value('/docs')
+        async with page.expect_download() as download:
+            await pane.get_by_role('button', name='Download report.txt', exact=True).click()
+        saved = await download.value
+        await saved.save_as(state / f'download-{width}.txt')
+        assert (saved.suggested_filename, (state / f'download-{width}.txt').read_text()) == ('report.txt', 'fixture report\n')
+        await files.locator('input[type=file]').set_input_files(
+            files=[{'name': 'upload.txt', 'mimeType': 'text/plain', 'buffer': b'uploaded'}])
+        await files.locator('.q-list').get_by_text('upload.txt', exact=True).wait_for()
+        assert (state / 'vm-files' / 'docs' / 'upload.txt').read_bytes() == b'uploaded'
+        await files.locator('input[type=file]').set_input_files(
+            files=[{'name': 'upload.txt', 'mimeType': 'text/plain', 'buffer': b'again'}])
+        await page.get_by_text('Overwrite upload.txt?', exact=True).wait_for()
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        assert (state / 'vm-files' / 'docs' / 'upload.txt').read_bytes() == b'uploaded'
+        await pane.get_by_role('button', name='Parent directory', exact=True).click()
+        await playwright.expect(pane.get_by_label('Path', exact=True)).to_have_value('/')
+        await pane.get_by_label('Path', exact=True).fill('/b.txt')
+        await pane.get_by_label('Path', exact=True).press('Enter')
+        await pane.locator('[data-marker="terminal_error"], .text-red-600').filter(visible=True).wait_for()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        assert await files.evaluate('el => el.scrollWidth <= el.clientWidth')
+        await page.screenshot(path=str(state / f'files-{width}x{height}.png'), full_page=True)
+        await page.wait_for_function('location.search.endsWith("&mode=files")')
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await files.get_by_text('docs', exact=True).wait_for()
+        await playwright.expect(pane.get_by_role('button', name='Files', exact=True)).to_have_attribute('aria-pressed', 'true')
+        await browser.close()
+
+
 async def login(page, url):
     await page.goto(url + '/login')
     await page.get_by_label('Username', exact=True).fill('alice')

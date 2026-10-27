@@ -1063,9 +1063,14 @@ class Service:
         return url
 
     async def open_vm_terminal_connection(self, identity, vm_id):
+        return await self.open_vm_connection(identity, vm_id, 'open-vm-terminal')
+
+    async def open_vm_connection(self, identity, vm_id, operation=None):
+        # Shared by the terminal and file browser: native authorization, managed key, pinned host key.
         import asyncssh
         address, record, vm = await self.target_vm(identity, vm_id)
-        self.store.audit(identity['userid'], 'open-vm-terminal', vm_id)
+        if operation:
+            self.store.audit(identity['userid'], operation, vm_id)
         client_key = asyncssh.import_private_key(self.store.open(record['private_key']))
         host_key = asyncssh.import_public_key(record['host_key'])
         known_hosts = ([host_key], [], [])

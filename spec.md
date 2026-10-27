@@ -235,7 +235,9 @@ current compaction settings.
   administrator access is not permission to execute arbitrary commands on the
   physical host running the hub or CloudStack.
 - V1 supplies connection details, CloudStack links, an embedded SSH terminal,
-  and CloudStack's native noVNC console (embedded or in a new tab). Console
+  a file browser (browse, download, upload up to 100 MiB per file) over the
+  managed SFTP connection after the same native authorization, and
+  CloudStack's native noVNC console (embedded or in a new tab). Console
   endpoints are requested just in time through the signed-in owner's own
   CloudStack session; the hub does not implement its own VNC service.
 

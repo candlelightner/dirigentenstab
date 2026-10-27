@@ -183,6 +183,26 @@ class FixtureCloud(Cloud):
 
 
 class FixtureService(Service):
+    sftp_root = None
+    sftp_server = None
+
+    async def open_vm_connection(self, identity, vm_id, operation=None):
+        # Stand-in for the guest: a local SFTP-only server rooted at <state>/vm-files, still behind the authorization path.
+        import asyncssh
+        if not self.sftp_server:
+            class Server(asyncssh.SSHServer):
+                def begin_auth(self, username):
+                    return False
+
+            self.sftp_server = await asyncssh.create_server(
+                Server, '127.0.0.1', 0, server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')],
+                sftp_factory=lambda chan: asyncssh.SFTPServer(chan, chroot=self.sftp_root))
+        if operation:
+            self.store.audit(identity['userid'], operation, vm_id)
+        conn = await asyncssh.connect('127.0.0.1', self.sftp_server.get_port(), username='dirigent',
+                                      known_hosts=None, config=None, agent_path=None)
+        return conn, {'id': vm_id, 'name': 'research-vm'}
+
     def client(self, credentials):
         self._remember(credentials)
         return FixtureCloud(self.settings, credentials)
@@ -329,6 +349,10 @@ def main():
                         database=str(store.path), key_file=str(master),
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
     service = FixtureService(store, settings)
+    service.sftp_root = args.state_dir / 'vm-files'
+    (service.sftp_root / 'docs').mkdir(parents=True)
+    (service.sftp_root / 'docs' / 'report.txt').write_text('fixture report\n')
+    (service.sftp_root / f'long-name-{"x" * 120}.txt').write_text('long\n')
 
     async def discover_mcp(self, identity, agent_id, server_id):
         configuration = await self.configuration(identity, agent_id)

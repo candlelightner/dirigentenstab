@@ -12,6 +12,8 @@ HTTP mutations and socket handshakes require the configured exact HTTPS Origin. 
 
 CloudStack console tickets are requested through the signed-in human’s native permissions. The console proxy binds short-lived grants to that browser session and validates the session on HTTP and WebSocket access; it accepts no browser-supplied upstream URL or transport target. Native noVNC assets and WebSocket traffic travel over the application’s HTTPS/WSS origin, with private HTTP/WS access to the trusted CPVM behind it. Only `/vm-console/` responses allow same-origin framing; other application responses retain `X-Frame-Options: DENY`. Native console assets are trusted code served on the application origin.
 
+VM file downloads use single-use grants (60 seconds) bound to the browser session, re-authorize natively when fetched, and stream over the managed SFTP connection; uploads are limited to 100 MiB per file, reject names containing `/`, and ask before overwriting. Downloads and uploads are audited without file contents or paths.
+
 ## Infrastructure keys
 
 Each managed agent account has one encrypted CloudStack API key pair, shared by generic API calls and managed subgroup provisioning. CloudStack's current account, domain and role authorize every infrastructure request. New keys contain no additional per-key allow/deny rules; the application adds no command blacklist, parameter-name blacklist or duplicate infrastructure permission table. Search and description use the same identity's live `listApis` catalogue, including service-offering, account and domain APIs that CloudStack permits.
