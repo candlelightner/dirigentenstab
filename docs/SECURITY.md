@@ -4,7 +4,7 @@ Dirigentenstab is an administrative application. An authorized agent can change 
 
 ## Credentials and sessions
 
-All CloudStack keys, provider keys, MCP bearer credentials, guest private keys, CloudStack browser sessions, and conversation messages use Fernet authenticated encryption. The master key is a separate file mounted as a Docker secret. SQLite UUIDs, display names, provider and MCP URLs, tool assignments, conversation titles and audit metadata remain plaintext. Back up the master key independently; losing it makes encrypted records unrecoverable.
+All CloudStack keys, provider keys, MCP bearer credentials, guest private keys, the owner's optional terminal SSH private key and passphrase, CloudStack browser sessions, and conversation messages use Fernet authenticated encryption. The master key is a separate file mounted as a Docker secret. SQLite UUIDs, display names, provider and MCP URLs, tool assignments, conversation titles and audit metadata remain plaintext. Back up the master key independently; losing it makes encrypted records unrecoverable.
 
 The application never stores a human CloudStack password. Login attempts are bounded by persistent per-client and per-username limits. Session cookies are opaque, HttpOnly, Secure and SameSite Strict; only hashes are indexed in SQLite. Logout revokes the local session even if CloudStack is temporarily unavailable. CloudStack user/account status is checked again on protected operations. There is no public registration.
 
