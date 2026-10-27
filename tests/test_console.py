@@ -251,3 +251,75 @@ def test_unreachable_upstream_has_sanitized_error(setup, monkeypatch):
         response = client.get(path)
         assert response.status_code == 502
         assert 'private' not in response.text and 'cpvm' not in response.text
+
+
+def test_upstream_keepalive_pings_are_disabled(setup, monkeypatch):
+    _, app, path, _ = setup
+    ticket = path.split('/')[2]
+    seen = {}
+
+    class Fake:
+        def __init__(self, uri, **kwargs):
+            seen.update(kwargs)
+            raise OSError('stop')
+
+    monkeypatch.setattr('dirigentenstab.console._NoRedirectConnect', Fake)
+    with TestClient(app, base_url='https://app.example:3001') as client:
+        client.cookies.set('ds_session', 'one')
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect(
+                '/vm-console/' + ticket + '/ws', headers={'origin': 'https://app.example:3001'}):
+            pass
+    assert seen['ping_interval'] is None
+
+
+def test_static_resources_are_cached_per_origin_and_bounded(setup, monkeypatch):
+    proxy, app, path, _ = setup
+    requested = []
+    status = [200]
+
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(status[0], content=b'x' * 10, headers={'content-type': 'text/css'})
+
+    mock_http(monkeypatch, handler)
+    root = path.split('vnc.html')[0]
+    with TestClient(app, base_url='https://app.example:3001') as client:
+        client.cookies.set('ds_session', 'one')
+        assert client.get(root + 'a.css').content == b'x' * 10
+        assert client.get(root + 'a.css').headers['content-type'] == 'text/css'
+        assert len(requested) == 1
+        status[0] = 404
+        assert client.get(root + 'missing.css').status_code == 502
+        assert client.get(root + 'missing.css').status_code == 502
+        assert len(requested) == 3
+        # A grant for another CPVM must not reuse the first origin's entries.
+        status[0] = 200
+        other = asyncio.run(proxy.open({'userid': 'same-human', '_session': 'one'}, 'vm-2'))
+        proxy.grants[other.split('/')[2]].origin = 'http://other-cpvm'
+        assert client.get(other.split('vnc.html')[0] + 'a.css').status_code == 200
+        assert requested[-1] == 'http://other-cpvm/resource/noVNC/a.css'
+        monkeypatch.setattr('dirigentenstab.console.CACHE_BYTES', 25)
+        for name in ('b.css', 'c.css', 'd.css'):
+            assert client.get(root + name).status_code == 200
+        assert sum(len(body) for body, _ in proxy.assets.values()) <= 25
+
+
+def test_console_session_end_is_logged_without_ticket(setup, monkeypatch, caplog):
+    proxy, app, path, _ = setup
+    ticket = path.split('/')[2]
+    caplog.set_level('INFO', logger='dirigentenstab.console')
+    with echo_server() as (port, _, closed), TestClient(app, base_url='https://app.example:3001') as client:
+        proxy.grants[ticket].websocket = f'ws://127.0.0.1:{port}/websockify?token=native-secret'
+        client.cookies.set('ds_session', 'one')
+        with client.websocket_connect('/vm-console/' + ticket + '/ws', headers={'origin': 'https://app.example:3001'},
+                                     subprotocols=['binary']) as ws:
+            ws.send_bytes(b'12345')
+            assert ws.receive_bytes() == b'12345'
+        assert closed.wait(timeout=2)
+    for _ in range(100):
+        if any('session ended' in r.message for r in caplog.records):
+            break
+        time.sleep(0.02)
+    lines = [r.getMessage() for r in caplog.records if 'session ended' in r.message]
+    assert len(lines) == 1 and 'client-closed' in lines[0] and '5 B up, 5 B down' in lines[0]
+    assert 'native-secret' not in caplog.text and ticket not in caplog.text and '127.0.0.1' not in caplog.text

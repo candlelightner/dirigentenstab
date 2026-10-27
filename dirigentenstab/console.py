@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+import logging
 import secrets
 import time
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
@@ -10,7 +11,7 @@ import httpx
 from fastapi import HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from websockets.asyncio.client import connect
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .auth import Auth
 
@@ -18,6 +19,9 @@ PREFIX = '/vm-console/'
 RESOURCE = '/resource/noVNC/'
 SESSION_POLL_SECONDS = 1
 NATIVE_POLL_SECONDS = 30
+CACHE_BYTES = 32 * 1024 * 1024
+CACHE_ENTRIES = 256
+logger = logging.getLogger('dirigentenstab.console')
 
 
 class _NoRedirectConnect(connect):
@@ -38,6 +42,7 @@ class ConsoleProxy:
         self.service = service
         self.auth = Auth(service)
         self.grants = {}
+        self.assets = {}  # (CPVM origin, resource) -> (body, content type); static noVNC files only
 
     async def open(self, identity, vm_id):
         session = identity.get('_session')
@@ -90,6 +95,10 @@ class ConsoleProxy:
             raise PermissionError('Console session mismatch')
         return grant
 
+    @staticmethod
+    def _asset(body, content_type):
+        return Response(body, headers={'content-type': content_type, 'referrer-policy': 'no-referrer'})
+
     def install(self, app):
         """Install behind the application's existing SessionGuard middleware."""
         @app.api_route(PREFIX + '{ticket}/{resource:path}', methods=['GET', 'HEAD'])
@@ -102,6 +111,9 @@ class ConsoleProxy:
             if (not resource or any(part in {'', '.', '..'} for part in resource.split('/'))
                     or any(c in resource for c in '\\%?#:') or any(ord(c) < 32 for c in resource)):
                 raise HTTPException(404, 'Console resource unavailable')
+            key = (grant.origin, resource)
+            if request.method == 'GET' and key in self.assets:
+                return self._asset(*self.assets[key])
             try:
                 async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
                     async with client.stream(request.method, grant.origin + RESOURCE + resource) as upstream:
@@ -112,10 +124,12 @@ class ConsoleProxy:
                             body.extend(chunk)
                             if len(body) > 8 * 1024 * 1024:
                                 raise HTTPException(502, 'Console resource too large')
-                        return Response(bytes(body), headers={
-                            'content-type': upstream.headers.get('content-type', 'application/octet-stream'),
-                            'referrer-policy': 'no-referrer',
-                        })
+                        asset = bytes(body), upstream.headers.get('content-type', 'application/octet-stream')
+                        if request.method == 'GET':
+                            self.assets[key] = asset
+                            while len(self.assets) > CACHE_ENTRIES or sum(len(a[0]) for a in self.assets.values()) > CACHE_BYTES:
+                                del self.assets[next(iter(self.assets))]
+                        return self._asset(*asset)
             except httpx.HTTPError:
                 raise HTTPException(502, 'Console upstream unavailable') from None
 
@@ -131,11 +145,17 @@ class ConsoleProxy:
                 await socket.close(code=4403)
                 return
             tasks = []
+            upstream = None
+            reason = 'error'
+            started = time.monotonic()
+            sent = [0, 0]  # bytes client->upstream, upstream->client
             try:
                 offered = socket.scope.get('subprotocols', [])
                 protocols = ['binary'] if 'binary' in offered else None
                 async with _NoRedirectConnect(grant.websocket, origin=grant.origin, subprotocols=protocols,
                                               proxy=None, compression=None, open_timeout=10,
+                                              ping_interval=None,  # CPVM does not answer pings; VNC traffic and watch_session show liveness
+
                                               close_timeout=2, max_size=16 * 1024 * 1024) as upstream:
                     await socket.accept(subprotocol=upstream.subprotocol)
 
@@ -144,10 +164,13 @@ class ConsoleProxy:
                             message = await socket.receive()
                             if message['type'] == 'websocket.disconnect':
                                 return
-                            await upstream.send(message['bytes'] if message.get('bytes') is not None else message['text'])
+                            data = message['bytes'] if message.get('bytes') is not None else message['text']
+                            sent[0] += len(data)
+                            await upstream.send(data)
 
                     async def outgoing():
                         async for message in upstream:
+                            sent[1] += len(message)
                             if isinstance(message, bytes):
                                 await socket.send_bytes(message)
                             else:
@@ -165,11 +188,17 @@ class ConsoleProxy:
 
                     tasks = [asyncio.create_task(work()) for work in (incoming, outgoing, watch_session)]
                     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    reason = ('client-closed', 'upstream-closed', 'session-ended')[min(tasks.index(t) for t in done)]
                     for task in done:
                         task.result()
-            except (OSError, TimeoutError, WebSocketException, WebSocketDisconnect, PermissionError, httpx.HTTPError):
-                pass  # Do not expose ticketed upstream URLs in errors sent to the client.
+            except (OSError, TimeoutError, WebSocketException, WebSocketDisconnect, PermissionError, httpx.HTTPError) as exc:
+                reason = ('upstream-closed' if isinstance(exc, ConnectionClosed) else
+                          'client-closed' if isinstance(exc, WebSocketDisconnect) else 'error ' + type(exc).__name__)
+                # Do not expose ticketed upstream URLs in errors sent to the client.
             finally:
+                logger.info('console session ended: %s, upstream close %s %r, %.1f s, %d B up, %d B down',
+                            reason, getattr(upstream, 'close_code', None), getattr(upstream, 'close_reason', ''),
+                            time.monotonic() - started, *sent)
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
