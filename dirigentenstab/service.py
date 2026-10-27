@@ -135,13 +135,16 @@ class Service:
             'WHERE va.vm_id NOT LIKE "pending-%"'
         )
         cs_names = {}
+        cs_displays = {}
         try:
             cs_vms = (await self.human_call(identity, 'listVirtualMachines', {'listall': 'true'})).get('virtualmachine', [])
             cs_names = {vm['id']: vm.get('name') or vm.get('displayname') for vm in cs_vms if 'id' in vm}
+            cs_displays = {vm['id']: vm['displayname'] for vm in cs_vms if 'id' in vm and vm.get('displayname')}
         except Exception:
             pass
         vms = [{'id': row['id'], 'owner_agent': row['owner_agent'],
-                'name': cs_names.get(row['id']) or row['name']}
+                'name': cs_names.get(row['id']) or row['name'],
+                'displayname': cs_displays.get(row['id'])}
                for row in managed_vms if row['owner_agent'] in visible_agents]
         return {'domains': domains, 'agents': agents, 'pending_provisioning': pending,
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}

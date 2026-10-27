@@ -92,6 +92,35 @@ def test_global_admin_is_separate_above_preserved_domain_tree():
                                      'icon': 'smart_toy', 'children': []}]
 
 
+def test_hierarchy_nodes_modes_and_alias_display():
+    data = {
+        'domains': [{'id': 'native', 'name': 'ROOT', 'level': 0},
+                    {'id': 'eng-domain', 'name': 'Engineering', 'parentdomainid': 'native'}],
+        'agents': [{'id': 'eng-agent', 'name': 'Eng Admin', 'domain_id': 'eng-domain'}],
+        'vms': [
+            {'id': 'vm-1', 'name': 'ds-vm-1111', 'displayname': 'my-custom-vm', 'owner_agent': 'eng-agent'},
+            {'id': 'vm-2', 'name': 'ds-vm-2222', 'displayname': 'ds-vm-2222', 'owner_agent': 'eng-agent'},
+            {'id': 'vm-3', 'name': 'ds-vm-3333', 'owner_agent': 'eng-agent'},
+        ],
+    }
+    nodes = hierarchy_nodes(data, mode=['Agents'])
+    assert 'ds-vm-1111' not in str(nodes)
+    assert 'my-custom-vm' not in str(nodes)
+
+    nodes = hierarchy_nodes(data, mode=['Agents', 'VMs'])
+    labels = [c['label'] for c in nodes[0]['children']]
+    assert labels == ['ds-vm-1111', 'ds-vm-2222', 'ds-vm-3333']
+
+    nodes = hierarchy_nodes(data, mode=['Agents', 'VMs'], show_aliases=True)
+    labels = [c['label'] for c in nodes[0]['children']]
+    assert labels == ['my-custom-vm', 'ds-vm-2222', 'ds-vm-3333']
+
+    nodes = hierarchy_nodes(data, mode=['VMs'], show_aliases=True)
+    assert len(nodes) == 1
+    assert nodes[0]['selectable'] is False
+    assert [c['label'] for c in nodes[0]['children']] == ['my-custom-vm', 'ds-vm-2222', 'ds-vm-3333']
+
+
 def test_history_excludes_system_instructions_and_keeps_tool_activity():
     history = {'messages': [
         {'kind': 'request', 'parts': [{'part_kind': 'system-prompt', 'content': 'internal instructions'},
