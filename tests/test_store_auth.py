@@ -145,9 +145,50 @@ async def test_revoked_cloudstack_account_invalidates_session(store):
     with pytest.raises(PermissionError):
         auth.csrf('opaque-token', 'forged')
     enabled = False
+    auth.verified.clear()
     with pytest.raises(PermissionError):
         await auth.identity('opaque-token')
     assert not store.one('SELECT token_hash FROM sessions')
+
+
+async def test_native_revalidation_is_cached_for_thirty_seconds(store, monkeypatch):
+    calls, enabled, clock = [], True, [1000.0]
+
+    async def human_call(identity, command, params):
+        calls.append(command)
+        if command == 'listUsers':
+            return {'user': [{'id': 'person', 'state': 'enabled' if enabled else 'disabled'}]}
+        return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
+
+    monkeypatch.setattr('dirigentenstab.auth.time.monotonic', lambda: clock[0])
+    auth = Auth(SimpleNamespace(store=store, human_call=human_call))
+    private = {'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin', 'type': 1}
+    store.execute('INSERT INTO sessions VALUES(?,?,?,?)',
+                  (auth.digest('tok'), 'csrf', store.seal(private), time.time() + 300))
+    await auth.identity('tok')
+    assert len(calls) == 2
+    clock[0] += 29
+    enabled = False
+    assert (await auth.identity('tok'))['userid'] == 'person'
+    assert len(calls) == 2
+    clock[0] += 1
+    with pytest.raises(PermissionError):
+        await auth.identity('tok')
+    assert len(calls) == 4
+    assert not store.one('SELECT token_hash FROM sessions')
+    enabled = True
+    store.execute('INSERT INTO sessions VALUES(?,?,?,?)',
+                  (auth.digest('tok'), 'csrf', store.seal(private), time.time() + 300))
+    await auth.identity('tok')
+    assert len(calls) == 6
+    await auth.identity('tok')
+    assert len(calls) == 6
+    await auth.identity_from_session(auth.digest('tok'), fresh=True)
+    assert len(calls) == 8
+    await auth.identity('tok')
+    store.execute('DELETE FROM sessions')
+    with pytest.raises(PermissionError, match='Session expired'):
+        await auth.identity('tok')
 
 
 async def test_session_expiration_and_persistent_login_rate_limit(store):

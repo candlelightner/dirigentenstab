@@ -13,11 +13,13 @@ from starlette.datastructures import Headers
 from .cloud import CloudError
 
 COOKIE = 'ds_session'
+NATIVE_POLL_SECONDS = 30
 
 
 class Auth:
     def __init__(self, service):
         self.service, self.store = service, service.store
+        self.verified = {}  # session hash -> monotonic time of the last successful native revalidation
 
     @staticmethod
     def digest(token):
@@ -63,13 +65,17 @@ class Auth:
             raise PermissionError('Login required')
         return await self.identity_from_session(self.digest(token))
 
-    async def identity_from_session(self, hashed):
+    async def identity_from_session(self, hashed, fresh=False):
         session = self.store.one('SELECT * FROM sessions WHERE token_hash=? AND expires>?', (hashed, time.time()))
         if not session:
             raise PermissionError('Session expired')
         private = self.store.open(session['identity'])
         identity = {key: private.get(key) for key in ('userid', 'username', 'domainid', 'account', 'type')}
         identity.update(csrf=session['csrf'], _session=hashed)
+        now = time.monotonic()
+        if not fresh and now - self.verified.get(hashed, -NATIVE_POLL_SECONDS) < NATIVE_POLL_SECONDS:
+            return identity
+        self.verified = {k: t for k, t in self.verified.items() if now - t < NATIVE_POLL_SECONDS}
         try:
             users = await self.service.human_call(identity, 'listUsers', {'id': identity['userid']})
             user = next((u for u in users.get('user', []) if u['id'] == identity['userid']), None)
@@ -86,6 +92,7 @@ class Auth:
             if hasattr(self.service, 'close_user_terminal_sessions') and identity.get('userid'):
                 self.service.close_user_terminal_sessions(identity['userid'])
             raise PermissionError('CloudStack session no longer valid') from None
+        self.verified[hashed] = now
         return identity
 
     def csrf(self, token, value):
@@ -98,6 +105,7 @@ class Auth:
         hashed = self.digest(token)
         session = self.store.one('SELECT identity FROM sessions WHERE token_hash=?', (hashed,))
         self.store.execute('DELETE FROM sessions WHERE token_hash=?', (hashed,))
+        self.verified.pop(hashed, None)
         if session:
             private = self.store.open(session['identity'])
             if hasattr(self.service, 'close_user_terminal_sessions') and private.get('userid'):
