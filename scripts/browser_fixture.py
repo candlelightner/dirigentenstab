@@ -93,6 +93,7 @@ def fake_api(state):
                 value = {'domain': [d for d in DOMAINS if not params.get('id') or d['id'] == params['id']]}
             elif command == 'listVirtualMachines':
                 value = {'virtualmachine': [{'id': '00000000-0000-0000-0000-000000000004', 'name': 'research-vm',
+                                             'displayname': 'Research Worker',
                                              'state': 'Running'}]}
             elif command == 'listApis':
                 value = {'api': [{'name': 'updateVirtualMachine', 'params': [
@@ -128,6 +129,7 @@ class FixtureCloud(Cloud):
             return {'domain': [d for d in DOMAINS if not params.get('id') or d['id'] == params['id']]}
         if command == 'listVirtualMachines':
             return {'virtualmachine': [{'id': '00000000-0000-0000-0000-000000000004', 'name': 'research-vm',
+                                        'displayname': 'Research Worker',
                                         'state': 'Running', 'password': PRIVATE_VALUES[-1],
                                         'note': PRIVATE_VALUES[0]}]}
         raise ValueError('This CI fixture only supports listing domains and VMs')

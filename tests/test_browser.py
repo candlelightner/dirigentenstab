@@ -1087,24 +1087,58 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         await search.wait_for()
 
         # Check sidebar selector exists
-        sidebar_select = page.locator('.q-drawer').get_by_text('Agents', exact=True).first
+        sidebar_select = page.locator('.q-drawer .sidebar-view-select')
         await sidebar_select.wait_for()
 
-        # Open sidebar selector menu to switch to "Agents and VMs"
+        # Check alias switch is initially hidden
+        alias_switch = page.locator('.q-drawer .sidebar-show-aliases')
+        assert not await alias_switch.is_visible()
+
+        # Open sidebar selector menu to select "VMs" (both Agents and VMs selected)
         await sidebar_select.click()
-        await page.get_by_role('option', name='Agents and VMs', exact=True).click()
+        await page.get_by_role('option', name='VMs', exact=True).click()
         await page.wait_for_timeout(300)
+        await page.keyboard.press('Escape')
+
+        # Alias toggle is now visible
+        await alias_switch.wait_for()
 
         # Under Research Admin, research-vm should be visible
         vm_node = page.locator('.q-drawer').get_by_text('research-vm', exact=True)
         await vm_node.wait_for()
 
-        # Switch to "VMs" mode
-        await page.locator('.q-drawer').get_by_text('Agents and VMs', exact=True).first.click()
-        await page.get_by_role('option', name='VMs', exact=True).click()
-        await page.wait_for_timeout(300)
+        # Toggle Show aliases on: VM label changes to displayname
+        await alias_switch.click()
+        alias_node = page.locator('.q-drawer').get_by_text('Research Worker', exact=True)
+        await alias_node.wait_for()
+        assert not await vm_node.is_visible()
 
-        # In VMs mode, research-vm is still visible under Research Admin
+        # Toggle Show aliases off: reverts to name
+        await alias_switch.click()
+        await vm_node.wait_for()
+        assert not await alias_node.is_visible()
+
+        # Switch to "VMs" only mode by deselecting Agents
+        await sidebar_select.click()
+        agents_opt = page.get_by_role('option', name='Agents', exact=True)
+        await agents_opt.wait_for()
+        await agents_opt.click()
+        await page.wait_for_timeout(300)
+        await page.keyboard.press('Escape')
+
+        # In VMs mode, research-vm is still visible and alias switch remains visible
+        await vm_node.wait_for()
+        assert await alias_switch.is_visible()
+
+        # Enforce at least one selected: try deselecting VMs (the last selected item)
+        await sidebar_select.click()
+        vms_opt = page.get_by_role('option', name='VMs', exact=True)
+        await vms_opt.wait_for()
+        await vms_opt.click()
+        await page.wait_for_timeout(300)
+        await page.keyboard.press('Escape')
+
+        # VMs remains selected, research-vm still visible
         await vm_node.wait_for()
 
         # Click the VM node to open terminal pane

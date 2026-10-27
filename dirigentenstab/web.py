@@ -64,8 +64,11 @@ def agent_label(agent):
     return 'Main Agent' if agent.get('is_main') else agent['name']
 
 
-def hierarchy_nodes(data, mode='Agents'):
+def hierarchy_nodes(data, mode='Agents', show_aliases=False):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
+    if isinstance(mode, (list, tuple, set)):
+        s = set(mode)
+        mode = 'Agents and VMs' if {'Agents', 'VMs'} <= s else 'VMs' if 'VMs' in s else 'Agents'
     global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
     agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
     vms_by_agent = {}
@@ -73,6 +76,10 @@ def hierarchy_nodes(data, mode='Agents'):
         for vm in data.get('vms', []):
             if vm.get('owner_agent'):
                 vms_by_agent.setdefault(vm['owner_agent'], []).append(vm)
+
+    def vm_label(vm):
+        alias = vm.get('displayname')
+        return alias if (show_aliases and alias and alias != vm.get('name')) else (vm.get('name') or vm['id'])
 
     domains, roots = {}, []
     for domain in data.get('domains', []):
@@ -83,7 +90,7 @@ def hierarchy_nodes(data, mode='Agents'):
         children = []
         if agent and agent['id'] in vms_by_agent:
             for vm in vms_by_agent[agent['id']]:
-                children.append({'id': 'vm:' + vm['id'], 'label': vm.get('name') or vm['id'],
+                children.append({'id': 'vm:' + vm['id'], 'label': vm_label(vm),
                                  'icon': 'dns', 'children': []})
         domains[domain['id']] = {'id': node_id, 'label': label, 'icon': icon, 'children': children}
 
@@ -104,7 +111,7 @@ def hierarchy_nodes(data, mode='Agents'):
         children = []
         if agent['id'] in vms_by_agent:
             for vm in vms_by_agent[agent['id']]:
-                children.append({'id': 'vm:' + vm['id'], 'label': vm.get('name') or vm['id'],
+                children.append({'id': 'vm:' + vm['id'], 'label': vm_label(vm),
                                  'icon': 'dns', 'children': []})
         global_nodes.append({'id': 'agent:' + agent['id'], 'label': agent_label(agent),
                              'icon': 'admin_panel_settings', 'children': children})
@@ -378,13 +385,17 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                 ':model-value="null"').classes('bg-stone-50') as drawer:
             with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
                 with ui.row().classes('w-full items-center no-wrap'):
-                    sidebar_select = ui.select(['Agents', 'VMs', 'Agents and VMs'], value='Agents').props('dense options-dense').classes('text-base font-semibold min-w-[150px]').mark('sidebar_view_select')
+                    sidebar_select = ui.select(['Agents', 'VMs'], multiple=True, value=['Agents']).props(
+                        'dense options-dense').classes('sidebar-view-select text-base font-semibold min-w-[140px] max-w-[180px]').mark('sidebar_view_select')
                     ui.space()
                     ui.button(icon='close', on_click=lambda: drawer.run_method('hide')).props('flat round aria-label="Close agent hierarchy"')
                     refresh_button = ui.button(icon='refresh').props('flat round aria-label="Refresh hierarchy"')
+                alias_switch = ui.switch('Show aliases', value=False).props('dense').classes(
+                    'sidebar-show-aliases text-xs text-stone-600').mark('sidebar_show_aliases')
+                alias_switch.set_visibility('VMs' in (sidebar_select.value or []))
                 search = ui.input('Search agents and domains').props('clearable').classes('w-full')
                 with ui.scroll_area().classes('w-full flex-1 min-h-0'):
-                    tree = ui.tree(hierarchy_nodes(data, mode=sidebar_select.value)).classes('w-full').mark('hierarchy')
+                    tree = ui.tree(hierarchy_nodes(data, mode=sidebar_select.value, show_aliases=alias_switch.value)).classes('w-full').mark('hierarchy')
                 status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
                 if identity.get('type') == 1:
                     dashboard_link('dashboard-mobile w-full text-teal-900')
@@ -806,8 +817,12 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             ssh_dialog.open()
 
         def update_sidebar_view():
-            tree.props['nodes'] = hierarchy_nodes(state.get('data', {}), mode=sidebar_select.value)
-            if sidebar_select.value in {'VMs', 'Agents and VMs'}:
+            has_vms = 'VMs' in (sidebar_select.value or [])
+            alias_switch.set_visibility(has_vms)
+            tree.props['nodes'] = hierarchy_nodes(
+                state.get('data', {}), mode=sidebar_select.value, show_aliases=alias_switch.value
+            )
+            if has_vms:
                 tree.expand()
             tree.update()
 
@@ -817,14 +832,16 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             state['data'] = updated
             agents.clear()
             agents.update({row['id']: row for row in updated.get('agents', [])})
-            tree.props['nodes'] = hierarchy_nodes(updated, mode=sidebar_select.value)
+            tree.props['nodes'] = hierarchy_nodes(
+                updated, mode=sidebar_select.value, show_aliases=alias_switch.value
+            )
             tree.update()
             status.set_text(str(updated.get('status', 'CloudStack connected')))
 
         async def select_node(event):
             if selection_lock.locked() or not event.value:
                 return
-            if sidebar_select.value == 'VMs' and not event.value.startswith('vm:'):
+            if set(sidebar_select.value or []) == {'VMs'} and not event.value.startswith('vm:'):
                 return
             kind, identifier = event.value.split(':', 1)
             if kind == 'agent':
@@ -1841,7 +1858,19 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         refresh_button.on_click(lambda: protect(refresh))
         new_button.on_click(lambda: protect(new_conversation))
         send_button.on_click(lambda: protect(send))
-        sidebar_select.on_value_change(lambda _: update_sidebar_view())
+        last_view = list(sidebar_select.value or ['Agents'])
+
+        def select_sidebar_view(e):
+            nonlocal last_view
+            val = [x for x in (e.value or []) if x in {'Agents', 'VMs'}]
+            if not val:
+                sidebar_select.set_value(last_view)
+                return
+            last_view = list(val)
+            update_sidebar_view()
+
+        sidebar_select.on_value_change(select_sidebar_view)
+        alias_switch.on_value_change(lambda _: update_sidebar_view())
         if ssh_key_button is not None:
             ssh_key_button.on_click(lambda: protect(lambda: open_dialog(open_ssh_key_dialog)))
         if providers_button is not None:
