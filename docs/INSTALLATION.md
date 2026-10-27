@@ -62,7 +62,8 @@ The implementation is visible in Apache's [capacity manager](https://github.com/
 For the reference host's scoped persistent CPVM route, installation and Windows
 reboot checks, see [CONSOLE_ACCESS.md](CONSOLE_ACCESS.md). The optional
 [Ubuntu XFCE template procedure](DESKTOP_TEMPLATE.md) is future work for new,
-explicitly authorized builder VMs; it does not modify running guests.
+explicitly authorized builder VMs; it does not modify running guests. The
+[dev VM template](DEV_TEMPLATE.md) preinstalls AI coding CLIs the same way.
 
 The local application serves HTTPS and NiceGUI WebSockets on the same port. Accept the generated development certificate locally or replace the certificate/key secret with a certificate trusted by your clients. `PUBLIC_ORIGIN` must match your actual HTTPS origin, including any non-default port. Secure cookies deliberately do not work over plain HTTP.
 
