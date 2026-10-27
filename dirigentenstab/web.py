@@ -2065,7 +2065,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         requested = query.get('agent')
         if requested in agents:
             try:
-                await show_agent(requested, close_navigation=False)
+                await show_agent(requested)
             except Exception:
                 pass  # Unavailable ids fall back to the default below.
         if main and not state['agent']:

@@ -1410,8 +1410,7 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.locator('.messages table').wait_for()
-        if not await page.get_by_role('button', name='Settings', exact=True).is_visible():
-            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await page.get_by_role('button', name='Settings', exact=True).click()
         await playwright.expect(toggle).not_to_be_checked()
         await page.keyboard.press('Escape')
@@ -1456,11 +1455,14 @@ async def test_browser_reload_restores_open_agent_vm_mode_and_skill(browser_app,
         async def reloaded():
             await page.reload()
             await page.wait_for_function('window.socket?.connected && window.did_handshake')
+            await playwright.expect(page.get_by_label('Search agents and domains', exact=True)).to_be_hidden()
 
         async def open_node(label):
             search = page.get_by_label('Search agents and domains', exact=True)
             if not await search.is_visible():
                 await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            await playwright.expect(page.locator('.q-drawer .sidebar-view-select')).not_to_have_class(
+                re.compile(r'.*q-field--disabled.*'))
             await search.fill(label)
             await page.locator('.q-tree').get_by_text(label, exact=True).click()
 
