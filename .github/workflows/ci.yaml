@@ -22,7 +22,7 @@ jobs:
       - run: ruff check . && bash -n setup.sh
       - name: Unit and integration, including multi-turn conversations and 65-tool continuation
         timeout-minutes: 4
-        run: python scripts/test_runner.py run unit-and-integration -- pytest -q -m "not browser and not live"
+        run: python scripts/test_runner.py run unit-and-integration -- pytest -q -n auto --timeout=60 -m "not browser and not live"
   container:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

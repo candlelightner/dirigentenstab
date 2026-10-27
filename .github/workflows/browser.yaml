@@ -15,11 +15,7 @@ permissions:
 
 jobs:
   chromium:
-    name: chromium (shard ${{ matrix.shard }}/2)
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
+    name: chromium
     runs-on: ubuntu-24.04
     timeout-minutes: 9
     container:
@@ -27,7 +23,6 @@ jobs:
       options: --shm-size=1g
     env:
       HOME: /root
-      BROWSER_SHARD: ${{ matrix.shard }}/2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,11 +54,11 @@ jobs:
       - name: Browser tests
         if: steps.changes.outputs.code == 'true'
         timeout-minutes: 8
-        run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
+        run: python scripts/test_runner.py run browser -- python -m pytest -q -m browser tests/test_browser.py -n 4 --timeout=120 --basetemp=browser-results
       - uses: actions/upload-artifact@v4
         if: always() && steps.changes.outputs.code == 'true'
         with:
-          name: playwright-browser-results-${{ matrix.shard }}
+          name: playwright-browser-results
           path: |
             browser-results/**/browser-server.log
             browser-results/**/*.png

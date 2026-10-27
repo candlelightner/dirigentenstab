@@ -25,14 +25,14 @@ Guest forwarding tests verify native security-group references, source-IP checks
 ```sh
 python -m pip install -e '.[browser]'
 python -m playwright install --with-deps --only-shell --no-remove chromium
-python -m pytest -q -m browser tests/test_browser.py --basetemp=browser-results
+python -m pytest -q -m browser tests/test_browser.py -n 2 --timeout=120 --basetemp=browser-results
 ```
 
 The tests start a temporary HTTPS NiceGUI server on a loopback port and drive it with Chromium. They exercise the application's real CloudStack login code, encrypted server-side sessions, Secure/HttpOnly cookies, session-bound WebSockets, direct agent chat, Pydantic AI streaming and tools, conversation restoration, provider settings, responsive layout and logout. They also disable a CloudStack human after the socket is established and verify that the next action returns to login.
 
 The CloudStack transport, model and remote MCP tool discovery are fixtures in this test mode. `scripts/browser_fixture.py` refuses to start unless `DIRIGENTENSTAB_BROWSER_FIXTURE=1` is explicitly set. It creates a temporary database, synthetic credentials and a temporary TLS certificate. It does not access an existing CloudStack installation, hypervisor or model provider. Browser tests assert that synthetic infrastructure/provider keys and VM passwords are absent from browser content.
 
-`.github/workflows/browser.yaml` runs inside the prebuilt test runner container with Chromium and Firefox pre-installed as two parallel matrix shards (`BROWSER_SHARD=1/2` and `2/2`; `tests/conftest.py` assigns browser tests to shards by collection index, and locally an unset variable runs everything). Each shard uploads desktop/mobile screenshots and the fixture's server log. Pull requests that only change Markdown files, `docs/**` or `LICENSE` skip the browser tests but the job still succeeds so required checks pass. A new push to a pull request cancels that PR's older `ci.yaml` and `browser.yaml` runs; runs on `main` are never cancelled. A development environment without the optional Playwright package reports browser tests as skipped; the dedicated browser CI job must run them.
+`.github/workflows/browser.yaml` runs inside the prebuilt test runner container with Chromium and Firefox pre-installed as a single job using `pytest-xdist` (`-n 4`, matching the 4 vCPUs of the GitHub runner) and a per-test `pytest-timeout` (`--timeout=120`, default signal method; a hung test fails with a traceback instead of stalling the job). Each test starts its own server on a random port in its own temporary directory, so tests are isolation-safe. On a memory-constrained machine run `-n 2` (never more) and, if needed, split the suite with `BROWSER_SHARD=1/2` (and `2/2`) — `tests/conftest.py` assigns browser tests to shards by collection index, and an unset variable runs everything. The job uploads desktop/mobile screenshots and the fixture's server log. Pull requests that only change Markdown files, `docs/**` or `LICENSE` skip the browser tests but the job still succeeds so required checks pass. A new push to a pull request cancels that PR's older `ci.yaml` and `browser.yaml` runs; runs on `main` are never cancelled. A development environment without the optional Playwright package reports browser tests as skipped; the dedicated browser CI job must run them.
 
 ## Prebuilt CI test runner
 

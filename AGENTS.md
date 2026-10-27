@@ -12,9 +12,9 @@ Guidelines and conventions for AI assistants working in this repository.
 - Use the **GitHub MCP** (`ServerName="github"`) for all GitHub operations (PR creation, check-run tracking, PR merging, issue/PR inspection).
 - Standard end-to-end workflow (treat implied steps—branching, committing, pushing, PRs, restarting hung CI jobs, merging, and deploying—as pre-approved scope; only stop on genuine blockers):
   1. Branch off `main` (`implementation/<topic>` or `fix/<topic>`) in a dedicated git worktree. The main checkout `/home/emil/dirigentenstab` is deploy-only: never edit, commit, or leave uncommitted changes there; only pull `origin/main` and deploy from it.
-  2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py` for UI changes.
+  2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py -n 2 --timeout=120` for UI changes (never more than 2 workers locally; `BROWSER_SHARD=1/2` splits the suite on constrained machines).
   3. Commit locally and push branch changes via GitHub MCP (`create_branch` + `push_files`) when shell git credentials are absent.
-  4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, two parallel Chromium shards) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
+  4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, one job with 4 xdist workers) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
   5. Merge PR into `main` via GitHub MCP.
   6. Pull `origin/main` in `/home/emil/dirigentenstab`, build the image tagged `dirigentenstab-local:<7-char short SHA of the deployed main commit>` (never reuse an older tag), set only `IMAGE` in `.env` to it, restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI. Afterwards remove merged worktrees and their branches.
 
