@@ -150,6 +150,7 @@ class Service:
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}
                           for user in users if user.get('domainid') in visible],
                 'vms': vms,
+                'skills': await self.list_skills(identity),
                 'status': 'CloudStack connected'}
 
     async def authorize(self, identity, agent_id, *, include_disabled=False):
@@ -201,9 +202,11 @@ class Service:
                                            for d in domains if d.get('parentdomainid') == domain['id']]},
                 'available_api_names': sorted(catalogue),
                 'approved_guest_assets': await self.guest_assets(agent['id']),
+                'skills': await self.list_skills({'_agent_id': agent['id']}),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
-                          'run_vm_command', 'transfer_vm_file', 'configure_agent']
-                         + (['request_escalation'] if (await self.escalation_access(agent))['enabled'] else []),
+                          'run_vm_command', 'transfer_vm_file', 'configure_agent',
+                          'list_skills', 'get_skill', 'save_skill', 'share_skill']
+                         + (['request_escalation', 'request_skill_global'] if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
 
@@ -611,6 +614,116 @@ class Service:
             if paused:
                 await runtime.resume_agents(new_ids)
 
+    def _skill_metadata(self, row, can_edit):
+        return {key: row[key] for key in ('id', 'creator_agent_id', 'name', 'description', 'revision')} | {
+            'global_shared': row['global_revision'] == row['revision'],
+            'shared_agent_ids': json.loads(row['shared_agent_ids']), 'can_edit': can_edit}
+
+    async def list_skills(self, identity):
+        actor_id = identity.get('_agent_id')
+        if actor_id:
+            await self.agent(actor_id)
+        elif identity.get('type') not in {1, 2}:
+            raise PermissionError('A CloudStack administrator account is required')
+        result = []
+        for row in self.store.all('SELECT id,creator_agent_id,name,description,revision,global_revision,shared_agent_ids FROM skills ORDER BY name,id'):
+            try:
+                creator = await self.agent(row['creator_agent_id'])
+                if actor_id:
+                    can_edit = actor_id in {a['id'] for a in await self.agent_chain(creator)}
+                else:
+                    await self.authorize(identity, creator['id'])
+                    can_edit = True
+            except PermissionError:
+                continue
+            selected = actor_id in json.loads(row['shared_agent_ids'])
+            if selected and not can_edit:
+                selected = row['creator_agent_id'] in {a['id'] for a in (await self.agent_chain(await self.agent(actor_id)))[:-1]}
+            if can_edit or row['global_revision'] == row['revision'] or selected:
+                result.append(self._skill_metadata(row, can_edit))
+        return result
+
+    async def get_skill(self, identity, skill_id):
+        metadata = next((s for s in await self.list_skills(identity) if s['id'] == skill_id), None)
+        if not metadata:
+            raise PermissionError('Skill is unavailable')
+        row = self.store.one('SELECT * FROM skills WHERE id=?', (skill_id,))
+        if not row or self._skill_metadata(row, metadata['can_edit']) != metadata:
+            raise PermissionError('Skill changed; reload its current revision')
+        shareable = []
+        if metadata['can_edit']:
+            for target in self.store.all('SELECT * FROM agents WHERE enabled=1'):
+                try:
+                    if row['creator_agent_id'] in {a['id'] for a in (await self.agent_chain(target))[:-1]}:
+                        shareable.append({'id': target['id'], 'name': target['name']})
+                except PermissionError:
+                    continue
+        return metadata | {'text': self.store.open(row['text']), 'shareable_agents': shareable}
+
+    async def save_skill(self, identity, creator_agent_id, name, description, text, skill_id=None):
+        if (not isinstance(name, str) or not name.strip() or len(name) > 100 or not name.isprintable()
+                or not isinstance(description, str) or not description.strip() or len(description) > 500
+                or not isinstance(text, str) or not text.strip() or len(text) > 60000 or '\x00' in text):
+            raise ValueError('Supply a name (1–100 characters), short description (1–500), and full text (1–60000)')
+        if skill_id:
+            current = await self.get_skill(identity, skill_id)
+            if not current['can_edit'] or creator_agent_id != current['creator_agent_id']:
+                raise PermissionError('Only the creator, its ancestors, or the human owner may edit a skill')
+            if (name.strip(), description.strip(), text) == (current['name'], current['description'], current['text']):
+                return self._skill_metadata(self.store.one('SELECT * FROM skills WHERE id=?', (skill_id,)), True)
+        elif identity.get('_agent_id'):
+            if identity['_agent_id'] != creator_agent_id:
+                raise PermissionError('Create skills under your own agent identity')
+            await self.agent(creator_agent_id)
+        else:
+            await self.authorize(identity, creator_agent_id)
+        now = time.time()
+        if skill_id:
+            self.store.execute('UPDATE skills SET name=?,description=?,text=?,revision=revision+1,global_revision=NULL,updated=? WHERE id=?',
+                               (name.strip(), description.strip(), self.store.seal(text), now, skill_id))
+        else:
+            skill_id = str(uuid.uuid4())
+            self.store.execute('INSERT INTO skills(id,creator_agent_id,name,description,text,created,updated) VALUES(?,?,?,?,?,?,?)',
+                               (skill_id, creator_agent_id, name.strip(), description.strip(), self.store.seal(text), now, now))
+        self.store.audit(identity.get('_agent_id') or identity['userid'], 'save-skill', skill_id)
+        return next(s for s in await self.list_skills(identity) if s['id'] == skill_id)
+
+    async def share_skill(self, identity, skill_id, agent_ids):
+        skill = await self.get_skill(identity, skill_id)
+        if not skill['can_edit']:
+            raise PermissionError('Only skill editors may change sharing')
+        if (not isinstance(agent_ids, list) or any(not isinstance(a, str) for a in agent_ids)
+                or not set(agent_ids) <= {a['id'] for a in skill['shareable_agents']}):
+            raise PermissionError('Share only with selected descendants of the creator')
+        self.store.execute('UPDATE skills SET shared_agent_ids=?,updated=? WHERE id=?',
+                           (json.dumps(sorted(set(agent_ids))), time.time(), skill_id))
+        self.store.audit(identity.get('_agent_id') or identity['userid'], 'share-skill', skill_id)
+        return next(s for s in await self.list_skills(identity) if s['id'] == skill_id)
+
+    async def approve_skill_global(self, identity, skill_id, revision):
+        from .auth import Auth
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Global sharing requires explicit approval by the human platform administrator')
+        current = await Auth(self).identity_from_session(identity.get('_session'))
+        if current['type'] != 1 or current['userid'] != identity['userid']:
+            raise PermissionError('A current human platform administrator session is required')
+        skill = await self.get_skill(current, skill_id)
+        if type(revision) is not int or skill['revision'] != revision:
+            raise ValueError('Skill changed; review and approve its current revision')
+        changed = self.store.execute('UPDATE skills SET global_revision=revision WHERE id=? AND revision=?', (skill_id, revision))
+        if not changed:
+            raise ValueError('Skill changed; review and approve its current revision')
+        self.store.audit(current['userid'], 'approve-skill-global', skill_id, str(revision))
+        return next(s for s in await self.list_skills(current) if s['id'] == skill_id)
+
+    async def request_skill_global(self, agent_id, skill_id, reason, **context):
+        skill = await self.get_skill({'_agent_id': agent_id}, skill_id)
+        if not skill['can_edit']:
+            raise PermissionError('Only skill editors may request global sharing')
+        params = {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}
+        return await self.request_escalation(agent_id, 'Share skill globally: ' + skill['name'], reason,
+                                             'shareSkillGlobally', params, **context)
+
     def escalation_request_limit(self):
         row = self.store.one("SELECT value FROM platform_settings WHERE name='escalation_request_limit'")
         return int(row['value']) if row else 3
@@ -649,8 +762,17 @@ class Service:
         if (not isinstance(description, str) or not description.strip() or len(description) > 500
                 or not isinstance(reason, str) or not reason.strip() or len(reason) > 1000):
             raise ValueError('Supply a description (1–500 characters) and reason (1–1000 characters)')
-        validate(None, params)
-        if len(json.dumps(params)) > 65536:
+        if command == 'shareSkillGlobally':
+            if not isinstance(params, dict) or not isinstance(params.get('id'), str):
+                raise ValueError('Invalid skill publication request')
+            skill = await self.get_skill({'_agent_id': agent_id}, params['id'])
+            if not skill['can_edit']:
+                raise PermissionError('Only skill editors may request global sharing')
+            if params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}:
+                raise ValueError('Review the exact current skill revision')
+        else:
+            validate(None, params)
+        if len(json.dumps(params)) > (400000 if command == 'shareSkillGlobally' else 65536):
             raise ValueError('Escalation parameters are too large')
         description, reason = self.redact(description.strip()), self.redact(reason.strip())
         now, request_id = time.time(), str(uuid.uuid4())
@@ -703,6 +825,27 @@ class Service:
         if row['status'] != 'pending':
             return self._escalation_request(row)
         command, params = row['command'], self.store.open(row['params'])
+        if command == 'shareSkillGlobally':
+            if approve:
+                if not (await self.escalation_access(agent))['enabled']:
+                    raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
+                skill = await self.get_skill({'_agent_id': agent['id']}, params['id'])
+                if not skill['can_edit'] or params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}:
+                    raise ValueError('Skill changed; request approval for its current revision')
+            with self.store.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                pending = conn.execute("SELECT id FROM escalation_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
+                if pending:
+                    if approve:
+                        changed = conn.execute('UPDATE skills SET global_revision=revision WHERE id=? AND revision=?',
+                                               (params['id'], params['revision'])).rowcount
+                        if not changed:
+                            raise ValueError('Skill changed; request approval for its current revision')
+                    conn.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',
+                                 ('approved' if approve else 'deferred', self.store.seal({'skill_id': params['id'], 'revision': params['revision']}),
+                                  time.time(), request_id))
+            self.store.audit(current['userid'], 'decide-escalation', request_id, 'approved' if approve else 'deferred')
+            return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
         if approve:
             if not (await self.escalation_access(agent))['enabled']:
                 raise PermissionError('Escalation requests are disabled by this agent or an ancestor')

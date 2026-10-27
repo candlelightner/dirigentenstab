@@ -1280,3 +1280,70 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         # Verify zero horizontal overflow again
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await browser.close()
+
+
+@pytest.mark.parametrize('width', [390, 1440])
+async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, width):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': 844})
+        page = await context.new_page()
+        await login(page, url)
+        search = page.get_by_label('Search agents and domains', exact=True)
+        if not await search.is_visible():
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        sidebar = page.locator('.q-drawer .sidebar-view-select')
+        await playwright.expect(sidebar).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
+        await sidebar.click()
+        await page.get_by_role('option', name='Skills', exact=True).click()
+        await page.wait_for_function(
+            'JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003"))?.view.includes("Skills")')
+        await page.get_by_role('option', name='Agents', exact=True).click()
+        await page.wait_for_function(
+            'expected => JSON.stringify(JSON.parse(localStorage.getItem("dirigentenstab.sidebar.00000000-0000-0000-0000-000000000003")).view) === JSON.stringify(expected)',
+            arg=['Skills'])
+        await page.keyboard.press('Escape')
+        await page.get_by_role('button', name='New skill', exact=True).click()
+        await page.get_by_label('Skill name', exact=True).fill('GPU checklist')
+        await page.get_by_label('Short description', exact=True).fill('Prepare a GPU VM')
+        full_text = 'Detailed private checklist: inspect available profiles before deployment.'
+        await page.get_by_label('Full text', exact=True).fill(full_text)
+        await page.get_by_role('button', name='Save skill', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        await page.reload()
+        await playwright.expect(sidebar).not_to_have_class(re.compile(r'.*q-field--disabled.*'))
+        assert full_text not in await page.content()
+        if not await search.is_visible():
+            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await playwright.expect(sidebar).to_contain_text('Skills')
+        await playwright.expect(sidebar).not_to_contain_text('Agents')
+        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await playwright.expect(page.get_by_label('Full text', exact=True)).to_have_value(full_text)
+        sharing = page.get_by_label('Share with children', exact=True)
+        await sharing.click()
+        await page.get_by_role('option', name='Research Admin', exact=True).click()
+        await page.keyboard.press('Escape')
+        await page.get_by_role('button', name='Save skill', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await playwright.expect(sharing).to_have_value('Research Admin')
+        await page.get_by_role('button', name='Approve global sharing', exact=True).click()
+        review = page.get_by_role('dialog').filter(has=page.get_by_role('button', name='Approve', exact=True))
+        await playwright.expect(review.get_by_text(full_text, exact=True)).to_be_visible()
+        await review.get_by_role('button', name='Approve', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await page.get_by_text('This revision is shared globally. Editing requires approval again.', exact=True).wait_for()
+        await page.get_by_label('Full text', exact=True).fill(full_text + ' Updated.')
+        await page.get_by_role('button', name='Save skill', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await page.get_by_role('button', name='Approve global sharing', exact=True).wait_for()
+        assert await page.get_by_text('This revision is shared globally. Editing requires approval again.', exact=True).count() == 0
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.screenshot(path=str(state / 'skills-editor.png'), full_page=True, animations='disabled')
+        await browser.close()
