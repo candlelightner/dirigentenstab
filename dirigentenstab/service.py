@@ -543,13 +543,22 @@ class Service:
             await self.recover_deployments(operation_id=operation_id)
             current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
             if abandon and current['phase'] != 'complete':
+                saved = self.store.open(deployment['params'])
+                jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
+                if jobid:
+                    cloud = await self.cloud_client(await self.agent(agent_id))
+                    if (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0:
+                        raise CloudError('Deployment job still running; wait and recover', operation_id=operation_id)
                 live = [vm.get('id') for vm in await self._owned_matches(deployment)
                         if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]
                 if live:
                     raise CloudError(f'VM {", ".join(map(str, live))} matches this deployment; inspect and clean it up '
                                      'natively before abandoning the operation', operation_id=operation_id)
                 with self.store.connect() as conn:
-                    conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=?", (time.time(), operation_id))
+                    if conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=? "
+                                    "AND phase IN ('prepared','dispatched','failed')",
+                                    (time.time(), operation_id)).rowcount != 1:
+                        raise CloudError('Deployment changed during abandon; re-run recover_operation', operation_id=operation_id)
                     conn.execute('DELETE FROM vm_access WHERE vm_id=?', ('pending-' + operation_id,))
                     conn.execute('INSERT INTO audit(created,actor,operation,target,status) VALUES(?,?,?,?,?)',
                                  (time.time(), agent_id, 'deployment-abandoned-by-agent', operation_id, 'ok'))
