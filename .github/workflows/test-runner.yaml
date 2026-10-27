@@ -32,9 +32,34 @@ jobs:
       - id: meta
         run: python3 scripts/test_runner.py github-output
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for existing runner image
+        id: existing
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.security_rebuild }}
+        run: |
+          if [ "$FORCE_REBUILD" = true ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "$IMAGE" > /dev/null 2> manifest-error; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif grep -Eq '^(manifest unknown|no such manifest:)' manifest-error; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            cat manifest-error >&2
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@v3
+        if: steps.existing.outputs.build == 'true'
 
       - name: Build image for verification
+        if: steps.existing.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -47,18 +72,14 @@ jobs:
           pull: ${{ github.event_name == 'workflow_dispatch' && inputs.security_rebuild }}
 
       - name: Verify image offline before publishing
+        if: steps.existing.outputs.build == 'true'
         run: |
           docker run --rm --network none --shm-size=1g -v "$PWD:/work" -w /work \
             "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" \
             bash -c "python scripts/test_runner.py prepare --no-check-workflows && ruff check . && python scripts/test_runner.py run unit-smoke -- pytest -q -m 'not browser and not live' tests/test_setup.py tests/test_web.py"
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - id: push
+        if: steps.existing.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -70,6 +91,7 @@ jobs:
           sbom: true
 
       - name: Record digest
+        if: steps.existing.outputs.build == 'true'
         run: |
           echo "Pinned image: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}@${{ steps.push.outputs.digest }}"
           if [ -n "$GITHUB_STEP_SUMMARY" ]; then

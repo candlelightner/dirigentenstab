@@ -74,12 +74,14 @@ def compute_manifest(root: Path) -> dict[str, str]:
         json.dumps(deps_dict, sort_keys=True, separators=(',', ':')).encode('utf-8')
     ).hexdigest()
 
+    runner_script_sha256 = hashlib.sha256((root / 'scripts/test_runner.py').read_bytes()).hexdigest()
     canonical_inputs = {
         'dockerfile_sha256': dockerfile_sha256,
         'playwright_version': pw_version,
         'pyproject_deps_sha256': pyproject_deps_sha256,
         'python_version': python_version,
         'requirements_sha256': requirements_sha256,
+        'runner_script_sha256': runner_script_sha256,
     }
     manifest_sha256 = hashlib.sha256(
         json.dumps(canonical_inputs, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -95,6 +97,7 @@ def compute_manifest(root: Path) -> dict[str, str]:
         'pyproject_deps_sha256': pyproject_deps_sha256,
         'python_version': python_version,
         'requirements_sha256': requirements_sha256,
+        'runner_script_sha256': runner_script_sha256,
         'tag': tag,
     }
 
@@ -136,6 +139,7 @@ def validate(root: Path, manifest_path: Path, check_workflows: bool | None) -> N
         'python_version',
         'playwright_version',
         'requirements_sha256',
+        'runner_script_sha256',
         'pyproject_deps_sha256',
         'dockerfile_sha256',
         'manifest_sha256',

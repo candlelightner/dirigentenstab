@@ -1,6 +1,9 @@
 import importlib.util
+import os
 from pathlib import Path
 import re
+import subprocess
+import textwrap
 
 import pytest
 
@@ -172,7 +175,8 @@ def test_test_runner_manifest_computation_and_invalidation(tmp_path):
     test_runner = importlib.util.module_from_spec(spec_tr)
     spec_tr.loader.exec_module(test_runner)
 
-    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml'):
+    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml', 'scripts/test_runner.py'):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text((repo / name).read_text(encoding='utf-8'), encoding='utf-8')
 
     base = test_runner.compute_manifest(tmp_path)
@@ -186,7 +190,9 @@ def test_test_runner_manifest_computation_and_invalidation(tmp_path):
 
     # Changing version in pyproject.toml does NOT invalidate manifest
     pyproj = (tmp_path / 'pyproject.toml').read_text(encoding='utf-8')
-    (tmp_path / 'pyproject.toml').write_text(pyproj.replace('version = "0.1.14"', 'version = "0.1.15"'))
+    version_bump = re.sub(r'^version = "[^"]+"$', 'version = "999.0.0"', pyproj, flags=re.MULTILINE)
+    assert version_bump != pyproj
+    (tmp_path / 'pyproject.toml').write_text(version_bump)
     bumped = test_runner.compute_manifest(tmp_path)
     assert bumped['manifest_sha256'] == base['manifest_sha256']
     assert bumped['tag'] == base['tag']
@@ -226,6 +232,11 @@ def test_test_runner_manifest_computation_and_invalidation(tmp_path):
     df_changed = test_runner.compute_manifest(tmp_path)
     assert df_changed['manifest_sha256'] != base['manifest_sha256']
 
+    (tmp_path / 'Dockerfile.test-runner').write_text(df)
+    script = tmp_path / 'scripts/test_runner.py'
+    script.write_text(script.read_text() + '# modification\n')
+    assert test_runner.compute_manifest(tmp_path)['tag'] != base['tag']
+
 
 def test_test_runner_workflow_validation(tmp_path):
     repo = Path(__file__).parents[1]
@@ -239,7 +250,8 @@ def test_test_runner_workflow_validation(tmp_path):
     test_runner.validate(repo, manifest_file, check_workflows=True)
 
     # Setup isolated test directory with workflows
-    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml'):
+    for name in ('Dockerfile.test-runner', 'requirements.lock', 'pyproject.toml', 'scripts/test_runner.py'):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text((repo / name).read_text(encoding='utf-8'), encoding='utf-8')
     wf_dir = tmp_path / '.github/workflows'
     wf_dir.mkdir(parents=True)
@@ -294,3 +306,36 @@ def test_test_runner_workflow_validation(tmp_path):
     )
     with pytest.raises(RuntimeError, match='test job must not run docker commands'):
         test_runner.validate(tmp_path, manifest_file, check_workflows=True)
+
+
+@pytest.mark.parametrize(('force', 'error', 'expected'), [
+    ('false', '', 'build=false'),
+    ('false', 'manifest unknown', 'build=true'),
+    ('false', 'no such manifest: example/runner:content-tag', 'build=true'),
+    ('true', 'unauthorized', 'build=true'),
+    ('false', 'unauthorized', None),
+    ('false', 'connection timed out', None),
+])
+def test_runner_publisher_reuses_only_existing_images(tmp_path, force, error, expected):
+    workflow = (Path(__file__).parents[1] / '.github/workflows/test-runner.yaml').read_text()
+    probe = workflow.split('        id: existing\n', 1)[1].split('        run: |\n', 1)[1]
+    probe = textwrap.dedent(probe.split('\n      - ', 1)[0])
+    docker = tmp_path / 'docker'
+    docker.write_text('#!/bin/sh\ntouch docker-called\necho "$DOCKER_ERROR" >&2\n[ -z "$DOCKER_ERROR" ]\n')
+    docker.chmod(0o755)
+    output = tmp_path / 'output'
+    result = subprocess.run(['bash', '-e', '-c', probe], cwd=tmp_path, capture_output=True, text=True,
+                            env={**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}',
+                                 'FORCE_REBUILD': force, 'DOCKER_ERROR': error,
+                                 'IMAGE': 'example/runner:content-tag', 'GITHUB_OUTPUT': str(output)})
+    assert (tmp_path / 'docker-called').exists() == (force != 'true')
+    if expected is None:
+        assert result.returncode != 0
+        assert error in result.stderr
+        assert not output.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert output.read_text().strip() == expected
+    for step in ('uses: docker/setup-buildx-action@v3', 'name: Build image for verification',
+                 'name: Verify image offline before publishing', 'id: push', 'name: Record digest'):
+        assert f"      - {step}\n        if: steps.existing.outputs.build == 'true'" in workflow
