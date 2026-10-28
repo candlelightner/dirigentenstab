@@ -1,10 +1,12 @@
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
 
 from dirigentenstab.auth import Auth
+from dirigentenstab.cloud import CloudError
 from dirigentenstab.store import Store
 
 
@@ -321,3 +323,75 @@ def test_escalation_migration_preserves_single_queue_ciphertext_decisions_and_hi
         assert row['call_id'] == row['status'] and row['created'] == 1 and row['updated'] == 2
         assert row['description'] == 'Legacy compute offering request'
         assert row['delivery_run_id'] == ('run' if row['status'] == 'approved' else None)
+
+
+def _session_auth(store, human_call, closed=None):
+    service = SimpleNamespace(store=store, human_call=human_call,
+                              close_user_terminal_sessions=(closed if closed is not None else []).append)
+    auth = Auth(service)
+    private = {'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin', 'type': 1}
+    for name, expires in (('live', time.time() + 300), ('old', time.time() - 1)):
+        store.execute('INSERT INTO sessions VALUES(?,?,?,?)', (auth.digest(name), 'csrf', store.seal(private), expires))
+    return auth
+
+
+def _ok(calls=None):
+    async def human_call(identity, command, params):
+        if calls is not None:
+            calls.append(identity['_session'])
+        if command == 'listUsers':
+            return {'user': [{'id': 'person', 'state': 'enabled'}]}
+        return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
+    return human_call
+
+
+async def test_keepalive_touches_only_unexpired_sessions(store):
+    calls = []
+    auth = _session_auth(store, _ok(calls))
+    await auth.keepalive()
+    assert set(calls) == {auth.digest('live')}
+    assert store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('old'),))
+
+
+@pytest.mark.parametrize('error', [PermissionError('gone'), CloudError('bad account', rejected=True)])
+async def test_keepalive_definitive_failure_revokes_and_closes_terminals(store, error):
+    closed = []
+
+    async def human_call(identity, command, params):
+        raise error
+    auth = _session_auth(store, human_call, closed)
+    await auth.keepalive()
+    assert not store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('live'),))
+    assert closed == ['person']
+
+
+@pytest.mark.parametrize('error', [httpx.ConnectError('down'), httpx.ReadTimeout('slow'),
+                                   CloudError('CloudStack error 530: internal')])
+async def test_transient_failure_keeps_session_and_loop_continues(store, error):
+    async def human_call(identity, command, params):
+        raise error
+    auth = _session_auth(store, human_call)
+    await auth.keepalive()
+    assert store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('live'),))
+    with pytest.raises(CloudError, match='temporarily unreachable'):
+        await auth.identity('live')
+    assert store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('live'),))
+
+
+async def test_transient_failure_allows_recently_verified_session_only(store, monkeypatch):
+    clock, down = [1000.0], []
+
+    async def human_call(identity, command, params):
+        if down:
+            raise httpx.ConnectError('down')
+        return await _ok()(identity, command, params)
+    monkeypatch.setattr('dirigentenstab.auth.time.monotonic', lambda: clock[0])
+    auth = _session_auth(store, human_call)
+    await auth.identity('live')
+    down.append(1)
+    clock[0] += 60
+    assert (await auth.identity('live'))['userid'] == 'person'
+    clock[0] += 600
+    with pytest.raises(CloudError):
+        await auth.identity('live')
+    assert store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('live'),))

@@ -110,10 +110,14 @@ class Service:
                                                   [private['sessionkey'], *private['cookies'].values()]))
                 raise CloudError(f'CloudStack error {code}: {detail}',
                                  rejected=code in {400, 431, 435, 436, 531, 535}, public_detail=detail)
+            if response.status_code >= 500:
+                response.raise_for_status()  # outage without a CloudStack error body: transient, not a revocation
             if response.is_error:
                 raise PermissionError('CloudStack session no longer authorized')
             return value
         except (ValueError, StopIteration, TypeError):
+            if response.status_code >= 500:
+                response.raise_for_status()
             raise PermissionError('CloudStack session validation failed') from None
 
     async def hierarchy(self, identity):
