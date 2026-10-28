@@ -1516,6 +1516,44 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await browser.close()
 
 
+async def test_browser_autoscroll_off_keeps_position_when_declined_notice_shifts_history(browser_app):
+    url, state = browser_app
+    from dirigentenstab.store import Store
+
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        message = page.get_by_label('Message', exact=True)
+        await message.fill('markdown stress')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.locator('.messages table').wait_for()
+        await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_visible()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
+        await page.get_by_role('switch', name='Chat autoscroll', exact=True).click()
+        await page.keyboard.press('Escape')
+        await page.get_by_role('button', name='Close agent hierarchy', exact=True).click()
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        conversation = store.one('SELECT * FROM conversations ORDER BY created DESC')
+        run = store.one('SELECT * FROM chat_runs WHERE conversation_id=?', (conversation['id'],))
+        now = int(time.time())
+        store.execute('INSERT INTO escalation_requests (id,agent_id,conversation_id,run_id,call_id,human_id,command,description,'
+                      "reason,params,status,created,updated) VALUES('declined-scroll','research',?,?,'none',?,'x','x','x',?,'deferred',?,?)",
+                      (conversation['id'], run['id'], conversation['human_id'], store.seal({}), now, now))
+        scroll = page.locator('.messages .q-scrollarea__container')
+        await scroll.evaluate('el => el.scrollTop = 100')
+        await page.get_by_text('Escalation request declined', exact=True).wait_for()
+        assert abs(await scroll.evaluate('el => el.scrollTop') - 100) < 5
+        await message.fill('Inspect resources')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        await page.wait_for_timeout(500)
+        assert abs(await scroll.evaluate('el => el.scrollTop') - 100) < 5
+        await browser.close()
+
+
 @pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
 async def test_browser_reload_restores_open_agent_vm_mode_and_skill(browser_app, width, height):
     url, state = browser_app

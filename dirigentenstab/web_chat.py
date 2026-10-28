@@ -391,8 +391,22 @@ def setup_chat(ctx):
         keys = [(kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
                 if kind == 'activity' else (kind, index)
                 for index, (kind, content) in enumerate(parts)]
-        if (rendered_conversation != restored['id'] or not ctx.transcript.default_slot.children
-                or keys[:len(rendered_parts)] != [part[0] for part in rendered_parts]):
+        rendered_keys = [part[0] for part in rendered_parts]
+        common = next((i for i, pair in enumerate(zip(rendered_keys, keys, strict=False)) if pair[0] != pair[1]),
+                      min(len(keys), len(rendered_keys)))
+        rebuild = rendered_conversation != restored['id'] or not ctx.transcript.default_slot.children
+        if not rebuild and common < len(rendered_parts):
+            # Trailing notices (e.g. declined escalations) shift when history grows; drop just those.
+            rebuild = any(key[0] != 'notice' for key in rendered_keys[common:])
+            if not rebuild:
+                for _, _, element in rendered_parts[common:]:
+                    element.delete()
+                del rendered_parts[common:]
+        offset = None
+        if rebuild:
+            if rendered_conversation == restored['id'] and not ctx.autoscroll.value:
+                offset = await ui.run_javascript(
+                    f'getHtmlElement({ctx.transcript_scroll.id})?.querySelector(".q-scrollarea__container")?.scrollTop')
             ctx.transcript.clear()
             tool_cards.clear()
             rendered_parts.clear()
@@ -420,6 +434,11 @@ def setup_chat(ctx):
             ui.run_javascript(
                 f'requestAnimationFrame(() => {{ const c = getHtmlElement({ctx.transcript_scroll.id})'
                 '?.querySelector(".q-scrollarea__container"); if (c) c.scrollTop = c.scrollHeight; })'
+            )
+        elif offset:
+            ui.run_javascript(
+                f'requestAnimationFrame(() => {{ const c = getHtmlElement({ctx.transcript_scroll.id})'
+                f'?.querySelector(".q-scrollarea__container"); if (c) c.scrollTop = {offset}; }})'
             )
         state['activity_token'] = None
     ctx.render_history = render_history
