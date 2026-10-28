@@ -9,7 +9,7 @@ import uuid
 import httpx
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior, UsageLimitExceeded
 
-from .cloud import CloudError
+from .cloud import CloudError, redact
 
 logger = logging.getLogger('dirigentenstab.operations')
 
@@ -47,6 +47,17 @@ def error_hint(text):
     return ''
 
 
+SECRET_PAIR = re.compile(r'(?i)(["\']?\b(?:api[_-]?key|secret[_-]?key|signature|session[_-]?key|access[_-]?token|token|password|secret|'
+                         r'authorization|userdata)\b["\']?\s*[:=]\s*)("[^"]*"|\'[^\']*\'|[^\s&,;}]+)')
+SECRET_TOKEN = re.compile(r'(?i)\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|[A-Za-z0-9+/=]{200,}|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)')
+
+
+def public_text(value, limit=1000):
+    """The real message with credentials, keys, tokens and userdata removed, capped for display."""
+    text = SECRET_PAIR.sub(r'\1[redacted]', SECRET_TOKEN.sub('[redacted]', redact(str(value))))
+    return ' '.join(text.split())[:limit]
+
+
 class OperationError(ValueError):
     def __init__(self, category, description, operation_id, *, reconciliation=False):
         self.category = category
@@ -59,12 +70,13 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
     if isinstance(exc, OperationError):
         return exc
     operation_id = operation_id or str(uuid.uuid4())
+    detail = public_text(exc)
     if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
         category, description = 'timeout', 'The operation timed out.'
     elif isinstance(exc, PermissionError):
         category, description = 'authorization', 'Access denied or session expired. Sign in again if needed.'
         if str(exc) in {'API unavailable to this CloudStack identity and API key', 'API not available to this identity'}:
-            description = 'CloudStack does not permit this API for this agent’s current account and API key.'
+            description, detail = 'CloudStack does not permit this API for this agent’s current account and API key.', ''
     elif isinstance(exc, CloudError):
         category = 'cloudstack'
         description = ('CloudStack rejected the operation. Check permissions, resource limits and parameters.'
@@ -80,8 +92,8 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         elif exc.rejected and any(code in str(exc) for code in ('401', '403', '531')):
             category = 'authorization'
             description = 'CloudStack denied this operation for the agent’s account, domain or API key.'
-        if exc.public_detail:
-            description += ' Details: ' + exc.public_detail[:500] + error_hint(str(exc))
+        if exc.public_detail and exc.public_detail not in detail:
+            detail = public_text(f'{detail} {exc.public_detail}')
     elif isinstance(exc, ModelHTTPError):
         category = 'model-provider'
         code = exc.status_code
@@ -105,40 +117,14 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         category, description = 'model-provider', 'The model provider could not complete this reply. Check its configuration.'
     elif isinstance(exc, RuntimeError) and str(exc) == (
             'Context compaction failed; the original conversation and previous summary are preserved'):
-        category, description = 'compaction', str(exc) + '.'
+        category, description, detail = 'compaction', str(exc) + '.', ''
     elif isinstance(exc, ValueError):
         category, description = 'configuration', 'The request or configuration is invalid. Review the selected settings.'
-        safe_messages = {
-            'Managed enrollment supports VM deployment, private template creation and GPU lifecycle operations',
-            'Configure a model identifier before starting a conversation',
-            'Select a model provider in this agent’s settings first',
-            'This conversation already has an execution in progress',
-            'Conversation reached its context limit; start a new conversation',
-            'Use scalar values, comma-separated lists, or indexed map parameters',
-            'Provider missing', 'Invalid provider name or protocol', 'Agent configuration too large',
-            'Use an HTTP(S) URL without embedded credentials',
-            'Endpoint URLs cannot contain queries, fragments or newlines',
-            'Model catalogue exceeds the size limit',
-            'Provider returned an invalid model catalogue; enter a model ID manually',
-            'Use a short subgroup name with letters, numbers, spaces, underscores or dashes',
-            'Subgroup configuration too large', 'Message must contain 1–32768 characters',
-            'Compaction provider missing', 'Compaction provider is unavailable', 'Choose a compaction model',
-            'Invalid compaction provider', 'Invalid compaction model',
-            'Automatic compaction must be a whole percentage from 1 to 99, or disabled',
-            'Context window must be a whole token count from 2 to 2147483647',
-            'Set a known context window before enabling automatic compaction',
-            'Context compaction requires a known context window, output reserve and threshold of 1–99 percent',
-            'Context compaction cannot proceed while an operation needs reconciliation',
-            'Context cannot be compacted safely; the current request and recent tool exchange must remain intact',
-            'Context cannot shrink while preserving the current user request and system prompts',
-            'Context compaction returned an empty summary; the original conversation is preserved',
-            'Context compaction did not produce a smaller context that fits; the original conversation is preserved',
-        }
-        if str(exc) in safe_messages:
-            description = str(exc) + '.'
     else:
         category = 'tool-execution' if tool else 'unexpected'
         description = 'Agent execution failed. The administrator can investigate using this reference.'
+    if detail:
+        description += ' Details: ' + detail + error_hint(detail)
     if reconciliation:
         category = 'provisioning'
         description += ' Infrastructure requires reconciliation. Inspect the saved provisioning or VM deployment before continuing; do not create duplicates.'
