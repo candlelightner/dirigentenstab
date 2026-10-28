@@ -41,3 +41,28 @@ def test_history_parts_yields_pause_work_reason_as_agent_message():
         ]}],
     }
     assert list(history_parts(history_saved_only))[-1] == ('agent', 'Legacy event pause')
+
+
+def test_escalation_notices_are_placed_after_their_request_activity():
+    from dirigentenstab.web_chat import with_escalation_notices
+
+    def call(op, cid):
+        return ('activity', {'type': 'tool_call', 'operation_id': op, 'call_id': cid})
+
+    parts = [('human', 'hi'), call('r1', 'a'), call('r1', 'b'), ('agent', 'one'), call('r2', 'c'), ('agent', 'two')]
+    requests = [
+        {'id': 'e1', 'run_id': 'r1', 'call_id': 'a', 'status': 'deferred'},
+        {'id': 'e2', 'run_id': 'r2', 'call_id': 'c', 'status': 'approved'},
+        {'id': 'e3', 'run_id': 'r1', 'call_id': 'a', 'status': 'approved'},
+        {'id': 'e4', 'run_id': 'r1', 'call_id': 'zz', 'status': 'uncertain'},
+        {'id': 'e5', 'run_id': 'r1', 'call_id': 'a', 'status': 'pending'},
+        {'id': 'e6', 'run_id': 'gone', 'call_id': 'a', 'status': 'failed'},
+    ]
+    placed = [(content if kind == 'notice' else kind, key) for kind, content, key in with_escalation_notices(parts, requests)]
+    assert placed == [
+        ('human', None), ('activity', None),
+        ('Escalation declined', ('escalation', 'e1')), ('Escalation approved', ('escalation', 'e3')),
+        ('activity', None), ('Escalation approved, outcome uncertain', ('escalation', 'e4')),
+        ('agent', None), ('activity', None), ('Escalation approved', ('escalation', 'e2')), ('agent', None),
+        ('Escalation approved, but the command failed', ('escalation', 'e6')),
+    ]

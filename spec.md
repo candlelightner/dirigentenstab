@@ -83,6 +83,11 @@ users. There is no new hub account or registration system.
   after its current conversation finishes or pauses. A stopped conversation must
   not restart because a result arrived. Results are clearly identified system
   notifications, not owner-authored messages.
+- Each decided request shows a centered note ("Escalation approved", "Escalation
+  declined", or an applying, failed or uncertain variant) in the originating chat
+  directly after that request's tool activity, not at the end. While the run is
+  still marked running with a pending request of its own, the busy indicator reads
+  "Waiting for your decision on an escalation request" instead of "Thinking…".
 - Dismissal invokes no agent and changes no infrastructure. Its originating chat
   shows only a centered informational note. The top-right icon opens a compact
   list with the goal and reason on two ellipsized lines; selecting a request opens
