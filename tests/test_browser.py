@@ -1037,7 +1037,8 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         assert await page.evaluate('window.socket.connected && socketFailures.length === 0')
         await page.get_by_label('Message', exact=True).fill('heartbeat fixture')
         await page.get_by_role('button', name='Send', exact=True).click()
-        await page.get_by_text('Heartbeat 0.', exact=False).wait_for()
+        # The 18 MB encrypted history is decrypted, validated and resealed several times before the first token (~10 s idle, far more with 4 workers).
+        await page.get_by_text('Heartbeat 0.', exact=False).wait_for(timeout=90000)
         await page.evaluate("window.retainedMessage = document.querySelector('.q-message')")
         await asyncio.sleep(3)
         assert await page.evaluate('window.retainedMessage.isConnected')
