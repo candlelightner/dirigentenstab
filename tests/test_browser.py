@@ -118,10 +118,24 @@ async def login(page, url):
     await page.wait_for_function('window.socket?.connected && window.did_handshake')
 
 
-async def select_agent(page, name):
+async def open_sidebar(page):
+    """Open the agent drawer unless it is open. Wait for Quasar's show-if-above transition first: a drawer that is
+    mid-close still counts as visible, so deciding early skipped the click and left it offscreen."""
     search = page.get_by_label('Search agents and domains', exact=True)
+    box = None
+    for _ in range(50):
+        prev, box = box, await page.locator('.q-drawer').bounding_box()
+        if prev == box:
+            break
+        await page.wait_for_timeout(100)
     if not await search.is_visible():
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+    await search.wait_for()
+
+
+async def select_agent(page, name):
+    await open_sidebar(page)
+    search = page.get_by_label('Search agents and domains', exact=True)
     await search.fill(name)
     await page.locator('.q-tree').get_by_text(name, exact=True).click()
     await search.wait_for(state='hidden')
@@ -1023,7 +1037,8 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         assert await page.evaluate('window.socket.connected && socketFailures.length === 0')
         await page.get_by_label('Message', exact=True).fill('heartbeat fixture')
         await page.get_by_role('button', name='Send', exact=True).click()
-        await page.get_by_text('Heartbeat 0.', exact=False).wait_for()
+        # The 18 MB encrypted history is decrypted, validated and resealed several times before the first token (~10 s idle, far more with 4 workers).
+        await page.get_by_text('Heartbeat 0.', exact=False).wait_for(timeout=90000)
         await page.evaluate("window.retainedMessage = document.querySelector('.q-message')")
         await asyncio.sleep(3)
         assert await page.evaluate('window.retainedMessage.isConnected')
@@ -1141,10 +1156,8 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         await login(page, url)
 
         # Open drawer if search/hierarchy is hidden
+        await open_sidebar(page)
         search = page.get_by_label('Search agents and domains', exact=True)
-        if not await search.is_visible():
-            await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-        await search.wait_for()
 
         # Check sidebar selector exists
         sidebar_select = page.locator('.q-drawer .sidebar-view-select')

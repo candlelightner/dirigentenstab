@@ -277,8 +277,12 @@ def setup_vm(ctx):
         await connect_console(popout=True)
     ctx.popout_console = popout_console
 
+    listing = 0
+
     async def list_dir(path):
-        request = ssh_request
+        nonlocal listing
+        request, listing = ssh_request, listing + 1
+        mine = listing
         ctx.terminal_error.set_visibility(False)
         try:
             full = await files_sftp.realpath(path or '.')
@@ -292,12 +296,12 @@ def setup_vm(ctx):
                 rows.append((not directory, entry.filename.casefold(), entry.filename, entry.attrs.size or 0, entry.attrs.mtime))
             rows.sort()
         except Exception as exc:
-            if request == ssh_request:
+            if request == ssh_request and mine == listing:
                 ctx.files_path.set_value(ctx.files_dir)
                 ctx.terminal_error.set_text(str(exc))
                 ctx.terminal_error.set_visibility(True)
             return
-        if request != ssh_request:
+        if request != ssh_request or mine != listing:  # a newer navigation superseded this listing
             return
         ctx.files_dir = full
         ctx.files_path.set_value(full)
