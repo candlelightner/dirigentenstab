@@ -9,6 +9,7 @@ from nicegui import app, ui
 from .console import ConsoleProxy
 from .diagnostics import diagnose
 from .files import VMFiles
+from .platform_status import banner
 from .runtime import Runtime
 from .settings import Settings
 from .store import Store
@@ -190,6 +191,17 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         with ui.column().classes('workspace'):
             build_chat_view(ctx)
             build_vm_view(ctx)
+            platform_banner = ui.label().classes('fixed top-16 right-3 z-50 max-w-sm rounded shadow px-3 py-1 text-sm whitespace-pre-line').mark('platform_banner')
+
+            def refresh_platform_banner():
+                shown = banner(service.platform_status())
+                platform_banner.set_visibility(bool(shown))
+                if shown:
+                    platform_banner.set_text(shown[0])
+                    platform_banner.classes(replace='fixed top-16 right-3 z-50 max-w-sm rounded shadow px-3 py-1 text-sm whitespace-pre-line ' + (
+                        'bg-orange-100 text-orange-900' if shown[1] else 'text-stone-500'))
+            refresh_platform_banner()
+            ui.timer(5.0, refresh_platform_banner)
         setup_admin_dialogs(ctx)
         setup_agent_dialogs(ctx)
         setup_vm(ctx)

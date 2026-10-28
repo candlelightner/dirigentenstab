@@ -33,6 +33,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .guest import Guest
 from .diagnostics import diagnose
+from .platform_status import summary as platform_summary
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_operation_id
 from .mcp import MCP
 from .mcp_tools import RemoteTools
@@ -579,7 +580,7 @@ class Runtime:
                 raise ConfigurationChanged()
             await self.service.authorize(identity, agent_id)
             tool = operation.__name__
-            read_only = (tool in {'search_api', 'describe_api', 'recover_operation', 'list_skills', 'get_skill'} or
+            read_only = (tool in {'search_api', 'describe_api', 'recover_operation', 'list_skills', 'get_skill', 'platform_status'} or
                          tool == 'configure_agent' and args[2] is None or
                          tool == 'execute' and args[1].startswith(('list', 'get', 'query')))
             invocation_key = [agent_id, tool, args, kwargs]
@@ -655,6 +656,7 @@ class Runtime:
                           'Use managed=True on createTemplate for private-template recovery. '
                           'Use managed=False for unchanged native API parameters, including custom userdata/public templates. '
                           'Use run_vm_command for enrolled guest execution. '
+                          'After a placement or start failure (No destination found, insufficient capacity, host errors) call platform_status before retrying; if a host is not Up, wait or report instead of retrying. '
                           'After interruption or a lost response, inspect actual infrastructure state before retrying uncertain actions. '
                           'Saved uncertain actions do not prove failure. Investigate, continue safe work where possible, '
                           'or use pause_work if you need the owner. Never delegate work to other agents.\n'
@@ -825,6 +827,14 @@ class Runtime:
             if state:
                 budget['save']()
             return self.service.redact({'actions': state.get('mutations', {}), 'tool_activity': budget.get('events', [])})
+
+        @agent.tool_plain(sequential=True)
+        async def platform_status() -> dict:
+            """Read-only host health from the platform watchdog: hosts, system VMs, capacity, issues and staleness
+            (stale=true or status unknown means the feed is unavailable, not that the platform is down)."""
+            async def platform_status():
+                return platform_summary(self.service.platform_status())
+            return await invoke(platform_status)
 
         @agent.tool_plain(sequential=True)
         async def recover_operation(operation_id: str, abandon: bool = False) -> dict:

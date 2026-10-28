@@ -9,6 +9,8 @@ from dirigentenstab.web import build_ui, hierarchy_nodes, history_parts
 
 
 class AgentCapabilities:
+    platform_status = staticmethod(lambda: None)
+
     class store:
         @staticmethod
         def one(*args):

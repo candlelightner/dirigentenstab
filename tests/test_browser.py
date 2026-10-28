@@ -1630,3 +1630,19 @@ async def test_browser_reload_restores_open_agent_vm_mode_and_skill(browser_app,
         await page.wait_for_function('/^\\?agent=[^&]+$/.test(location.search)')
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await browser.close()
+
+
+async def test_browser_platform_banner_shows_issues_when_fresh_and_unhealthy(browser_app):
+    url, state = browser_app
+    now = time.time()
+    (state / 'platform-status.json').write_text(json.dumps({
+        'version': 1, 'updated': now, 'healthy': False, 'hosts': [], 'issues': ['host kvm1 Disconnected']}))
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await (await browser.new_context(ignore_https_errors=True)).new_page()
+        await login(page, url)
+        banner = page.locator('.whitespace-pre-line.shadow')
+        await playwright.expect(banner).to_have_text('host kvm1 Disconnected')
+        (state / 'platform-status.json').write_text(json.dumps({'version': 1, 'updated': now - 900, 'healthy': False}))
+        await playwright.expect(banner).to_have_text('Platform status unavailable', timeout=15000)
+        await browser.close()

@@ -280,6 +280,24 @@ guest licensing service, or development-workload orchestration to V1.
   V1 into exhaustive edge-case machinery; agents are responsible for investigating
   and handling operational situations within their authority.
 
+## Platform status
+
+- A host-side watchdog writes a read-only, secret-free `status.json` (hosts,
+  management API, system VMs, capacity, `issues`, owner-only `actions`, and an
+  `updated` timestamp). Compose mounts `/var/lib/dirigentenstab/platform` read-only
+  at `/platform`; `PLATFORM_STATUS_FILE` overrides the path. A missing file, invalid
+  JSON, or a status older than 300 seconds is "unknown/stale" and never blocks work.
+  Create the host directory before `docker compose up` (otherwise Docker creates it as root).
+- Agents have a read-only `platform_status` tool (status, summarized `issues`,
+  `stale`; never `actions`). After a placement or start failure, and before
+  retrying, they check it and wait or report instead of retrying when a host is not Up.
+- Managed VM deployment and GPU deploy/start refuse immediately with a rejected
+  error, before any deployment row or CloudStack call, when a fresh status shows a
+  host that is not Up.
+- The owner sees a compact warning banner with the `issues` while a fresh status is
+  unhealthy, or a subtle "Platform status unavailable" note when stale, refreshed
+  every few seconds.
+
 ## Explicitly outside V1
 
 - Agent-to-agent task assignment, delegation tools, and delegation execution.
