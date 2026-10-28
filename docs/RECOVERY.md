@@ -123,7 +123,17 @@ A safe cutover must inventory each workload's root disk **and every attached cus
  "actions": [{"at": 1767225180.0, "action": "restart-cloudstack-agent", "result": "restarted"}]}
 ```
 
-`healthy` is false whenever `issues` names a host, API or system-VM problem; capacity issues alone do not flip it. `since` is when the watchdog first saw that host status. A stale `updated` (older than a few minutes) means the watchdog itself is not running. If the database cannot be read, `issues` says so and no remediation is attempted.
+`secondary_nfs` is `{"nfsd_threads": <configured>, "blocked": <nfsd threads in D state>, "stuck": <bool>}`. `healthy` is false whenever `issues` names a host, API, system-VM or stuck-NFS problem; capacity issues alone do not flip it. `since` is when the watchdog first saw that host status. A stale `updated` (older than a few minutes) means the watchdog itself is not running. If the database cannot be read, `issues` says so and no remediation is attempted.
+
+## Template or snapshot copy hangs on secondary storage
+
+**Symptom.** `createTemplate` (or any copy into secondary storage) stalls for many minutes; `dmesg` shows `nfs: server 10.253.80.1 not responding`; most or all `nfsd` kernel threads are in D state (`ps -eo stat,comm | grep '^D.*nfsd'`).
+
+**Cause.** Secondary storage is a loopback NFS mount of this host, so a writer holding a file's inode lock waits on an NFS commit that needs a free `nfsd` thread, while the other threads queue on that lock; with too few threads the server deadlocks itself. Setup configures `threads=32` in `/etc/nfs.conf.d/dirigentenstab.conf`.
+
+**Manual fix** (immediate, no restart; the copy then finishes): `echo 32 | sudo tee /proc/fs/nfsd/threads`. On a host set up before this change, also add `threads=32` under `[nfsd]` in `/etc/nfs.conf.d/`.
+
+**Watchdog.** When at least 75% of `nfsd` threads are blocked on two consecutive runs, it reports the issue (`healthy` false, `secondary_nfs.stuck` true) and raises `/proc/fs/nfsd/threads` by 16, capped at 64, at most once per 15 minutes (journal and `actions`). It never restarts `nfs-server`, unmounts, or kills processes. The dmesg message is only a supporting hint in the issue text.
 
 ## Private templates and optional GPU preparation
 

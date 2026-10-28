@@ -144,7 +144,9 @@ def configure_storage():
     clients = [ADDRESS, *map(str, system_ranges)]
     save('/etc/exports.d/dirigentenstab.exports',
          str(directory) + ' ' + ' '.join(f'{client}({options})' for client in clients) + '\n')
-    save('/etc/nfs.conf.d/dirigentenstab.conf', f'[nfsd]\nhost={ADDRESS}\nvers3=n\nvers4=y\n')
+    # threads=32: this host mounts its own export, so a write holding an inode lock waits on an NFS commit that
+    # needs a free nfsd thread; with the default 8 threads all blocked on that lock deadlock the server.
+    save('/etc/nfs.conf.d/dirigentenstab.conf', f'[nfsd]\nhost={ADDRESS}\nvers3=n\nvers4=y\nthreads=32\n')
     run('systemctl', 'unmask', 'nfs-server', 'rpcbind', 'rpcbind.socket')
     run('exportfs', '-ra')
     run('systemctl', 'restart', 'nfs-kernel-server')

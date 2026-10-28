@@ -3,8 +3,9 @@
 
 Read-only data sources: the CloudStack DB (root MySQL socket auth), the management API landing page and
 agent.properties. The only changes it ever makes are fixing the agent's management address (with a
-backup) and restarting cloudstack-agent, both rate limited. It never restarts cloudstack-management and
-never touches VMs, volumes or the database.
+backup), restarting cloudstack-agent, and raising the nfsd thread count (never above 64), all rate limited.
+It never restarts cloudstack-management or nfs-server, never unmounts, and never touches VMs, volumes or
+the database.
 
 CloudStack 4.23 capacity types (org.apache.cloudstack.api.ApiConstants / com.cloud.capacity.Capacity):
 0 memory, 1 cpu (both: allocated, summed per cluster over hosts; total already includes overprovisioning),
@@ -33,6 +34,10 @@ PROPERTIES = Path('/etc/cloudstack/agent/agent.properties')
 NOT_UP_SECONDS = 180
 RESTART_INTERVAL = 900
 MAX_ACTIONS = 20
+NFSD_THREADS = Path('/proc/fs/nfsd/threads')
+NFSD_RAISE_INTERVAL = 900
+NFSD_STEP, NFSD_MAX = 16, 64
+NFSD_STUCK_RUNS = 2
 CAPACITY_MEMORY, CAPACITY_CPU, CAPACITY_LOCAL_STORAGE = 0, 1, 9
 SYSTEM_VM_TYPES = ('SecondaryStorageVm', 'ConsoleProxy', 'DomainRouter')
 
@@ -61,6 +66,32 @@ def clock(epoch):
 
 def pct(used, total):
     return round(100 * used / total, 1) if total else 0.0
+
+
+def nfsd_state():
+    """Loopback secondary storage: nfsd threads in uninterruptible sleep (D) and the configured thread count."""
+    total = blocked = 0
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            text = stat.read_text()
+        except OSError:
+            continue  # the process exited
+        name, _, rest = text.rpartition(')')
+        if name.partition('(')[2] == 'nfsd':
+            total += 1
+            blocked += rest.split()[0] == 'D'
+    try:
+        configured = int(NFSD_THREADS.read_text())
+    except (OSError, ValueError):
+        configured = 0
+    # Supporting signal only: the latest client message about the server is "not responding", not "OK".
+    try:
+        lines = subprocess.run(['dmesg'], capture_output=True, text=True, timeout=10).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        lines = []
+    last = [line for line in lines if re.search(r'nfs: server \S+ (not responding|OK)', line)]
+    return {'threads': configured, 'running': total, 'blocked': blocked,
+            'not_responding': bool(last) and 'not responding' in last[-1]}
 
 
 def collect(query=mysql, reachable=http_ok):
@@ -97,7 +128,7 @@ def collect(query=mysql, reachable=http_ok):
     except OSError:
         agent_host = None
     return {'hosts': hosts, 'system_vms': vms, 'capacity': capacity, 'agent_host': agent_host,
-            'api': reachable(f'http://{ADDRESS}:8080/client/')}
+            'api': reachable(f'http://{ADDRESS}:8080/client/'), 'nfsd': nfsd_state()}
 
 
 def evaluate(data, state, now):
@@ -129,22 +160,38 @@ def evaluate(data, state, now):
         if capacity[f'{key}_allocated_pct'] >= capacity[f'{key}_threshold_pct']:
             issues.append(f"{label} allocation {capacity[f'{key}_allocated_pct']:.0f}% >= threshold "
                           f"{capacity[f'{key}_threshold_pct']:.0f}%")
-    healthy = (bool(hosts) and all(h['status'] == 'Up' and h['resource_state'] == 'Enabled' for h in hosts)
+    nfsd = data['nfsd']
+    # Most or all nfsd threads blocked, on consecutive runs: the loopback NFS export is deadlocked.
+    blocked_now = nfsd['running'] > 0 and 4 * nfsd['blocked'] >= 3 * nfsd['running']
+    runs = state.get('nfsd_blocked_runs', 0) + 1 if blocked_now else 0
+    stuck = runs >= NFSD_STUCK_RUNS
+    if stuck:
+        issues.append(f"Secondary storage NFS stuck: {nfsd['blocked']}/{nfsd['running']} nfsd threads blocked"
+                      + (' (kernel reports server not responding)' if nfsd['not_responding'] else ''))
+    healthy = (bool(hosts) and not stuck and all(h['status'] == 'Up' and h['resource_state'] == 'Enabled' for h in hosts)
                and data['api'] and all(v['state'] == 'Running' for v in data['system_vms']))
     status = {'version': 1, 'updated': now, 'healthy': healthy, 'hosts': hosts,
               'management_api': {'reachable': data['api']}, 'system_vms': data['system_vms'],
-              'capacity': capacity, 'issues': issues, 'actions': list(state.get('actions', []))[-MAX_ACTIONS:]}
-    return status, {**state, 'hosts': tracked}
+              'capacity': capacity,
+              'secondary_nfs': {'nfsd_threads': nfsd['threads'], 'blocked': nfsd['blocked'], 'stuck': stuck},
+              'issues': issues, 'actions': list(state.get('actions', []))[-MAX_ACTIONS:]}
+    return status, {**state, 'hosts': tracked, 'nfsd_blocked_runs': runs}
 
 
 def plan(data, state, now):
     """Pure: the remediations due now, as (name, detail) tuples."""
+    steps = []
+    nfsd = data['nfsd']
+    if (state['nfsd_blocked_runs'] >= NFSD_STUCK_RUNS and 0 < nfsd['threads'] < NFSD_MAX
+            and now - state.get('last_nfsd_raise', 0) >= NFSD_RAISE_INTERVAL):
+        target = min(NFSD_MAX, nfsd['threads'] + NFSD_STEP)
+        steps.append(('raise-nfsd-threads', f"{nfsd['blocked']}/{nfsd['running']} nfsd threads blocked; "
+                                            f"{nfsd['threads']} -> {target}"))
     stuck = [h['name'] for h in data['hosts']
              if state['hosts'][h['name']]['not_up_since'] is not None
              and now - state['hosts'][h['name']]['not_up_since'] >= NOT_UP_SECONDS]
     if not stuck:
-        return []
-    steps = []
+        return steps
     if data['agent_host'] is not None and not data['agent_host'].startswith(ADDRESS):
         steps.append(('fix-agent-host', f"agent.properties host={data['agent_host']} -> {ADDRESS}@static"))
     if now - state.get('last_agent_restart', 0) >= RESTART_INTERVAL:
@@ -172,6 +219,10 @@ def execute(steps, state, now, restart=systemctl_restart):
         try:
             if name == 'fix-agent-host':
                 result = f'{detail}; ' + fix_agent_host(now)
+            elif name == 'raise-nfsd-threads':
+                state['last_nfsd_raise'] = now  # set first: a failing write must not be retried every minute
+                NFSD_THREADS.write_text(f"{detail.rpartition(' -> ')[2]}\n")
+                result = f'{detail}; raised'
             else:
                 restart('cloudstack-agent')
                 state['last_agent_restart'] = now
