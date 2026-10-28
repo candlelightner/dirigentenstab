@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 import os
 
@@ -232,6 +233,7 @@ def main():
     auth = Auth(service)
     attach(app, auth, settings)
     app.on_startup(build_ui(service, auth).start)
+    app.on_startup(lambda: setattr(service, 'reconciler', asyncio.create_task(service.reconcile_periodically())))
     tls = {}
     if os.getenv('APP_TLS_CERT') or os.getenv('APP_TLS_KEY'):
         tls = {'ssl_certfile': os.environ['APP_TLS_CERT'], 'ssl_keyfile': os.environ['APP_TLS_KEY']}

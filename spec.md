@@ -126,6 +126,12 @@ users. There is no new hub account or registration system.
   infrastructure state and reconciles what happened itself, then resumes. A lost
   response is not proof that a mutation failed. Do not make routine recovery
   depend on the owner running an administrator repair command.
+- The hub itself resolves stale managed VM deployments (startup, every 5 minutes,
+  and before refusing a new managed VM): it binds a unique usable VM, or closes
+  the row when its job is finished or purged and no owned VM is live, or when a
+  never-dispatched `prepared` row is older than 30 minutes with no matching VM.
+  It only reads CloudStack and never creates, deletes or redeploys anything; an
+  agent is never left blocked by such a row waiting for a human.
 - If the outcome remains uncertain, the agent decides whether to investigate
   further, continue where possible, or pause and ask the owner. Do not impose a
   universal manual-review gate merely because an operation was interrupted.

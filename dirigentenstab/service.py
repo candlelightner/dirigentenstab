@@ -3,6 +3,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 from pathlib import Path
 import re
 import time
@@ -337,8 +338,10 @@ class Service:
     async def _deploy_managed(self, agent, cloud, params, *, workspace_disk=False):
         from .guest import Guest
 
-        pending = self.store.one("SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')",
-                                 (agent['id'],))
+        pending_query = "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')"
+        if self.store.one(pending_query, (agent['id'],)):
+            await self.reconcile_deployments(agent['id'])
+        pending = self.store.one(pending_query, (agent['id'],))
         if pending:
             raise CloudError(f"Deployment {pending['id']} needs recovery before another managed VM is created", operation_id=pending['id'])
         metadata = (await cloud.catalogue()).get('deployVirtualMachine')
@@ -523,15 +526,83 @@ class Service:
         return [vm for vm in response.get('virtualmachine', []) if vm.get('name') == op['name']
                 and vm.get('account') == account['name'] and vm.get('domainid') == account['domainid']]
 
+    async def _bind_usable_vm(self, op):
+        matches = await self._owned_matches(op)
+        if len(matches) == 1 and matches[0].get('state') in {'Running', 'Stopped'}:
+            self._bind_vm(op['id'], matches[0]['id'])
+            return True
+        return False
+
     async def recover_deployments(self, operation_id=None):
         query = "SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"
         for op in self.store.all(query + (' AND id=?' if operation_id else ''), (operation_id,) if operation_id else ()):
-            matches = await self._owned_matches(op)
-            if len(matches) == 1 and matches[0].get('state') in {'Running', 'Stopped'}:
-                self._bind_vm(op['id'], matches[0]['id'])
-            else:
+            if not await self._bind_usable_vm(op):
                 self.store.audit(op['agent_id'], 'deployment-recovery-needs-review', op['id'], 'pending')
         # Absence is not proof that dispatch never reached CloudStack. Never create a second VM here.
+
+    async def _close_deployment(self, op, actor, audit_operation, prepared_grace=None):
+        """Close an unresolved deployment as rejected when CloudStack shows nothing can still produce its VM.
+
+        Returns None once closed, otherwise the reason it stays open. Only reads CloudStack. With prepared_grace
+        (automatic reconciliation) a deployment without a saved job is closed only if it is still `prepared` and
+        older than that many seconds."""
+        saved = self.store.open(op['params'])
+        jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
+        if jobid:
+            cloud = await self.cloud_client(await self.agent(op['agent_id']))
+            try:
+                running = (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0
+            except CloudError as exc:
+                # CloudStack purges old async jobs; a missing job is not running.
+                if not (exc.rejected and 'jobid' in str(exc) and 'does not exist' in str(exc)):
+                    raise
+                running = False
+            if running:
+                return 'Deployment job still running; wait and recover'
+        elif prepared_grace is not None and not (
+                op['phase'] == 'prepared' and time.time() - op['updated'] > prepared_grace):
+            return 'Deployment without a saved job is too recent to treat as never dispatched'
+        live = [vm.get('id') for vm in await self._owned_matches(op)
+                if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]
+        if live:
+            return (f'VM {", ".join(map(str, live))} matches this deployment; inspect and clean it up '
+                    'natively before abandoning the operation')
+        with self.store.connect() as conn:
+            if conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=? "
+                            "AND phase IN ('prepared','dispatched','failed')",
+                            (time.time(), op['id'])).rowcount != 1:
+                raise CloudError('Deployment changed during abandon; re-run recover_operation', operation_id=op['id'])
+            conn.execute('DELETE FROM vm_access WHERE vm_id=?', ('pending-' + op['id'],))
+            conn.execute('INSERT INTO audit(created,actor,operation,target,status) VALUES(?,?,?,?,?)',
+                         (time.time(), actor, audit_operation, op['id'], 'ok'))
+
+    # A deployment still `prepared` with no saved job may have reached CloudStack just before a crash, and the VM can
+    # take a while to become listable. Thirty minutes is far beyond the 10-minute deploy wait and any request timeout,
+    # so by then an absent VM reliably means the request never landed, yet an agent is not blocked for long.
+    PREPARED_GRACE_SECONDS = 30 * 60
+
+    async def reconcile_deployments(self, agent_id=None):
+        """Resolve unresolved managed deployments without agent or human action; read-only toward CloudStack.
+
+        Binds a unique usable VM, or closes the row when its job is finished/purged (or a stale never-dispatched
+        `prepared` row) and no live owned VM matches. Anything else is left for the agent. One failing row is
+        logged and skipped."""
+        query = "SELECT * FROM vm_deployments WHERE phase IN ('prepared','dispatched','failed')"
+        for op in self.store.all(query + (' AND agent_id=?' if agent_id else ''), (agent_id,) if agent_id else ()):
+            try:
+                if not await self._bind_usable_vm(op):
+                    await self._close_deployment(op, op['agent_id'], 'deployment-auto-reconciled',
+                                                 self.PREPARED_GRACE_SECONDS)
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Deployment %s not reconciled: %s', op['id'], exc)
+
+    async def reconcile_periodically(self, interval=300):
+        while True:
+            try:
+                await self.reconcile_deployments()
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Deployment reconciliation failed: %s', exc)
+            await asyncio.sleep(interval)
 
     async def recover_operation(self, agent_id, operation_id, abandon=False):
         await self.agent(agent_id)
@@ -543,32 +614,9 @@ class Service:
             await self.recover_deployments(operation_id=operation_id)
             current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
             if abandon and current['phase'] != 'complete':
-                saved = self.store.open(deployment['params'])
-                jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
-                if jobid:
-                    cloud = await self.cloud_client(await self.agent(agent_id))
-                    try:
-                        running = (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0
-                    except CloudError as exc:
-                        # CloudStack purges old async jobs; a missing job is not running.
-                        if not (exc.rejected and 'jobid' in str(exc) and 'does not exist' in str(exc)):
-                            raise
-                        running = False
-                    if running:
-                        raise CloudError('Deployment job still running; wait and recover', operation_id=operation_id)
-                live = [vm.get('id') for vm in await self._owned_matches(deployment)
-                        if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]
-                if live:
-                    raise CloudError(f'VM {", ".join(map(str, live))} matches this deployment; inspect and clean it up '
-                                     'natively before abandoning the operation', operation_id=operation_id)
-                with self.store.connect() as conn:
-                    if conn.execute("UPDATE vm_deployments SET phase='rejected',updated=? WHERE id=? "
-                                    "AND phase IN ('prepared','dispatched','failed')",
-                                    (time.time(), operation_id)).rowcount != 1:
-                        raise CloudError('Deployment changed during abandon; re-run recover_operation', operation_id=operation_id)
-                    conn.execute('DELETE FROM vm_access WHERE vm_id=?', ('pending-' + operation_id,))
-                    conn.execute('INSERT INTO audit(created,actor,operation,target,status) VALUES(?,?,?,?,?)',
-                                 (time.time(), agent_id, 'deployment-abandoned-by-agent', operation_id, 'ok'))
+                reason = await self._close_deployment(deployment, agent_id, 'deployment-abandoned-by-agent')
+                if reason:
+                    raise CloudError(reason, operation_id=operation_id)
                 current = self.store.one('SELECT phase,vm_id FROM vm_deployments WHERE id=?', (operation_id,))
             return {'operation_id': operation_id, **current, 'request': self.redact(self.store.open(deployment['params']))}
         if template:
