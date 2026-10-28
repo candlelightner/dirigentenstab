@@ -547,7 +547,14 @@ class Service:
                 jobid = (saved.get('result') or {}).get('jobid') if isinstance(saved, dict) else None
                 if jobid:
                     cloud = await self.cloud_client(await self.agent(agent_id))
-                    if (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0:
+                    try:
+                        running = (await cloud.raw('queryAsyncJobResult', {'jobid': jobid})).get('jobstatus') == 0
+                    except CloudError as exc:
+                        # CloudStack purges old async jobs; a missing job is not running.
+                        if not (exc.rejected and 'jobid' in str(exc) and 'does not exist' in str(exc)):
+                            raise
+                        running = False
+                    if running:
                         raise CloudError('Deployment job still running; wait and recover', operation_id=operation_id)
                 live = [vm.get('id') for vm in await self._owned_matches(deployment)
                         if vm.get('state') not in {'Destroyed', 'Expunging', 'Expunged', 'Error'}]

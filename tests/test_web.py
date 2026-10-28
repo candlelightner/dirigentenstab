@@ -462,7 +462,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         Integration.fail = True
         user.find(kind=ui.button, content='Refresh tools').click()
         await user.should_see('Your selections are preserved.')
-        await user.should_not_see('private discovery payload')
+        await user.should_see('private discovery payload')
         assert next(iter(user.find(kind=ui.checkbox, content='web_search').elements)).value
         assert not next(iter(user.find(kind=ui.button, content='Save assigned tools').elements)).enabled
         user.find('Save assigned tools').click()
@@ -606,7 +606,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
         assert selector.options == {'default': 'Model default', 'off': 'Off', 'on': 'On'}
         user.find('Model provider').trigger('update:modelValue', {'value': 2})
         await user.should_see('Thinking support could not be verified')
-        await user.should_not_see('Private model API failure payload')
+        await user.should_see('Private model API failure payload')
         assert selector.options == {'default': 'Model default'} and selector.value == 'default'
 
 

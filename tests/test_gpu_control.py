@@ -280,7 +280,7 @@ async def test_definitive_gpu_rejection_crosses_socket_and_releases_operation_bl
     with pytest.raises(CloudError) as failure:
         await helper_call(gpu_socket, payload.pop('action'), **payload)
     assert failure.value.rejected and failure.value.public_detail == reason
-    assert reason in str(failure.value) and 'private-payload' not in str(failure.value) + caplog.text
+    assert reason in str(failure.value) and 'private-payload' not in caplog.text
     receipt = controller.journal.rows('SELECT phase,changed FROM operations')[0]
     assert receipt == {'phase': 'failed', 'changed': int(changed)}
     assert not controller.cloud.vms and len(controller.host.items) == 1

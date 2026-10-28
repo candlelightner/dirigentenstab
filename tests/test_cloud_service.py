@@ -913,6 +913,15 @@ async def test_agent_can_abandon_a_deployment_with_no_usable_vm_to_unblock_new_o
         await service._deploy_managed(agent, NoCatalogue(), {})
 
 
+async def test_agent_sees_the_real_message_when_a_pending_deployment_blocks_a_new_one(failed_deployment):
+    from dirigentenstab.diagnostics import diagnose
+
+    service, cloud, operation_id, name = failed_deployment
+    with pytest.raises(CloudError) as error:
+        await service._deploy_managed(await service.agent('parent'), cloud, {})
+    assert f'Deployment {operation_id} needs recovery before another managed VM is created' in str(diagnose(error.value))
+
+
 @pytest.mark.parametrize('state', ['Running', 'Stopped', 'Starting', 'Stopping', 'Migrating', 'Unknown', None])
 async def test_abandon_is_refused_while_a_matching_owned_vm_may_be_live(failed_deployment, state):
     service, cloud, operation_id, name = failed_deployment
@@ -942,6 +951,8 @@ def _with_job(service, cloud, operation_id, name, jobstatus):
     async def raw(command, params):
         if command == 'queryAsyncJobResult':
             cloud.calls.append((command, params.copy()))
+            if isinstance(jobstatus, Exception):
+                raise jobstatus
             return {'jobstatus': jobstatus}
         return await original(command, params)
 
@@ -965,6 +976,27 @@ async def test_abandon_proceeds_once_the_deployment_job_has_finished_without_a_v
     assert (await service.recover_operation('parent', operation_id, abandon=True))['phase'] == 'rejected'
     assert ('queryAsyncJobResult', {'jobid': 'job-1'}) in cloud.calls
     assert service.store.all('SELECT * FROM vm_access') == []
+
+
+PURGED = CloudError('CloudStack error 431: Invalid parameter jobid value=job-1 due to incorrect long value format, '
+                    'or entity does not exist or due to incorrect parameter annotation', rejected=True)
+
+
+async def test_abandon_treats_a_purged_deployment_job_as_not_running_and_ignores_a_vm_in_error(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Error')]
+    _with_job(service, cloud, operation_id, name, PURGED)
+    result = await service.recover_operation('parent', operation_id, abandon=True)
+    assert result['phase'] == 'rejected'
+    assert service.store.all('SELECT * FROM vm_access') == []
+
+
+async def test_abandon_still_fails_on_other_job_lookup_errors(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, CloudError('CloudStack error 530: internal error', rejected=False))
+    with pytest.raises(CloudError, match='internal error'):
+        await service.recover_operation('parent', operation_id, abandon=True)
+    assert service.store.one('SELECT phase FROM vm_deployments')['phase'] == 'failed'
 
 
 async def test_abandon_does_not_overwrite_a_deployment_resolved_concurrently(failed_deployment):

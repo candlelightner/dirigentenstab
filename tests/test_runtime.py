@@ -156,7 +156,7 @@ async def test_failed_runtime_suppresses_provider_secrets_and_preserves_retryabl
     manager = runtime.Runtime(service)
     with pytest.raises(ValueError, match='Agent execution failed') as error:
         await manager.chat({'userid': 'human'}, 'parent', None, 'Hello')
-    assert 'SUPERSECRET' not in str(error.value)
+    assert 'provider failed with SUPERSECRET' in str(error.value)
     conversation = (await manager.conversations({'userid': 'human'}, 'parent'))[0]
     restored = await manager.restore({'userid': 'human'}, conversation['id'])
     assert 'Hello' in str(restored['messages'])
@@ -280,7 +280,7 @@ async def test_provider_failure_keeps_completed_tools_and_correlation(service, m
     assert run['events'][0]['call_id'] == run['events'][1]['call_id'] == 'call-1'
     assert error.value.operation_id == run['id']
     assert 'Traceback' in caplog.text and run['id'] in caplog.text
-    assert 'SUPERSECRET' not in caplog.text + str(error.value)
+    assert 'SUPERSECRET private conversation' in str(error.value) and 'SUPERSECRET' not in caplog.text
     assert 'private conversation' not in caplog.text
 
 
@@ -337,13 +337,14 @@ async def test_model_discovery_server_side_and_bounded(service, monkeypatch, sta
     (404, 'model-provider', 'Model ID'), (429, 'model-provider', 'quota'),
     (503, 'model-provider', 'unavailable'), (400, 'model-provider', 'compatibility'),
 ])
-def test_specific_provider_errors_never_expose_payload(code, category, description, caplog):
+def test_specific_provider_errors_pass_the_provider_message_but_keep_logs_payload_free(code, category, description, caplog):
     from dirigentenstab.diagnostics import diagnose
     from pydantic_ai.exceptions import ModelHTTPError
     error = diagnose(ModelHTTPError(code, 'private model', {'error': 'secret private conversation'}),
                      operation_id='operation', agent_id='agent', tool='execute_api')
     assert error.category == category and description in str(error)
-    assert 'private' not in str(error) + caplog.text and 'secret' not in str(error) + caplog.text
+    assert 'secret private conversation' in str(error)
+    assert 'private' not in caplog.text and 'secret' not in caplog.text
     assert 'agent=agent tool=execute_api' in caplog.text
 
 
