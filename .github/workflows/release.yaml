@@ -8,7 +8,31 @@ permissions:
   contents: write
   packages: write
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Publish only when the version changed
+        id: check
+        env:
+          DS_BEFORE: ${{ github.event.before }}
+        run: |
+          read_version='import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])'
+          DS_VERSION=$(python3 -c "$read_version" < pyproject.toml)
+          DS_OLD=$(git show "$DS_BEFORE:pyproject.toml" 2>/dev/null | python3 -c "$read_version" 2>/dev/null || true)
+          if [ "$GITHUB_REF_TYPE" != tag ] && [ "$DS_OLD" = "$DS_VERSION" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version $DS_VERSION is unchanged, nothing to publish"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
   publish:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
