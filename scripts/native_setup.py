@@ -277,7 +277,7 @@ def services():
     Path('/var/lib/libvirt/images/dirigentenstab').chmod(0o750)
     # Keep libvirt on its authenticated Unix socket: no unauthenticated TCP listener.
     properties('/etc/cloudstack/agent/agent.properties', {
-        'host': ADDRESS, 'private.network.device': BRIDGE, 'public.network.device': BRIDGE,
+        'host': f'{ADDRESS}@static', 'private.network.device': BRIDGE, 'public.network.device': BRIDGE,
         'guest.network.device': BRIDGE, 'hypervisor.uri': 'qemu:///system',
         'local.storage.path': '/var/lib/libvirt/images/dirigentenstab',
         'local.storage.uuid': str(__import__('uuid').uuid4()), 'image.server.listen.address': ADDRESS,

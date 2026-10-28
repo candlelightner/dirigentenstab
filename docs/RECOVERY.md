@@ -37,6 +37,14 @@ KVM launch failures reporting UID 64055 permission errors often indicate that a 
 
 If strict HTTPS template validation fails, verify that the agent JKS contains both the CloudStack private CA/client key and the maintained system CA trust anchors. Do not disable certificate verification. The installer imports the system Java trust store while preserving the client key. CloudStack manages native certificate lifecycle; platform administrators must test renewal and refresh CA trust during upgrades.
 
+### KVM host Disconnected after an agent restart
+
+Symptom: the host stays Disconnected after `cloudstack-agent` restarts (for example from an unattended upgrade). The agent log shows "Broken pipe" and the management log shows "Certificate ownership verification failed".
+
+Cause: the agent certificate only covers the `dscloud0` bridge address (`CLOUDSTACK_GATEWAY`, normally `10.253.80.1`), but the management server pushes the global setting `host` to agents, and CloudStack auto-detects that as the default-route NIC address. Setup now sets `host` to the bridge address and restarts `cloudstack-management` only when it differs.
+
+Fix on an existing install: set global `host` to the bridge address (`updateConfiguration name=host value=10.253.80.1`), restart `cloudstack-management`, then confirm `/etc/cloudstack/agent/agent.properties` has `host=10.253.80.1@static` and the host returns to Up (`listHosts`). Rerunning `sudo ./setup.sh --install` does the same.
+
 ## Partial subgroup and VM provisioning
 
 Subgroup creation has durable SQLite stages because CloudStack and SQLite cannot share a transaction. Retry the recorded operation after correcting the cause; inspect its phase and native resource IDs. Do not manually create a second account/domain with the same intended name. If an issued key could not be committed locally, reconcile it before retrying. The parent's one API key pair performs provisioning using its current CloudStack account/domain/role permissions; a denial never triggers a more privileged fallback.
