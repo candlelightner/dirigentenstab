@@ -209,9 +209,14 @@ def guest_template(cloud, zone_id):
 
 def zone(cloud):
     cloud.call('updateConfiguration', name='system.vm.use.local.storage', value='true')
-    management = cloud.call('listConfigurations', name='management.network.cidr').get('configuration', [])
-    if management and management[0].get('value') != str(NETWORK):
-        cloud.call('updateConfiguration', name='management.network.cidr', value=str(NETWORK))
+    # `host` must be the agent certificate address; CloudStack otherwise auto-detects the default-route NIC.
+    restart = False
+    for name, value in (('host', ADDRESS), ('management.network.cidr', str(NETWORK))):
+        current = cloud.call('listConfigurations', name=name).get('configuration', [])
+        if current and current[0].get('value') != value:
+            cloud.call('updateConfiguration', name=name, value=value)
+            restart = True
+    if restart:
         run('systemctl', 'restart', 'cloudstack-management')
         for _ in range(120):
             try:

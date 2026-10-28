@@ -339,3 +339,32 @@ def test_runner_publisher_reuses_only_existing_images(tmp_path, force, error, ex
     for step in ('uses: docker/setup-buildx-action@v3', 'name: Build image for verification',
                  'name: Verify image offline before publishing', 'id: push', 'name: Record digest'):
         assert f"      - {step}\n        if: steps.existing.outputs.build == 'true'" in workflow
+
+
+def test_zone_sets_host_to_agent_certificate_address_and_restarts_only_on_change(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / 'scripts'))
+    zs = importlib.import_module('zone_setup')
+    values = {'host': '10.0.0.203', 'management.network.cidr': str(zs.NETWORK)}
+    calls = []
+
+    class Stop(Exception):
+        pass
+
+    class Cloud:
+        def call(self, api, **kw):
+            if api == 'listConfigurations':
+                return {'configuration': [{'value': values[kw['name']]}]}
+            if api == 'updateConfiguration':
+                calls.append(kw['name'])
+                values[kw['name']] = kw['value']
+            return {}
+
+    restarts = []
+    monkeypatch.setattr(zs, 'run', lambda *a: restarts.append(a))
+    monkeypatch.setattr(zs, 'configure_storage', lambda: (_ for _ in ()).throw(Stop()))
+    for expected in (1, 1):
+        with pytest.raises(Stop):
+            zs.zone(Cloud())
+        assert values['host'] == zs.ADDRESS
+        assert len(restarts) == expected
+    assert calls == ['system.vm.use.local.storage', 'host', 'system.vm.use.local.storage']
