@@ -1641,7 +1641,7 @@ async def test_browser_platform_banner_shows_issues_when_fresh_and_unhealthy(bro
         browser = await p.chromium.launch()
         page = await (await browser.new_context(ignore_https_errors=True)).new_page()
         await login(page, url)
-        banner = page.locator('[data-marker="platform_banner"]')
+        banner = page.locator('.whitespace-pre-line.shadow')
         await playwright.expect(banner).to_have_text('host kvm1 Disconnected')
         (state / 'platform-status.json').write_text(json.dumps({'version': 1, 'updated': now - 900, 'healthy': False}))
         await playwright.expect(banner).to_have_text('Platform status unavailable', timeout=15000)
