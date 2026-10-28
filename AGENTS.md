@@ -15,8 +15,16 @@ Guidelines and conventions for AI assistants working in this repository.
   2. Verify locally: `.venv/bin/ruff check .`, `.venv/bin/pytest -q -m "not browser and not live"`, and `.venv/bin/pytest -q -m browser tests/test_browser.py -n 2 --timeout=120` for UI changes (never more than 2 workers locally; `BROWSER_SHARD=1/2` splits the suite on constrained machines).
   3. Commit locally and push branch changes via GitHub MCP (`create_branch` + `push_files`) when shell git credentials are absent.
   4. Open PR against `main` via GitHub MCP. A subagent watches CI (`ci.yaml` and `browser.yaml`, one job with 4 xdist workers) until green, restarting hung jobs itself; the parent steps in only when the subagent escalates a genuine failure or blocker.
-  5. Merge PR into `main` via GitHub MCP.
-  6. Pull `origin/main` in `/home/emil/dirigentenstab`, build the image tagged `dirigentenstab-local:<7-char short SHA of the deployed main commit>` (never reuse an older tag), set only `IMAGE` in `.env` to it, restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`, and verify `/healthz` + live UI. Afterwards remove merged worktrees and their branches.
+  5. Merge PR into `main` via GitHub MCP. Merging does not deploy.
+  6. Deploy only a published release, never a bare merge:
+     a. Merge a version-bump PR. `release.yaml` then publishes `ghcr.io/candlelightner/dirigentenstab:<version>` and the tag `v<version>`; wait for that workflow to succeed.
+     b. Pull `origin/main` in `/home/emil/dirigentenstab`.
+     c. Back up `.env` under `.work/env-backup-<UTC timestamp>`.
+     d. Pull the release image and set only `IMAGE` in `.env` to `ghcr.io/candlelightner/dirigentenstab:<version>`. Never deploy locally built or SHA-tagged images.
+     e. Restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`.
+     f. Verify `/healthz` via `PUBLIC_ORIGIN`. `127.0.0.1:<port>/healthz` can return an empty reply on this host because the port is shared with tailscale serve.
+     g. If health fails, roll back to the previous `IMAGE`.
+  7. Afterwards remove merged worktrees and their branches.
 
 ## 3. Implementation & UI Principles (`ponytail` + `spec.md`)
 
