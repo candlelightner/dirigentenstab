@@ -165,10 +165,11 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .q-message-container,.q-message-text-content{min-width:0;max-width:100%}
             .q-dialog__inner{height:var(--viewport-height,100dvh);bottom:auto}
             .q-dialog__inner>.q-card{max-height:calc(var(--viewport-height,100dvh)*.85);overflow-y:auto}
-            .q-tree__node{padding-left:8px}
-            .q-tree__children{padding-left:6px}
-            .q-tree__node-header{min-height:44px;overflow-wrap:anywhere}
-            .q-tree__node-header-content{min-width:0}
+            .q-drawer .q-scrollarea__content{width:100%!important;min-width:0!important}
+            .q-tree__node-header{min-height:44px}
+            .q-tree__node-header.q-tree__node--selected{background:#e4ecec;font-weight:600}
+            .q-tree__node-header-content{min-width:0;overflow:hidden;white-space:nowrap}
+            .q-tree__node-header-content .q-tree__node-label{overflow:hidden;text-overflow:ellipsis}
             button,.q-btn{min-height:44px}
             .dashboard-mobile{display:none;min-height:44px}
             @media(max-width:900px){.dashboard-header{display:none}.dashboard-mobile{display:flex;align-items:center}}

@@ -1682,3 +1682,42 @@ async def test_browser_platform_banner_shows_issues_when_fresh_and_unhealthy(bro
         (state / 'platform-status.json').write_text(json.dumps({'version': 1, 'updated': now - 900, 'healthy': False}))
         await playwright.expect(banner).to_have_text('Platform status unavailable', timeout=15000)
         await browser.close()
+
+
+async def test_browser_sidebar_tree_geometry_selection_and_overflow(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        for width, height in [(1440, 900), (390, 844)]:
+            page = await browser.new_page(ignore_https_errors=True, viewport={'width': width, 'height': height})
+            await login(page, url)
+            await ensure_navigation_open(page)
+            tree = page.locator('.q-tree')
+            for _ in range(100):
+                arrow = tree.locator('.q-tree__arrow:not(.q-tree__arrow--rotate)')
+                if not await arrow.count():
+                    break
+                await arrow.first.click()
+            # Icon x of every header, grouped by sibling list, with its parent's icon x.
+            groups = await tree.evaluate('''el => {
+                const x = node => node.querySelector(':scope > .q-tree__node-header .q-icon:not(.q-tree__arrow)').getBoundingClientRect().x;
+                const siblings = list => [...list.children].filter(n => n.classList.contains('q-tree__node'));
+                const out = [{parent: null, xs: siblings(el).map(x)}];
+                el.querySelectorAll('.q-tree__children').forEach(c =>
+                    out.push({parent: x(c.closest('.q-tree__node')), xs: siblings(c).map(x)}));
+                return out;
+            }''')
+            assert len(groups) > 3
+            for group in groups:
+                assert max(group['xs']) - min(group['xs']) <= 2, group
+                if group['parent'] is not None:
+                    assert min(group['xs']) > group['parent'], group
+            selected = tree.locator('.q-tree__node-header.q-tree__node--selected')
+            await playwright.expect(selected).to_have_count(1)
+            await playwright.expect(selected).to_contain_text('Main Agent')
+            assert await tree.locator('.q-tree__node-header-content').first.evaluate('el => getComputedStyle(el).opacity') == '1'
+            scroll = page.locator('.q-drawer .q-scrollarea__container')
+            assert await scroll.evaluate('el => el.scrollWidth <= el.clientWidth')
+            assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+            await page.close()
+        await browser.close()

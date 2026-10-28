@@ -115,7 +115,10 @@ def build_sidebar(ctx):
             ctx.new_skill_button.set_visibility(False)
             ctx.search = ui.input('Search agents and domains').props('clearable').classes('w-full')
             with ui.scroll_area().classes('w-full flex-1 min-h-0'):
-                ctx.tree = ui.tree(hierarchy_nodes(data, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value)).classes('w-full').mark('hierarchy')
+                ctx.tree = ui.tree(hierarchy_nodes(data, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value)).props('dense selected-color=primary').classes('w-full').mark('hierarchy')
+                ctx.tree.add_slot('default-header', '''<div class="row items-center no-wrap" style="min-width:0" :title="props.node.label">
+                    <q-icon :name="props.node.icon" size="sm" class="q-mr-sm" />
+                    <span class="ellipsis">{{ props.node.label }}</span></div>''')
             ctx.status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
             if identity.get('type') == 1:
                 ctx.dashboard_link('dashboard-mobile w-full text-teal-900')
