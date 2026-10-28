@@ -198,4 +198,4 @@ def test_nfsd_dry_run_changes_nothing(paths, capsys):
     run(data(nfsd=(8, 8, 8)), now=NOW + 60, dry_run=True)
     assert nfs_threads(paths) == 8
     assert 'raise-nfsd-threads' in capsys.readouterr().out
-    assert not (paths / 'status.json').exists()
+    assert json.loads((paths / 'status.json').read_text())['updated'] == NOW
