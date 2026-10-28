@@ -3,6 +3,7 @@ import base64
 import collections
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -763,9 +764,11 @@ async def test_managed_deploy_classifies_failure_and_reuses_the_prepared_ssh_ide
         return
     assert operation['phase'] == ('failed' if failure == 'async-job' else 'dispatched')
     prepared = store.one('SELECT private_key,host_key,owner_agent FROM vm_access')
+    cloud.vm['state'] = 'Starting'  # live but not yet bindable: inline reconciliation must leave the row alone
     with pytest.raises(CloudError, match='recovery'):
         await service.execute('parent', 'deployVirtualMachine', params, managed=True)
     assert cloud.deployments == 1
+    cloud.vm['state'] = 'Stopped'
     recovered = await service.recover_operation('parent', operation['id'])
     assert recovered['phase'] == 'complete' and 'BEGIN OPENSSH PRIVATE KEY' not in str(recovered)
     with pytest.raises(PermissionError):
@@ -783,7 +786,7 @@ def failed_deployment(store):
     add_parent(store)
     operation_id, name = 'failed-operation', 'ds-vm-owned-stable-name'
     store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',
-                  (operation_id, 'parent', name, store.seal({'name': name}), 'failed', 1))
+                  (operation_id, 'parent', name, store.seal({'name': name}), 'failed', time.time()))
     store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key) VALUES(?,?,?,?,?)',
                   ('pending-' + operation_id, 'parent', 'dirigent', store.seal('synthetic-private-key'), 'synthetic-host-key'))
 
@@ -1394,3 +1397,138 @@ async def test_global_admin_uses_own_identity_for_native_root_offering_metadata_
     assert (await service.search_api(GLOBAL_ADMIN_AGENT, 'Vgpu'))[0]['name'] == 'listVgpuProfiles'
     assert await service.execute(GLOBAL_ADMIN_AGENT, 'createServiceOffering', {'domainid': 'public'}) == {'success': True}
     assert calls == [('createServiceOffering', {'domainid': 'public'})]
+
+
+# Automatic reconciliation: the hub resolves stale deployments itself.
+async def _row(service):
+    return service.store.one('SELECT phase,vm_id FROM vm_deployments')
+
+
+async def test_reconcile_closes_a_purged_job_with_an_error_vm(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Error')]
+    _with_job(service, cloud, operation_id, name, PURGED)
+    await service.reconcile_deployments()
+    assert await _row(service) == {'phase': 'rejected', 'vm_id': None}
+    assert service.store.all('SELECT * FROM vm_access') == []
+    assert service.store.one('SELECT actor,target FROM audit WHERE operation=?', ('deployment-auto-reconciled',)) == {
+        'actor': 'parent', 'target': operation_id}
+    assert all(command in {'listAccounts', 'listVirtualMachines', 'queryAsyncJobResult'} for command, _ in cloud.calls)
+
+
+@pytest.mark.parametrize('jobstatus', [1, 2])
+async def test_reconcile_closes_a_finished_job_with_no_vm(failed_deployment, jobstatus):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, jobstatus)
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'rejected'
+
+
+async def test_reconcile_leaves_a_running_job_untouched(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, 0)
+    await service.reconcile_deployments()
+    assert await _row(service) == {'phase': 'failed', 'vm_id': None}
+    assert len(service.store.all('SELECT * FROM vm_access')) == 1
+    assert not service.store.all('SELECT * FROM audit WHERE operation=?', ('deployment-auto-reconciled',))
+
+
+async def test_reconcile_leaves_other_job_errors_untouched(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, CloudError('CloudStack error 530: internal error', rejected=False))
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'failed'
+
+
+@pytest.mark.parametrize('state', ['Starting', 'Stopping', 'Migrating', 'Unknown'])
+async def test_reconcile_leaves_a_transient_live_vm_untouched(failed_deployment, state):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, state)]
+    _with_job(service, cloud, operation_id, name, 2)
+    await service.reconcile_deployments()
+    assert await _row(service) == {'phase': 'failed', 'vm_id': None}
+
+
+async def test_reconcile_binds_a_unique_usable_vm(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Stopped', 'owned-vm')]
+    _with_job(service, cloud, operation_id, name, 2)
+    await service.reconcile_deployments()
+    assert await _row(service) == {'phase': 'complete', 'vm_id': 'owned-vm'}
+    assert not service.store.all('SELECT * FROM audit WHERE operation=?', ('deployment-auto-reconciled',))
+
+
+async def test_reconcile_leaves_ambiguous_running_vms_untouched(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Running', 'one'), _vm(name, 'Running', 'two')]
+    _with_job(service, cloud, operation_id, name, 2)
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'failed'
+
+
+async def test_reconcile_closes_prepared_without_a_job_only_after_the_grace_period(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    service.store.execute("UPDATE vm_deployments SET phase='prepared',updated=?", (time.time() - 60,))
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'prepared'
+    service.store.execute('UPDATE vm_deployments SET updated=?', (time.time() - service.PREPARED_GRACE_SECONDS - 1,))
+    cloud.vms = [_vm(name, 'Starting')]
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'prepared'
+    cloud.vms = []
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == 'rejected'
+    assert service.store.all('SELECT * FROM vm_access') == []
+
+
+@pytest.mark.parametrize('phase', ['dispatched', 'failed'])
+async def test_reconcile_never_closes_an_old_dispatched_or_failed_row_without_a_saved_job(failed_deployment, phase):
+    service, cloud, operation_id, name = failed_deployment
+    service.store.execute('UPDATE vm_deployments SET phase=?,updated=1', (phase,))
+    await service.reconcile_deployments()
+    assert (await _row(service))['phase'] == phase
+
+
+async def test_deploy_managed_reconciles_its_agents_stale_row_instead_of_refusing(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    cloud.vms = [_vm(name, 'Error')]
+    _with_job(service, cloud, operation_id, name, PURGED)
+
+    class Stop(Exception):
+        pass
+
+    class NoCatalogue:
+        async def catalogue(self):
+            raise Stop
+
+    with pytest.raises(Stop):  # got past the "needs recovery" refusal
+        await service._deploy_managed(await service.agent('parent'), NoCatalogue(), {})
+    assert (await _row(service))['phase'] == 'rejected'
+
+
+async def test_deploy_managed_still_refuses_while_the_row_stays_unresolved(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    _with_job(service, cloud, operation_id, name, 0)
+    with pytest.raises(CloudError, match='needs recovery'):
+        await service._deploy_managed(await service.agent('parent'), cloud, {})
+
+
+async def test_one_failing_row_does_not_stop_reconciliation_of_the_others(failed_deployment):
+    service, cloud, operation_id, name = failed_deployment
+    store = service.store
+    store.execute("INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials) "
+                  "SELECT 'other','Other','other-domain','other-account','other-user',credentials FROM agents WHERE id='parent'")
+    store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',
+                  ('second', 'other', 'ds-vm-second', store.seal({'name': 'ds-vm-second'}), 'prepared', 1))
+    original = service.cloud_client
+
+    async def client(agent, purpose='runtime'):
+        if agent['id'] == 'other':
+            raise CloudError('credentials expired')
+        return await original(agent, purpose)
+
+    service.cloud_client = client
+    _with_job(service, cloud, operation_id, name, PURGED)
+    await service.reconcile_deployments()
+    assert store.one('SELECT phase FROM vm_deployments WHERE id=?', ('second',))['phase'] == 'prepared'
+    assert store.one('SELECT phase FROM vm_deployments WHERE id=?', (operation_id,))['phase'] == 'rejected'
