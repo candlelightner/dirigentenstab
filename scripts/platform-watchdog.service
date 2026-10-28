@@ -1,0 +1,14 @@
+[Unit]
+Description=Dirigentenstab CloudStack platform watchdog
+After=mysql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/dirigentenstab-network.env
+ExecStart=/usr/bin/python3 /usr/local/libexec/dirigentenstab-platform-watchdog.py
+TimeoutStartSec=180
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dirigentenstab/platform /etc/cloudstack/agent
+ProtectHome=yes
+PrivateTmp=yes
