@@ -12,12 +12,13 @@ spec.loader.exec_module(wd)
 NOW = 1_000_000.0
 
 
-def data(status='Up', resource='Enabled', api=True, vm='Running', agent_host=None):
+def data(status='Up', resource='Enabled', api=True, vm='Running', agent_host=None, nfsd=(8, 8, 0)):
     return {'hosts': [{'name': 'homeserver', 'status': status, 'resource_state': resource, 'address': '10.253.80.1'}],
             'system_vms': [{'name': 's-1-VM', 'type': 'SecondaryStorageVm', 'state': vm}],
             'capacity': {'cpu_allocated_pct': 50.0, 'memory_allocated_pct': 40.0, 'local_storage_used_pct': None,
                          'cpu_threshold_pct': 85.0, 'memory_threshold_pct': 85.0},
-            'agent_host': agent_host or f'{wd.ADDRESS}@static', 'api': api}
+            'agent_host': agent_host or f'{wd.ADDRESS}@static', 'api': api,
+            'nfsd': {'threads': nfsd[0], 'running': nfsd[1], 'blocked': nfsd[2], 'not_responding': False}}
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +29,8 @@ def paths(tmp_path, monkeypatch):
     props = tmp_path / 'agent.properties'
     props.write_text('zone=1\nhost=10.0.0.203@static\nport=8250\n')
     monkeypatch.setattr(wd, 'PROPERTIES', props)
+    monkeypatch.setattr(wd, 'NFSD_THREADS', tmp_path / 'nfsd-threads')
+    (tmp_path / 'nfsd-threads').write_text('8\n')
     return tmp_path
 
 
@@ -59,7 +62,7 @@ def test_status_shape_and_file_modes(paths):
     on_disk = json.loads((paths / 'status.json').read_text())
     assert on_disk == status
     assert set(status) == {'version', 'updated', 'healthy', 'hosts', 'management_api', 'system_vms',
-                           'capacity', 'issues', 'actions'}
+                           'capacity', 'secondary_nfs', 'issues', 'actions'}
     assert set(status['hosts'][0]) == {'name', 'status', 'resource_state', 'since'}
     assert status['version'] == 1 and status['management_api'] == {'reachable': True}
     assert (paths / 'status.json').stat().st_mode & 0o777 == 0o644
@@ -144,3 +147,55 @@ def test_dry_run_changes_nothing(paths, capsys):
     out = json.loads(capsys.readouterr().out)
     assert [a['action'] for a in out['planned_actions']] == ['fix-agent-host', 'restart-cloudstack-agent']
     assert restarts == [] and {p.name: p.read_bytes() for p in paths.iterdir()} == before
+
+
+def nfs_threads(paths):
+    return int((paths / 'nfsd-threads').read_text())
+
+
+def test_nfsd_stuck_needs_two_runs_then_reports_and_raises(paths):
+    stuck = data(nfsd=(8, 8, 8))
+    status, _ = run(stuck)
+    assert status['healthy'] is True and status['secondary_nfs'] == {'nfsd_threads': 8, 'blocked': 8, 'stuck': False}
+    assert nfs_threads(paths) == 8
+    status, _ = run(stuck, now=NOW + 60)
+    assert status['healthy'] is False and status['secondary_nfs']['stuck'] is True
+    assert any('nfsd threads blocked' in issue for issue in status['issues'])
+    assert nfs_threads(paths) == 24
+    assert status['actions'][-1]['action'] == 'raise-nfsd-threads'
+
+
+def test_nfsd_blocked_run_counter_resets_when_recovered(paths):
+    run(data(nfsd=(8, 8, 8)))
+    run(data(), now=NOW + 60)
+    status, _ = run(data(nfsd=(8, 8, 8)), now=NOW + 120)
+    assert status['secondary_nfs']['stuck'] is False and nfs_threads(paths) == 8
+
+
+def test_nfsd_raise_rate_limited_and_capped_at_64(paths):
+    run(data(nfsd=(8, 8, 8)))
+    run(data(nfsd=(8, 8, 8)), now=NOW + 60)
+    assert nfs_threads(paths) == 24
+    run(data(nfsd=(24, 24, 24)), now=NOW + 120)
+    assert nfs_threads(paths) == 24  # inside the 15 minute window
+    run(data(nfsd=(24, 24, 24)), now=NOW + 60 + 900)
+    assert nfs_threads(paths) == 40
+    run(data(nfsd=(56, 56, 56)), now=NOW + 60 + 1800)
+    assert nfs_threads(paths) == 64
+    status, _ = run(data(nfsd=(64, 64, 64)), now=NOW + 60 + 2700)
+    assert nfs_threads(paths) == 64 and status['secondary_nfs']['stuck'] is True  # reported, nothing more to raise
+    assert [a['action'] for a in status['actions']].count('raise-nfsd-threads') == 3
+
+
+def test_nfsd_no_action_when_healthy_or_mostly_idle(paths):
+    for minute in range(4):
+        status, _ = run(data(nfsd=(8, 8, 1)), now=NOW + 60 * minute)
+    assert nfs_threads(paths) == 8 and status['healthy'] is True and status['actions'] == []
+
+
+def test_nfsd_dry_run_changes_nothing(paths, capsys):
+    run(data(nfsd=(8, 8, 8)))
+    run(data(nfsd=(8, 8, 8)), now=NOW + 60, dry_run=True)
+    assert nfs_threads(paths) == 8
+    assert 'raise-nfsd-threads' in capsys.readouterr().out
+    assert json.loads((paths / 'status.json').read_text())['updated'] == NOW
