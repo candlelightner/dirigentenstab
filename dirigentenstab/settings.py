@@ -36,6 +36,7 @@ class Settings:
     cloudstack_ui_url: str = ''
     guest_assets: str = '/data/guest-assets'
     gpu_helper_socket: str = ''
+    platform_status: str = '/platform/status.json'
 
     def __post_init__(self):
         if type(self.session_seconds) is not int or self.session_seconds <= 0:
@@ -58,4 +59,5 @@ class Settings:
                    ssh_networks=os.getenv('SSH_NETWORKS', '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'),
                    cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
                    guest_assets=os.getenv('GUEST_ASSETS', '/data/guest-assets'),
-                   gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''))
+                   gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''),
+                   platform_status=os.getenv('PLATFORM_STATUS_FILE', '/platform/status.json'))

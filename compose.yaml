@@ -21,6 +21,7 @@ services:
       PYTHONDONTWRITEBYTECODE: '1'
     volumes:
       - app_data:/data
+      - /var/lib/dirigentenstab/platform:/platform:ro
     secrets:
       - master_key
       - tls_cert

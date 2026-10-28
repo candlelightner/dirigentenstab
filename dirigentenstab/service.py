@@ -20,6 +20,7 @@ from .diagnostics import OperationError
 from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
+from . import platform_status
 
 _UNSET = object()
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
@@ -306,6 +307,8 @@ class Service:
                         raise PermissionError('Compute offering is unavailable to this agent')
                     gpu |= gpu_count(offering) > 0
                 if gpu:
+                    if command in {'deployVirtualMachine', 'startVirtualMachine'}:
+                        self.preflight()
                     context = GPU_CONTEXT.get() or {}
                     if not all(isinstance(context.get(field), str) and context[field] for field in ('run_id', 'call_id')):
                         raise PermissionError('Managed GPU operations require an authenticated durable agent execution')
@@ -335,8 +338,17 @@ class Service:
                              status='failed')
             raise
 
+    def platform_status(self):
+        return platform_status.read(getattr(self.settings, 'platform_status', ''))
+
+    def preflight(self):
+        # Refuse before any DB row or CloudStack call while the host is known down; stale/missing status never blocks.
+        if message := platform_status.refusal(self.platform_status()):
+            raise CloudError(message, rejected=True)
+
     async def _deploy_managed(self, agent, cloud, params, *, workspace_disk=False):
         from .guest import Guest
+        self.preflight()
 
         pending_query = "SELECT id FROM vm_deployments WHERE agent_id=? AND phase IN ('prepared','dispatched','failed')"
         if self.store.one(pending_query, (agent['id'],)):
