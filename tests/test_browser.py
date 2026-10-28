@@ -1116,7 +1116,7 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         await dialog.get_by_text('Dismissed', exact=True).wait_for()
         await dialog.get_by_role('button', name='Back to requests', exact=True).click()
         await page.get_by_role('button', name='Close', exact=True).click()
-        await page.get_by_text('Escalation request declined', exact=True).wait_for()
+        await page.get_by_text('Escalation declined', exact=True).wait_for()
         store = Store(str(state / 'browser.db'), str(state / 'master'))
         declined = store.one("SELECT * FROM escalation_requests WHERE status='deferred'")
         assert not declined['delivery_run_id']
@@ -1544,13 +1544,49 @@ async def test_browser_autoscroll_off_keeps_position_when_declined_notice_shifts
                       (conversation['id'], run['id'], conversation['human_id'], store.seal({}), now, now))
         scroll = page.locator('.messages .q-scrollarea__container')
         await scroll.evaluate('el => el.scrollTop = 100')
-        await page.get_by_text('Escalation request declined', exact=True).wait_for()
+        await page.get_by_text('Escalation declined', exact=True).wait_for()
         assert abs(await scroll.evaluate('el => el.scrollTop') - 100) < 5
         await message.fill('Inspect resources')
         await page.get_by_role('button', name='Send', exact=True).click()
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         await page.wait_for_timeout(500)
         assert abs(await scroll.evaluate('el => el.scrollTop') - 100) < 5
+        await browser.close()
+
+
+async def test_browser_escalation_notice_sits_at_request_and_waiting_is_not_thinking(browser_app):
+    url, state = browser_app
+    from dirigentenstab.store import Store
+
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        message = page.get_by_label('Message', exact=True)
+        await message.fill('Inspect resources')
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        conversation = store.one('SELECT * FROM conversations ORDER BY created DESC')
+        run = store.one('SELECT * FROM chat_runs WHERE conversation_id=?', (conversation['id'],))
+        call_id = next(e['call_id'] for e in store.open(run['events']) if e['type'] == 'tool_call')
+        now = int(time.time())
+        for request_id, status, call in (('approved-inline', 'approved', call_id), ('pending-inline', 'pending', 'other')):
+            store.execute('INSERT INTO escalation_requests (id,agent_id,conversation_id,run_id,call_id,human_id,command,description,'
+                          'reason,params,status,created,updated) VALUES(?,\'research\',?,?,?,?,\'x\',\'x\',\'x\',?,?,?,?)',
+                          (request_id, conversation['id'], run['id'], call, conversation['human_id'], store.seal({}),
+                           status, now, now))
+        notice = page.get_by_text('Escalation approved', exact=True)
+        await notice.wait_for()
+        order = await page.evaluate("""() => [...document.querySelectorAll('.messages .q-expansion-item, .messages [role=status], .messages .q-message')]
+            .map(el => el.textContent.trim())""")
+        assert order.index('Escalation approved') == len(order) - 2 and order[-1].endswith('The research VM is running.'), order
+        store.execute("UPDATE chat_runs SET status='running' WHERE id=?", (run['id'],))
+        await page.get_by_text('Waiting for your decision on an escalation request', exact=True).wait_for()
+        assert await page.get_by_text('Thinking…', exact=True).count() == 0
+        store.execute("UPDATE escalation_requests SET status='deferred',updated=? WHERE id='pending-inline'", (now + 1,))
+        await page.get_by_text('Thinking…', exact=True).wait_for()
         await browser.close()
 
 

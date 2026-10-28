@@ -80,6 +80,29 @@ def history_parts(history):
                     yield 'agent', reason
 
 
+ESCALATION_NOTICES = {
+    'approved': 'Escalation approved', 'applying': 'Escalation approved, applying…',
+    'failed': 'Escalation approved, but the command failed',
+    'uncertain': 'Escalation approved, outcome uncertain', 'deferred': 'Escalation declined',
+}
+
+
+def with_escalation_notices(parts, requests):
+    """Place each decided escalation's notice right after its request's tool activity, keyed by request id."""
+    parts = [(kind, content, None) for kind, content in parts]
+    for request in requests:
+        if not (text := ESCALATION_NOTICES.get(request['status'])):
+            continue
+        ends = [i for i, (kind, content, _) in enumerate(parts)
+                if kind == 'activity' and content.get('operation_id') == request['run_id']]
+        exact = [i for i in ends if parts[i][1].get('call_id') == request['call_id']]
+        at = (exact or ends or [len(parts) - 1])[-1] + 1
+        while at < len(parts) and parts[at][2]:
+            at += 1
+        parts.insert(at, ('notice', text, ('escalation', request['id'])))
+    return parts
+
+
 def conversation_activity(store, human_id, agent_ids):
     if not agent_ids:
         return []
@@ -124,8 +147,10 @@ def build_chat_view(ctx):
             ctx.transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
         with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
                 'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
-            ui.label('Thinking…')
-            with ui.row().classes('items-center gap-1').props('aria-hidden=true'):
+            ui.label().bind_text_from(
+                state, 'waiting', lambda waiting: 'Waiting for your decision on an escalation request' if waiting else 'Thinking…')
+            with ui.row().classes('items-center gap-1').props('aria-hidden=true').bind_visibility_from(
+                    state, 'waiting', lambda waiting: not waiting):
                 for dot in range(3):
                     ui.element('span').classes('thinking-dot').style(f'animation-delay:{dot * .15}s')
         with ui.row().classes('composer gap-2'):
@@ -261,7 +286,7 @@ def setup_chat(ctx):
         finally:
             ctx.prompt.enable()
         ctx.prompt.set_value(state['drafts'].get((agent_id, None), ''))
-        state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, activity_token=None)
+        state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, waiting=False, activity_token=None)
         ctx.sync_url()
         sync_composer()
         ctx.prompt.enable()
@@ -362,12 +387,15 @@ def setup_chat(ctx):
         state['conversation'] = restored['id']
         state['imported'] = bool(restored.get('imported'))
         state['active_operation'] = None
-        state['busy'] = False
+        state['busy'] = state['waiting'] = False
         reset_run_details()
         if restored.get('runs'):
             run = restored['runs'][-1]
             state['active_operation'] = run['id'] if run['status'] == 'running' else None
             state['busy'] = bool(state['active_operation'])
+            waiting = state['busy'] and service.store.one(
+                "SELECT 1 FROM escalation_requests WHERE run_id=? AND status='pending'", (run['id'],))
+            state['waiting'] = bool(waiting)
             reason = (run.get('budget') or {}).get('reason')
             label = ('Blocked / paused' if run['status'] == 'reconciliation' else 'Stopped' if reason == 'stopped' else 'Blocked / paused' if run['status'] == 'interrupted'
                      else run['status'].capitalize())
@@ -384,24 +412,22 @@ def setup_chat(ctx):
             ctx.status_label.set_text('Imported history is read-only. Sending starts a new conversation.')
         sync_composer()
         ctx.sync_run_details()
-        parts = list(history_parts(restored))
-        parts.extend(('notice', 'Escalation request declined') for _ in service.store.all(
-            "SELECT id FROM escalation_requests WHERE conversation_id=? AND status='deferred' ORDER BY updated",
-            (restored['id'],)))
-        keys = [(kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
-                if kind == 'activity' else (kind, index)
-                for index, (kind, content) in enumerate(parts)]
+        requests = service.store.all(
+            'SELECT id,run_id,call_id,status FROM escalation_requests WHERE conversation_id=? ORDER BY created',
+            (restored['id'],))
+        parts, keys, count = [], [], 0
+        for kind, content, key in with_escalation_notices(history_parts(restored), requests):
+            parts.append((kind, content))
+            if kind == 'activity':
+                key = (kind, content.get('type'), content.get('operation_id'), content.get('call_id'))
+            elif not key:
+                key, count = (kind, count), count + 1
+            keys.append(key)
         rendered_keys = [part[0] for part in rendered_parts]
         common = next((i for i, pair in enumerate(zip(rendered_keys, keys, strict=False)) if pair[0] != pair[1]),
                       min(len(keys), len(rendered_keys)))
-        rebuild = rendered_conversation != restored['id'] or not ctx.transcript.default_slot.children
-        if not rebuild and common < len(rendered_parts):
-            # Trailing notices (e.g. declined escalations) shift when history grows; drop just those.
-            rebuild = any(key[0] != 'notice' for key in rendered_keys[common:])
-            if not rebuild:
-                for _, _, element in rendered_parts[common:]:
-                    element.delete()
-                del rendered_parts[common:]
+        rebuild = (rendered_conversation != restored['id'] or not ctx.transcript.default_slot.children
+                   or common < len(rendered_parts))
         offset = None
         if rebuild:
             if rendered_conversation == restored['id'] and not ctx.autoscroll.value:
@@ -454,9 +480,9 @@ def setup_chat(ctx):
             rows = conversation_activity(service.store, current['userid'], list(agents))
             selected = next((row for row in rows if row['id'] == conversation_id), None)
             if selected:
-                declines = tuple((row['id'], row['updated']) for row in ctx.escalation_rows
-                                 if row['conversation_id'] == conversation_id and row['status'] == 'deferred')
-                activity_token = (selected['operation_id'], selected['status'], selected['updated'], declines)
+                decisions = tuple((row['id'], row['status'], row['updated']) for row in ctx.escalation_rows
+                                  if row['conversation_id'] == conversation_id)
+                activity_token = (selected['operation_id'], selected['status'], selected['updated'], decisions)
                 if activity_token != state['activity_token']:
                     restored = await runtime.restore(current, conversation_id)
                     if state['agent'] == agent_id and state['conversation'] == conversation_id:
@@ -472,7 +498,7 @@ def setup_chat(ctx):
         remember_conversation(None)
         state['drafts'][(state['agent'], state['conversation'])] = ctx.prompt.value or ''
         ctx.prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
-        state.update(conversation=None, active_operation=None, busy=False, imported=False,
+        state.update(conversation=None, active_operation=None, busy=False, waiting=False, imported=False,
                      activity_token=None)
         sync_composer()
         reset_run_details()
