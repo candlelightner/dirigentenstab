@@ -24,7 +24,7 @@ Guidelines and conventions for AI assistants working in this repository.
      e. Restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`.
      f. Verify `/healthz` via `PUBLIC_ORIGIN`. `127.0.0.1:<port>/healthz` can return an empty reply on this host because the port is shared with tailscale serve.
      g. If health fails, roll back to the previous `IMAGE`.
-  7. Afterwards remove merged worktrees and their branches.
+  7. Afterwards remove the merged worktree and its local branch, and delete the merged branch on the remote (`git push origin --delete <branch>`) if GitHub has not already done so. Never touch `main` or tags. Before deleting anything that was not merged through its own PR, confirm its work landed in `main` and archive it first; keep branches with unlanded work.
 
 ## 3. Implementation & UI Principles (`ponytail` + `spec.md`)
 
