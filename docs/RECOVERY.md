@@ -87,6 +87,34 @@ Seven legacy workers depend on host-mounted shared credential/configuration/data
 
 A safe cutover must inventory each workload's root disk **and every attached custom volume**, retain the unattached volumes and original backups, establish a workload-specific consistency boundary, and transfer the approved workspace/application datasets into guest-owned storage. Reconfigure providers and human identities through the new platform rather than copying legacy host credential directories into guests. Validate the workload and its data in CloudStack, then change only its endpoint while retaining a rollback route. The existing running administrator requires its own tested replacement before shutdown. This inventory phase is complete; legacy workload and conversation migration are explicitly **not complete** until those checks and transfers are performed.
 
+## Platform watchdog
+
+`scripts/platform_watchdog.py` runs every minute as root (systemd timer `dirigentenstab-platform-watchdog.timer`) so agents and administrators learn about host-side outages without anyone noticing by hand. It reads, never writes, the CloudStack database through root's MySQL socket:
+
+- **Hosts** (`type='Routing'`, not removed): status and resource state. Healthy means every host is `Up` and `Enabled`.
+- **System VMs** (SecondaryStorageVm, ConsoleProxy, DomainRouter): all must be `Running`.
+- **Management API**: `GET http://<CLOUDSTACK_GATEWAY>:8080/client/` must return 200.
+- **Capacity**: allocated CPU and memory and local-storage use from `op_host_capacity` (capacity types 0 memory, 1 CPU, 9 local storage; allocated is used plus reserved over total, summed per cluster, worst cluster reported) against `cluster.cpu.allocated.capacity.disablethreshold` and `cluster.memory.allocated.capacity.disablethreshold` from `configuration`. Per-cluster overrides in `cluster_details` are not consulted, and local storage is `null` when no local pool reports capacity.
+
+**What it fixes.** Only when a host has not been `Up` for 3 minutes: if `/etc/cloudstack/agent/agent.properties` `host=` does not start with the management address (`CLOUDSTACK_GATEWAY`), it saves `agent.properties.bak-<UTC timestamp>` and sets `host=<address>@static` (an unattended-upgrade once left `10.0.0.203`, which the agent certificate does not cover); then it restarts `cloudstack-agent`, at most once per 15 minutes. It never restarts `cloudstack-management` and never touches VMs, volumes or the database. An unreachable API or non-running system VMs are reported only. Actions go to the journal (`journalctl -u dirigentenstab-platform-watchdog`) and to `actions`.
+
+**Install** (root; restarts no CloudStack service): `sudo python3 scripts/install_platform_watchdog.py`. Re-running is safe. Preview without changing anything: `sudo python3 scripts/platform_watchdog.py --dry-run`.
+
+**Read status.** `/var/lib/dirigentenstab/platform/status.json` (0644, no secrets, replaced atomically; `state.json` beside it is root-only):
+
+```json
+{"version": 1, "updated": 1767225600.0, "healthy": false,
+ "hosts": [{"name": "homeserver", "status": "Disconnected", "resource_state": "Enabled", "since": 1767225000.0}],
+ "management_api": {"reachable": true},
+ "system_vms": [{"name": "s-1-VM", "type": "SecondaryStorageVm", "state": "Running"}],
+ "capacity": {"cpu_allocated_pct": 87.0, "memory_allocated_pct": 40.0, "local_storage_used_pct": null,
+              "cpu_threshold_pct": 85.0, "memory_threshold_pct": 85.0},
+ "issues": ["Host homeserver Disconnected since 06:39"],
+ "actions": [{"at": 1767225180.0, "action": "restart-cloudstack-agent", "result": "restarted"}]}
+```
+
+`healthy` is false whenever `issues` names a host, API or system-VM problem; capacity issues alone do not flip it. `since` is when the watchdog first saw that host status. A stale `updated` (older than a few minutes) means the watchdog itself is not running. If the database cannot be read, `issues` says so and no remediation is attempted.
+
 ## Private templates and optional GPU preparation
 
 Managed deployment and private-image recovery apply to operations explicitly requested with `managed=true`. Ordinary native API calls preserve supplied parameters and do not enroll managed SSH or approve derived images automatically. Never repeat a failed managed operation through the native path to bypass reconciliation.
