@@ -101,6 +101,7 @@ users. There is no new hub account or registration system.
   awareness, not a guarantee against conflicting operations on the same VM.
 - Work continues when the browser closes or the owner selects another agent
   or conversation. Reopening the hub shows saved history and current status.
+- The hub keeps the owner's CloudStack login alive server-side for the hub session's lifetime and never signs the owner out because CloudStack was briefly unreachable; only a definitive CloudStack rejection ends the session early.
 - Signing out or expiration of the owner's browser session does not stop accepted
   tasks. A valid human login authorizes submitting instructions; background work
   runs under the agent's own credentials and current native permissions, without

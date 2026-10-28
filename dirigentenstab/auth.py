@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import hmac
 import inspect
+import logging
 import secrets
 import time
 from urllib.parse import parse_qs
@@ -14,6 +16,12 @@ from .cloud import CloudError
 
 COOKIE = 'ds_session'
 NATIVE_POLL_SECONDS = 30
+# CloudStack idles out its own login session after 30 minutes without calls, and a sleeping phone sends none,
+# so the server touches every live session this often to keep the wrapped CloudStack session alive.
+KEEPALIVE_SECONDS = 600
+# During a transient CloudStack outage a session last verified within this window is let through unchanged;
+# beyond it requests fail with a retryable error. The session itself is never deleted for a transient error.
+TRANSIENT_GRACE_SECONDS = 600
 
 
 class Auth:
@@ -75,7 +83,7 @@ class Auth:
         now = time.monotonic()
         if not fresh and now - self.verified.get(hashed, -NATIVE_POLL_SECONDS) < NATIVE_POLL_SECONDS:
             return identity
-        self.verified = {k: t for k, t in self.verified.items() if now - t < NATIVE_POLL_SECONDS}
+        self.verified = {k: t for k, t in self.verified.items() if now - t < TRANSIENT_GRACE_SECONDS}
         try:
             users = await self.service.human_call(identity, 'listUsers', {'id': identity['userid']})
             user = next((u for u in users.get('user', []) if u['id'] == identity['userid']), None)
@@ -87,13 +95,33 @@ class Auth:
                 raise PermissionError('CloudStack account disabled or revoked')
             if int(account.get('accounttype', -1)) != identity['type']:
                 raise PermissionError('CloudStack role changed; log in again')
-        except (PermissionError, CloudError, httpx.HTTPError):
+        except (PermissionError, CloudError, httpx.HTTPError) as exc:
+            if isinstance(exc, httpx.HTTPError) or isinstance(exc, CloudError) and not exc.rejected:
+                # Transient (unreachable, timeout, 5xx): keep the session; do not refresh `verified`.
+                if now - self.verified.get(hashed, -TRANSIENT_GRACE_SECONDS) < TRANSIENT_GRACE_SECONDS:
+                    return identity
+                raise CloudError('CloudStack temporarily unreachable') from None
             self.store.execute('DELETE FROM sessions WHERE token_hash=?', (hashed,))
             if hasattr(self.service, 'close_user_terminal_sessions') and identity.get('userid'):
                 self.service.close_user_terminal_sessions(identity['userid'])
             raise PermissionError('CloudStack session no longer valid') from None
         self.verified[hashed] = now
         return identity
+
+    async def keepalive(self):
+        """Revalidate every live session once; this also keeps its CloudStack session from idling out."""
+        for row in self.store.all('SELECT token_hash FROM sessions WHERE expires>?', (time.time(),)):
+            try:
+                await self.identity_from_session(row['token_hash'], fresh=True)
+            except (PermissionError, CloudError, httpx.HTTPError) as exc:
+                logging.getLogger(__name__).warning('Session keepalive failed: %s', type(exc).__name__)
+            except Exception:
+                logging.getLogger(__name__).exception('Session keepalive crashed')
+
+    async def keepalive_periodically(self, interval=KEEPALIVE_SECONDS):
+        while True:
+            await asyncio.sleep(interval)
+            await self.keepalive()
 
     def csrf(self, token, value):
         session = self.store.one('SELECT csrf FROM sessions WHERE token_hash=? AND expires>?',
