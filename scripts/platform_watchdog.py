@@ -33,6 +33,7 @@ STATE = DIRECTORY / 'state.json'
 PROPERTIES = Path('/etc/cloudstack/agent/agent.properties')
 NOT_UP_SECONDS = 180
 RESTART_INTERVAL = 900
+AGENT_HOST_FIX_INTERVAL = 900
 MAX_ACTIONS = 20
 NFSD_THREADS = Path('/proc/fs/nfsd/threads')
 NFSD_RAISE_INTERVAL = 900
@@ -192,7 +193,8 @@ def plan(data, state, now):
              and now - state['hosts'][h['name']]['not_up_since'] >= NOT_UP_SECONDS]
     if not stuck:
         return steps
-    if data['agent_host'] is not None and not data['agent_host'].startswith(ADDRESS):
+    if (data['agent_host'] is not None and data['agent_host'].partition('@')[0] != ADDRESS
+            and now - state.get('last_agent_host_fix', 0) >= AGENT_HOST_FIX_INTERVAL):
         steps.append(('fix-agent-host', f"agent.properties host={data['agent_host']} -> {ADDRESS}@static"))
     if now - state.get('last_agent_restart', 0) >= RESTART_INTERVAL:
         steps.append(('restart-cloudstack-agent', 'host(s) not Up for 3+ minutes: ' + ', '.join(stuck)))
@@ -218,6 +220,7 @@ def execute(steps, state, now, restart=systemctl_restart):
     for name, detail in steps:
         try:
             if name == 'fix-agent-host':
+                state['last_agent_host_fix'] = now  # set first: a failing write must not be retried every minute
                 result = f'{detail}; ' + fix_agent_host(now)
             elif name == 'raise-nfsd-threads':
                 state['last_nfsd_raise'] = now  # set first: a failing write must not be retried every minute

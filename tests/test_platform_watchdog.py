@@ -125,6 +125,29 @@ def test_agent_properties_fix_backs_up_and_preserves_other_lines():
     assert len(list(wd.PROPERTIES.parent.glob('agent.properties.bak-*'))) == 1
 
 
+def test_agent_host_match_is_exact_on_the_host_part():
+    down = {'nfsd_blocked_runs': 0, 'hosts': {'homeserver': {'not_up_since': NOW - 300}}}
+    wrong_prefix = data(status='Disconnected', agent_host=f'{wd.ADDRESS}0@static')
+    assert [s[0] for s in wd.plan(wrong_prefix, down, NOW)] == ['fix-agent-host', 'restart-cloudstack-agent']
+    assert [s[0] for s in wd.plan(data(status='Disconnected'), down, NOW)] == ['restart-cloudstack-agent']
+    bare = data(status='Disconnected', agent_host=wd.ADDRESS)
+    assert [s[0] for s in wd.plan(bare, down, NOW)] == ['restart-cloudstack-agent']
+
+
+def test_agent_host_fix_rate_limited(paths):
+    d = data(status='Disconnected', agent_host='10.0.0.203@static')
+    run(d, now=NOW)
+    run(d, now=NOW + 180)
+    assert wd.PROPERTIES.read_text().count(wd.ADDRESS) == 1
+    wd.PROPERTIES.write_text('host=10.0.0.203@static\n')
+    status, _ = run(d, now=NOW + 240)
+    assert 'host=10.0.0.203' in wd.PROPERTIES.read_text()
+    assert [a['action'] for a in status['actions']].count('fix-agent-host') == 1
+    run(d, now=NOW + 180 + wd.AGENT_HOST_FIX_INTERVAL)
+    assert wd.PROPERTIES.read_text().startswith(f'host={wd.ADDRESS}@static')
+    assert len(list(wd.PROPERTIES.parent.glob('agent.properties.bak-*'))) == 2
+
+
 def test_no_remediation_for_api_or_system_vm_problems(paths):
     for offset in (0, 300):
         status, restarts = run(data(api=False, vm='Stopped'), now=NOW + offset)
