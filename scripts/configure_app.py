@@ -43,7 +43,7 @@ def configure(args):
     env_path.chmod(0o600)
     values = dotenv_values(env_path)
     origin, api = values['PUBLIC_ORIGIN'], values['CLOUDSTACK_URL']
-    settings = Settings(api, origin)
+    settings = Settings(api, origin, instance_name=values.get('INSTANCE_NAME') or '')
     if urlsplit(origin).scheme != 'https':
         raise SystemExit('PUBLIC_ORIGIN must use HTTPS. See docs/INSTALLATION.md.')
     network = load_network(env_path)

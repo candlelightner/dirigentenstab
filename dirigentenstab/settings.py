@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -37,10 +38,13 @@ class Settings:
     guest_assets: str = '/data/guest-assets'
     gpu_helper_socket: str = ''
     platform_status: str = '/platform/status.json'
+    instance_name: str = ''
 
     def __post_init__(self):
         if type(self.session_seconds) is not int or self.session_seconds <= 0:
             raise ValueError('SESSION_SECONDS must be a positive integer')
+        if not re.fullmatch(r'[a-z0-9-]{0,20}', self.instance_name):
+            raise ValueError('INSTANCE_NAME must be at most 20 lowercase letters, digits or hyphens')
         if self.cloudstack_ui_url:
             self.cloudstack_ui_url = dashboard_endpoint(self.cloudstack_ui_url)
 
@@ -60,4 +64,5 @@ class Settings:
                    cloudstack_ui_url=os.getenv('CLOUDSTACK_UI_URL', ''),
                    guest_assets=os.getenv('GUEST_ASSETS', '/data/guest-assets'),
                    gpu_helper_socket=os.getenv('GPU_HELPER_SOCKET', ''),
-                   platform_status=os.getenv('PLATFORM_STATUS_FILE', '/platform/status.json'))
+                   platform_status=os.getenv('PLATFORM_STATUS_FILE', '/platform/status.json'),
+                   instance_name=os.getenv('INSTANCE_NAME', ''))

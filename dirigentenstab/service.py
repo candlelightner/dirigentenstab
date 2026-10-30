@@ -1468,9 +1468,14 @@ class Service:
                 await self.configure_agent(agent_id, result['id'], settings)
             return result
 
-    async def _provision(self, op, cloud, parent_domain):
+    async def _provision(self, op, cloud, parent_domain, fresh=False):
         op_id = op['id']
         resource = 'ds-global-admin' if op_id == GLOBAL_ADMIN_AGENT else 'ds-' + op_id[:20]
+        instance = getattr(self.settings, 'instance_name', '')
+        if instance and op_id in (APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT):
+            resource += '-' + instance
+        collision = RuntimeError('Another Dirigentenstab installation appears to use this CloudStack; '
+                                 'set INSTANCE_NAME to a unique value and retry')
         account_type = 1 if op_id == GLOBAL_ADMIN_AGENT else 2
         def save(phase, **fields):
             fields = {'phase': phase, 'updated': time.time(), 'error': None, **fields}
@@ -1492,6 +1497,8 @@ class Service:
                 domains = (await cloud.raw('listDomains', {'name': name, 'listall': True})).get('domain', [])
                 domain = next((d for d in domains if d['name'] == name
                                and d.get('parentdomainid') == parent_domain), None)
+                if domain and fresh:
+                    raise collision
                 domain = domain or first(await cloud.raw('createDomain', {'name': name, 'parentdomainid': parent_domain}),
                                          'domain')
                 save('domain', domain_id=domain['id'])
@@ -1500,6 +1507,8 @@ class Service:
                 accounts = (await cloud.raw('listAccounts', {'name': resource, 'domainid': op['domain_id'],
                                                               'listall': True})).get('account', [])
                 account = next((a for a in accounts if a['name'] == resource and a['domainid'] == op['domain_id']), None)
+                if account and fresh:
+                    raise collision
                 if not account:
                     password = uuid.uuid4().hex + uuid.uuid4().hex
                     account = first(await cloud.raw('createAccount', {
@@ -1561,7 +1570,10 @@ class Service:
                 conn.execute('DELETE FROM legacy_agent_credentials WHERE agent_id=?', (op_id,))
             self.store.audit(op['parent_id'] or 'bootstrap', 'create-subgroup', op_id)
             return {'id': op_id, 'name': op['name'], 'domain_id': op['domain_id'], 'model': op['model']}
-        except BaseException:
+        except BaseException as error:
+            if error is collision:
+                self.store.execute('DELETE FROM provisioning WHERE id=?', (op_id,))
+                raise
             self.store.execute('UPDATE provisioning SET error=?,updated=? WHERE id=?',
                                ('Provisioning interrupted; retry using the same parent and name', time.time(), op_id))
             self.store.audit(op['parent_id'] or 'bootstrap', 'create-subgroup', op_id, 'incomplete')
@@ -1575,12 +1587,13 @@ class Service:
         root = next(d for d in (await cloud.raw('listDomains', {'listall': True})).get('domain', [])
                     if d.get('level') == 0)
         op_id = APP_ROOT_AGENT
+        fresh = not self.store.one('SELECT id FROM provisioning WHERE id=?', (op_id,))
         self.store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) '
                            'VALUES(?,NULL,?,?,?,?) ON CONFLICT(id) DO NOTHING',
                            (op_id, 'Agents', '', 'Manage this domain safely. Only the human owner assigns work.',
                             time.time()))
         op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
-        result = await self._provision(op, cloud, root['id'])
+        result = await self._provision(op, cloud, root['id'], fresh)
         await self.provision_global_admin(cloud=cloud, root=root)
         return result
 
@@ -1605,6 +1618,7 @@ class Service:
         async with self._provision_lock:
             main = self.store.one('SELECT * FROM agents WHERE id=?', (APP_ROOT_AGENT,))
             provider = self.store.one('SELECT id,default_model FROM providers ORDER BY id LIMIT 1')
+            fresh = not self.store.one('SELECT id FROM provisioning WHERE id=?', (GLOBAL_ADMIN_AGENT,))
             self.store.execute('INSERT INTO provisioning(id,parent_id,name,domain_id,provider_id,model,instructions,updated) '
                                'VALUES(?,NULL,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
                                (GLOBAL_ADMIN_AGENT, 'Global Admin', root['id'],
@@ -1613,7 +1627,7 @@ class Service:
                                 'Manage CloudStack globally using your own native root administrator identity. '
                                 'Only the human owner assigns work.', time.time()))
             op = self.store.one('SELECT * FROM provisioning WHERE id=?', (GLOBAL_ADMIN_AGENT,))
-            return await self._provision(op, cloud, root['id'])
+            return await self._provision(op, cloud, root['id'], fresh)
 
     @staticmethod
     def _native_pair(available, agent, *, key_id=None, credentials=None):
