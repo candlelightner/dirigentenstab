@@ -1061,3 +1061,31 @@ async def test_unknown_main_pane_query_ids_fall_back_to_default_agent():
             await user.open('/?' + query)
             await user.should_see('Configure')
             await user.should_not_see('Console')
+
+
+async def test_outage_on_page_load_shows_retry_state_not_login():
+    from dirigentenstab.cloud import CloudError
+
+    class Auth:
+        async def identity(self, token):
+            return {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+
+    class Service(AgentCapabilities):
+        error = CloudError('CloudStack temporarily unreachable')
+
+        async def hierarchy(self, current):
+            raise self.error
+
+    class Runtime:
+        async def start(self):
+            pass
+
+    service = Service()
+    async with user_simulation() as user:
+        build_ui(service, Auth(), Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        await user.should_see('CloudStack unreachable, retrying')
+        service.error = CloudError('bad account', rejected=True)
+        await user.open('/')
+        await user.should_not_see('CloudStack unreachable')

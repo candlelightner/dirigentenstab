@@ -5,7 +5,8 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
 
-from dirigentenstab.auth import Auth
+from dirigentenstab.auth import (GLOBAL_LOGIN_ATTEMPTS, KEEPALIVE_SECONDS, TRANSIENT_GRACE_SECONDS, USER_LOGIN_ATTEMPTS,
+                                 Auth)
 from dirigentenstab.cloud import CloudError
 from dirigentenstab.store import Store
 
@@ -202,10 +203,10 @@ async def test_session_expiration_and_persistent_login_rate_limit(store):
         await auth.identity('expired')
     for _ in range(8):
         with pytest.raises(PermissionError, match='Invalid login'):
-            await auth.login('', '', '/', 'test-address')
+            await auth.login('', '', '/')
     restarted = Auth(app)
     with pytest.raises(PermissionError, match='Too many'):
-        await restarted.login('', '', '/', 'test-address')
+        await restarted.login('', '', '/')
 
 
 @pytest.mark.parametrize('raw,expected', [(None, 3600), ('43200', 43200), ('0', None),
@@ -391,7 +392,48 @@ async def test_transient_failure_allows_recently_verified_session_only(store, mo
     down.append(1)
     clock[0] += 60
     assert (await auth.identity('live'))['userid'] == 'person'
-    clock[0] += 600
+    clock[0] += TRANSIENT_GRACE_SECONDS
     with pytest.raises(CloudError):
         await auth.identity('live')
     assert store.one('SELECT 1 FROM sessions WHERE token_hash=?', (auth.digest('live'),))
+
+
+def test_grace_covers_at_least_two_keepalives():
+    assert TRANSIENT_GRACE_SECONDS >= 2 * KEEPALIVE_SECONDS
+
+
+async def test_tab_woken_after_one_failed_keepalive_still_has_grace(store, monkeypatch):
+    clock, down = [1000.0], []
+
+    async def human_call(identity, command, params):
+        if down:
+            raise httpx.ConnectError('down')
+        return await _ok()(identity, command, params)
+    monkeypatch.setattr('dirigentenstab.auth.time.monotonic', lambda: clock[0])
+    auth = _session_auth(store, human_call)
+    await auth.identity('live')
+    down.append(1)
+    clock[0] += KEEPALIVE_SECONDS  # the next keepalive fails; the tab wakes just after it
+    await auth.keepalive()
+    clock[0] += 1
+    assert (await auth.identity('live'))['userid'] == 'person'
+
+
+async def test_failed_logins_lock_out_per_user_not_per_client(store):
+    auth = Auth(SimpleNamespace(store=store))
+    for _ in range(USER_LOGIN_ATTEMPTS):
+        with pytest.raises(PermissionError, match='Invalid login'):
+            await auth.login('', '', '/')
+    with pytest.raises(PermissionError, match='Too many'):
+        await auth.login('', '', '/')
+    with pytest.raises(PermissionError, match='Invalid login'):  # another user is unaffected
+        await auth.login('', 'x', 'other')
+
+
+async def test_global_login_cap_limits_spread_guessing(store):
+    auth = Auth(SimpleNamespace(store=store))
+    for n in range(GLOBAL_LOGIN_ATTEMPTS):
+        with pytest.raises(PermissionError, match='Invalid login'):
+            await auth.login('', '', 'd%d' % n)
+    with pytest.raises(PermissionError, match='Too many'):
+        await auth.login('', '', 'fresh')

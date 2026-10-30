@@ -12,7 +12,8 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 from websockets.sync.server import serve
 
-from dirigentenstab.auth import SessionGuard
+from dirigentenstab.auth import Auth, SessionGuard
+from dirigentenstab.cloud import CloudError
 from dirigentenstab.console import ConsoleProxy, _NoRedirectConnect
 
 
@@ -35,7 +36,7 @@ def setup():
 
     service = SimpleNamespace(store=store, settings=SimpleNamespace(origin='https://app.example:3001'),
                               vm_console_url=native)
-    proxy = ConsoleProxy(service)
+    proxy = ConsoleProxy(service, Auth(service))
 
     async def identity(token):
         if token not in store.sessions:
@@ -350,3 +351,40 @@ def test_unexpected_console_end_is_logged_as_warning(setup, caplog):
         server.shutdown()
     ended = [r for r in caplog.records if 'session ended' in r.message]
     assert [(r.levelname, 'upstream-closed' in r.getMessage()) for r in ended] == [('WARNING', True)]
+
+
+def test_cloudstack_blip_ends_console_without_raising(setup, monkeypatch, caplog):
+    proxy, app, path, _ = setup
+    ticket = path.split('/')[2]
+    monkeypatch.setattr('dirigentenstab.console.SESSION_POLL_SECONDS', 0.01)
+    monkeypatch.setattr('dirigentenstab.console.NATIVE_POLL_SECONDS', 0.01)
+
+    async def beyond_grace(session, fresh=False):
+        raise CloudError('CloudStack temporarily unreachable')
+    proxy.auth.identity_from_session = beyond_grace
+    with echo_server() as (port, _, closed), TestClient(app, base_url='https://app.example:3001') as client:
+        proxy.grants[ticket].websocket = f'ws://127.0.0.1:{port}/websockify?token=native-secret'
+        client.cookies.set('ds_session', 'one')
+        with client.websocket_connect('/vm-console/' + ticket + '/ws', headers={'origin': 'https://app.example:3001'},
+                                     subprotocols=['binary']) as ws:
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_bytes()
+        assert closed.wait(timeout=2)
+    assert any('error CloudError' in r.getMessage() for r in caplog.records)
+
+
+async def test_console_uses_shared_auth_so_grace_applies():
+    auth = Auth(SimpleNamespace(store=Store()))
+    assert ConsoleProxy(SimpleNamespace(), auth).auth is auth
+
+
+def test_guard_answers_cloudstack_outage_with_retry_page_not_login():
+    async def down(token):
+        raise CloudError('CloudStack temporarily unreachable')
+    app = FastAPI()
+    app.add_middleware(SessionGuard, auth=SimpleNamespace(identity=down), origin='https://app.example:3001')
+    app.get('/')(lambda: 'home')
+    with TestClient(app, base_url='https://app.example:3001', follow_redirects=False) as client:
+        page = client.get('/')
+        assert page.status_code == 503 and 'retrying' in page.text and 'refresh' in page.text
+        assert client.get('/api').status_code == 503

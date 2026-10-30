@@ -111,6 +111,8 @@ users. There is no new hub account or registration system.
 - Work continues when the browser closes or the owner selects another agent
   or conversation. Reopening the hub shows saved history and current status.
 - The hub keeps the owner's CloudStack login alive server-side for the hub session's lifetime and never signs the owner out because CloudStack was briefly unreachable; only a definitive CloudStack rejection ends the session early.
+  Revalidation is retried every 5 minutes and an unreachable CloudStack is tolerated for 15 minutes since the last success. Reloading during an outage shows a "CloudStack unreachable, retrying" page that retries on its own, never the sign-in page, and open VM consoles stay up within that window.
+- Failed sign-ins are limited to 8 per account per 15 minutes and 40 in total; the client IP is not used because the hub sits behind a shared proxy address.
 - Signing out or expiration of the owner's browser session does not stop accepted
   tasks. A valid human login authorizes submitting instructions; background work
   runs under the agent's own credentials and current native permissions, without
