@@ -19,6 +19,7 @@ from .settings import endpoint, dashboard_endpoint
 from .diagnostics import OperationError
 from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
+from .auth import NATIVE_POLL_SECONDS
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 from . import platform_status
 
@@ -44,6 +45,7 @@ class Service:
         self._deploy_lock = asyncio.Lock()
         self._secrets = set()
         self._terminal_sessions = {}
+        self._visible_domains = {}
         self.gpu_local = False
         self.gpu_deployment_id = None
         for row in store.all('SELECT credentials FROM agents UNION ALL SELECT credentials FROM legacy_agent_credentials'):
@@ -866,9 +868,11 @@ class Service:
         allowed = all(member['escalation_requests_enabled'] for member in chain[:-1])
         return {'selected': selected, 'allowed': allowed, 'enabled': selected and allowed}
 
-    def _escalation_request(self, row):
-        return self.redact({**row, 'params': self.store.open(row['params']),
-                            'result': self.store.open(row['result']) if row['result'] else None})
+    def _escalation_request(self, row, owner=False):
+        # Agent-facing by default (redacted); the owner's decision view shows the exact params that will run.
+        params = self.store.open(row['params'])
+        shown = self.redact({**row, 'params': params, 'result': self.store.open(row['result']) if row['result'] else None})
+        return {**shown, 'params': params} if owner else shown
 
     async def request_escalation(self, agent_id, description, reason, command, params, *, conversation_id, run_id, call_id):
         agent = await self.agent(agent_id)
@@ -925,9 +929,15 @@ class Service:
     async def list_escalation_requests(self, identity):
         if identity.get('_agent_id') or identity.get('type') != 1:
             raise PermissionError('Escalation decisions require the human platform administrator')
-        domains = (await self.human_call(identity, 'listDomains', {'listall': 'true'})).get('domain', [])
-        visible = {domain['id'] for domain in domains}
-        return [self._escalation_request(row) for row in self.store.all(
+        now, session = time.monotonic(), identity.get('_session')
+        cached = self._visible_domains.get(session)
+        if not cached or cached[0] < now:
+            domains = (await self.human_call(identity, 'listDomains', {'listall': 'true'})).get('domain', [])
+            self._visible_domains = {key: value for key, value in self._visible_domains.items() if value[0] >= now}
+            # Polled every second per tab; keep the TTL equal to the native session re-check interval.
+            cached = self._visible_domains[session] = (now + NATIVE_POLL_SECONDS, {domain['id'] for domain in domains})
+        visible = cached[1]
+        return [self._escalation_request(row, owner=True) for row in self.store.all(
             'SELECT r.*,a.name AS agent_name,a.domain_id FROM escalation_requests r '
             'JOIN agents a ON a.id=r.agent_id WHERE r.human_id=? ORDER BY r.created DESC',
             (identity['userid'],)) if row['domain_id'] in visible]

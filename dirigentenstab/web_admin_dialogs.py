@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import math
 
@@ -49,7 +51,15 @@ def setup_admin_dialogs(ctx):
             ui.label('Goal: ' + row['description']).classes('w-full whitespace-pre-wrap break-words font-semibold')
             ui.label('Permission needed: ' + row['reason']).classes('w-full whitespace-pre-wrap break-words text-sm')
             ui.label(row['command']).classes('w-full font-mono font-semibold break-all')
-            ui.label(json.dumps(row['params'], indent=2, ensure_ascii=False)).classes(
+            params = dict(row['params'])
+            userdata = params.get('userdata')
+            if isinstance(userdata, str):
+                try:
+                    params['userdata'] = base64.b64decode(userdata, validate=True).decode()
+                    ui.label('userdata is shown decoded from base64').classes('text-xs font-semibold')
+                except (binascii.Error, UnicodeDecodeError):
+                    ui.label('userdata is not valid base64 text; shown as sent').classes('text-xs font-semibold')
+            ui.label(json.dumps(params, indent=2, ensure_ascii=False)).classes(
                 'w-full whitespace-pre-wrap break-all font-mono text-xs')
             if row['status'] == 'pending':
                 with ui.row():
