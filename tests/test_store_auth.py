@@ -69,9 +69,9 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     credentials = store.seal({'id': 'retained-key', 'apikey': 'same-api-key'})
     old_provisioning = store.seal({'id': 'archived-key', 'secretkey': 'legacy-secret'})
     mcp_token = store.seal('private-mcp-credential')
-    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model,instructions,can_provision) '
-                  'VALUES(?,?,?,?,?,?,?,?,?)',
-                  ('agent', 'Preserved agent', 'domain', 'account', 'user', credentials, 'model-id', 'Custom prompt', 1))
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model,instructions) '
+                  'VALUES(?,?,?,?,?,?,?,?)',
+                  ('agent', 'Preserved agent', 'domain', 'account', 'user', credentials, 'model-id', 'Custom prompt'))
     store.execute('INSERT INTO mcp_servers(id,name,url,token) VALUES(?,?,?,?)',
                   ('search', 'Search', 'https://search.example/mcp', mcp_token))
     store.execute('INSERT INTO mcp_assignments VALUES(?,?,?)', ('agent', 'search', '["web_search"]'))
@@ -92,9 +92,9 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
     agent = reopened.one('SELECT * FROM agents')
     assert agent['credentials'] == credentials and not {'runtime', 'provisioning'} & agent.keys()
-    assert {key: agent[key] for key in ('id', 'name', 'domain_id', 'account_id', 'user_id', 'model', 'instructions', 'can_provision')} == {
+    assert {key: agent[key] for key in ('id', 'name', 'domain_id', 'account_id', 'user_id', 'model', 'instructions')} == {
         'id': 'agent', 'name': 'Preserved agent', 'domain_id': 'domain', 'account_id': 'account', 'user_id': 'user',
-        'model': 'model-id', 'instructions': 'Custom prompt', 'can_provision': 1}
+        'model': 'model-id', 'instructions': 'Custom prompt'}
     assert reopened.one('SELECT credentials FROM legacy_agent_credentials WHERE agent_id=?', ('agent',))['credentials'] == old_provisioning
     assert reopened.one('SELECT token FROM mcp_servers')['token'] == mcp_token
     assert reopened.one('SELECT * FROM mcp_assignments') == {

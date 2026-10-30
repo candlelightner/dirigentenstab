@@ -35,9 +35,9 @@ def add_parent(store):
                   ('provider', 'Local', 'chat', 'http://inference/v1', store.seal('provider-secret'), 'default'))
     credentials = {'id': 'old-key', 'apikey': 'parent-api', 'secretkey': 'parent-secret'}
     store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,'
-                  'model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                  'model,instructions) VALUES(?,?,?,?,?,?,?,?,?)',
                   ('parent', 'Parent', 'parent-domain', 'parent-account', 'parent-user',
-                   store.seal(credentials), 'provider', 'parent-model', 'Parent instructions', 1))
+                   store.seal(credentials), 'provider', 'parent-model', 'Parent instructions'))
     return credentials
 
 
@@ -79,8 +79,7 @@ async def test_invalid_thinking_level_cannot_partially_change_agent_configuratio
     service.authorize = authorize
     before = await service.agent('parent')
     with pytest.raises(ValueError, match='Invalid thinking level'):
-        await service.update_agent({'userid': 'owner', 'type': 1}, 'parent', 'provider', 'changed', 'changed',
-                                   can_provision=False, thinking=thinking)
+        await service.update_agent({'userid': 'owner', 'type': 1}, 'parent', 'provider', 'changed', 'changed', thinking=thinking)
     assert await service.agent('parent') == before
 
 
@@ -433,7 +432,7 @@ async def test_provisioning_resumes_with_one_native_pair_and_no_permission_rules
     assert child == await service.create_subgroup('parent', 'Research')
     row = store.one('SELECT * FROM agents WHERE id=?', (child['id'],))
     assert row['provider_id'] == 'provider' and row['model'] == 'parent-model'
-    assert row['instructions'] == 'Parent instructions' and row['can_provision'] == 1
+    assert row['instructions'] == 'Parent instructions'
     assert 'runtime' not in row and 'provisioning' not in row
     assert store.open(row['credentials'])['id'] in cloud.keys
     counts = collections.Counter(command for command, _ in cloud.calls)
@@ -1157,7 +1156,6 @@ async def test_private_template_ownership_recovery_and_managed_clone_approval(st
 
 async def test_managed_agent_feature_gate_does_not_override_native_infrastructure_grants(store):
     add_parent(store)
-    store.execute('UPDATE agents SET can_provision=0 WHERE id=?', ('parent',))
     service = Service(store, SimpleNamespace(max_output=65536))
     class NativeGrant:
         async def catalogue(self, *, refresh=False):
