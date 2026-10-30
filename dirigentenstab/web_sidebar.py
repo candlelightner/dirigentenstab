@@ -192,11 +192,16 @@ def setup_sidebar(ctx):
     ctx.refresh = refresh
 
     async def select_node(event):
-        if ctx.selection_lock.locked() or not event.value:
+        value = event.value
+        if not value and (event.previous_value or '').startswith('agent:'):
+            # Quasar unselects a re-clicked node: keep the agent highlighted and treat it as a re-selection.
+            value = ctx.tree.props['selected'] = event.previous_value
+            ctx.tree.update()
+        if ctx.selection_lock.locked() or not value:
             return
-        if 'Agents' not in (ctx.sidebar_select.value or []) and not event.value.startswith(('vm:', 'skill:')):
+        if 'Agents' not in (ctx.sidebar_select.value or []) and not value.startswith(('vm:', 'skill:')):
             return
-        kind, identifier = event.value.split(':', 1)
+        kind, identifier = value.split(':', 1)
         if kind == 'agent':
             if identifier != state.get('requested_agent', state['agent']) or ctx.terminal_pane.visible:
                 await ctx.show_agent(identifier)

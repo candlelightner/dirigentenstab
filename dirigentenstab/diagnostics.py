@@ -66,6 +66,9 @@ class OperationError(ValueError):
         super().__init__(f'{description} Reference: {operation_id}')
 
 
+SESSION_FAILURE = re.compile(r'session|log in|sign in|role changed', re.I)
+
+
 def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation=False):
     if isinstance(exc, OperationError):
         return exc
@@ -77,6 +80,8 @@ def diagnose(exc, *, operation_id=None, agent_id=None, tool=None, reconciliation
         category, description = 'authorization', 'Access denied or session expired. Sign in again if needed.'
         if str(exc) in {'API unavailable to this CloudStack identity and API key', 'API not available to this identity'}:
             description, detail = 'CloudStack does not permit this API for this agent’s current account and API key.', ''
+        elif str(exc) and not SESSION_FAILURE.search(str(exc)):
+            description, detail = detail.rstrip('.') + '.', ''  # a specific refusal, not a session or sign-in failure
     elif isinstance(exc, CloudError):
         category = 'cloudstack'
         description = ('CloudStack rejected the operation. Check permissions, resource limits and parameters.'

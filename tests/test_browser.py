@@ -162,6 +162,14 @@ async def click_tree_node(page, name):
     node = page.locator('.q-tree').get_by_text(name, exact=True)
     await node.wait_for()
     await tree_settled(page)
+    # tree_settled can pass before the server applies the search filter: the nodes then sit inside clipped, still
+    # expanding slide containers (rect is non-empty, but hit-testing reaches the search field or status label beneath).
+    # Click only once the node is scrolled within the scroll area, hit-testable and has stopped moving.
+    await node.evaluate('el => el.scrollIntoView({block: "center"})')
+    await page.wait_for_function(
+        """el => { const r = el.getBoundingClientRect(), at = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+            const key = r.x + ':' + r.y, stable = el.__clickKey === key; el.__clickKey = key;
+            return stable && at && el.contains(at); }""", arg=await node.element_handle())
     await node.click()
 
 
@@ -339,12 +347,19 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
                 raise
             assert (await message.bounding_box())['x'] < 60
             assert await page.evaluate('window.scrollY === 0')
+        await select_agent(page, 'Team 2 Level 3')  # re-selecting the open agent closes the drawer too
         await open_configuration(page)
         model = page.get_by_label('Model ID', exact=True)
         await page.get_by_text('2 models available.', exact=False).wait_for()
+        provider = page.get_by_label('Model provider', exact=True)
+        await playwright.expect(model).to_have_value('fixture-model')
+        for name, expected, value in [('Empty', 'No models discovered', ''), ('Local fixture', '2 models available', 'fixture-model')]:
+            await provider.click()  # a model that is the previous provider's default follows the provider
+            await page.get_by_role('option', name=name, exact=True).click()
+            await page.get_by_text(expected, exact=False).last.wait_for()
+            await playwright.expect(model).to_have_value(value)
         await model.fill('custom-private-model')
         await model.press('Enter')
-        provider = page.get_by_label('Model provider', exact=True)
         for name, expected in [('Unsupported', 'custom Model ID'), ('Empty', 'No models discovered'),
                                ('Unauthorized', 'rejected authentication'), ('Local fixture', '2 models available')]:
             await provider.click()

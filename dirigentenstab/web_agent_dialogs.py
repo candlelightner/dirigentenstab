@@ -430,6 +430,8 @@ def setup_agent_dialogs(ctx):
             compaction_provider.on_value_change(lambda: protect(load_compaction_models))
             ui.timer(0.01, lambda: protect(load_compaction_models), once=True)
 
+            previous_provider = [provider.value]
+
             async def load_models():
                 selected_provider = provider.value
                 model.props('loading')
@@ -438,7 +440,11 @@ def setup_agent_dialogs(ctx):
                     choices = await runtime.models(await actor(), selected_provider) if selected_provider else []
                     if provider.value != selected_provider:
                         return
-                    selected_model = model.value or default_models.get(selected_provider) or None
+                    # A model equal to the previous provider's default is not a custom choice: follow the provider.
+                    selected_model = model.value
+                    if not selected_model or selected_model == default_models.get(previous_provider[0]):
+                        selected_model = default_models.get(selected_provider) or None
+                    previous_provider[0] = selected_provider
                     model.set_options(list(dict.fromkeys(([selected_model] if selected_model else []) + choices)),
                                       value=selected_model)
                     model_status.set_text(f'{len(choices)} models available. Custom IDs can be entered.' if choices

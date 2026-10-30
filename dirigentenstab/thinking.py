@@ -16,11 +16,13 @@ OPENAI_RESPONSE_LEVELS = {
     'gpt-6-luna': ('none', 'low', 'medium', 'high', 'xhigh', 'max'),
 }
 CHANNEL_THOUGHT = re.compile(r'<\|channel>thought.*?<channel\|>|<\|channel>(?:thought)?|<channel\|>', re.S)
+TOOL_CALL = re.compile(r'<\|tool_?call>.*?(?:<tool_?call\|>|$)', re.S)
 
 
 def visible_text(text):
-    """Drop Gemma channel reasoning (`<|channel>thought ... <channel|>`) and stray channel markers."""
-    return CHANNEL_THOUGHT.sub('', text).strip()
+    """Drop Gemma channel reasoning (`<|channel>thought ... <channel|>`), stray channel markers and tool-call markup
+    (`<|toolcall>call:name{...}<toolcall|>`, or unterminated to the end)."""
+    return TOOL_CALL.sub('', CHANNEL_THOUGHT.sub('', text)).strip()
 
 
 def _deepseek(provider):
