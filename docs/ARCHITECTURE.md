@@ -20,6 +20,10 @@ There are no task duration, request-count, tool-count or spending budgets. A sem
 
 CloudMonkey runs directly through `asyncio.create_subprocess_exec`, never a host shell. Temporary credential configuration is mode 600 in tmpfs and removed after execution. API names and parameter shapes are validated against the calling account's live catalogue; local file expansion and transport credential overrides are blocked. Async job IDs are polled under the same identity. Responses are bounded and redacted. The audit log records actor, operation, target, time and outcome without plaintext parameters or credentials.
 
+## Named secrets
+
+The `secrets` table holds Fernet-sealed values keyed by name; `agents.enabled_secrets` lists the names granted to each agent. Effective access is the intersection along the ancestor chain, like providers, except an unset selection grants nothing. `Service.expand_secrets` resolves `{{secret:NAME}}` placeholders at execution time for `run_vm_command` (`env`) and `write_vm_secret_file`; `Guest` sends the expanded script or file content over SSH stdin. `Service.redact` also scrubs each value's base64 and URL-encoded forms, so everything passing through the existing tool-result, history and event redaction is covered.
+
 ## Optional MCP tools
 
 Human administrators authorized for the main agent domain register HTTPS Streamable HTTP endpoints with encrypted bearer credentials. Per-agent exact tool-name assignments are intersected with each ancestor's assignments using live CloudStack parent links. Parents can narrow descendant grants without editing central endpoint credentials. New agents inherit their parent’s provider and exact MCP tool selections. Effective provider/tool access is intersected along the native domain ancestry; disabling ancestor access preserves descendant selections.

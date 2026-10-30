@@ -25,7 +25,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 22
+    assert reopened.one('PRAGMA user_version')['user_version'] == 23
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -42,6 +42,8 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('ALTER TABLE agents ADD COLUMN provisioning BLOB NOT NULL')
     store.execute("ALTER TABLE agents ADD COLUMN runtime_policy TEXT NOT NULL DEFAULT '[]'")
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    store.execute('DROP TABLE secrets')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
@@ -85,6 +87,8 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
         store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    store.execute('DROP TABLE secrets')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
@@ -114,6 +118,8 @@ def test_thinking_migration_preserves_credentials_and_conversations_with_model_d
         store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN thinking')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    store.execute('DROP TABLE secrets')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
@@ -289,6 +295,8 @@ def test_escalation_migration_preserves_single_queue_ciphertext_decisions_and_hi
         store.execute('ALTER TABLE escalation_requests DROP COLUMN ' + column)
     store.execute('ALTER TABLE escalation_requests RENAME TO compute_offering_requests')
     store.execute('ALTER TABLE agents RENAME COLUMN escalation_requests_enabled TO compute_offering_requests_enabled')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    store.execute('DROP TABLE secrets')
     store.execute('PRAGMA user_version=17')
     credentials, params = store.seal({'apikey': 'legacy-key'}), store.seal({'name': 'Legacy', 'domainid': 'owned'})
     result = store.seal({'serviceoffering': {'id': 'created-offering'}})

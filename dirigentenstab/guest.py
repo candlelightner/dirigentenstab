@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import asyncssh
 
 MAX_FILE = 8 * 1024 * 1024
 MAX_ASSET = 512 * 1024 * 1024
+ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
 
 
 class OutputLimit(Exception):
@@ -100,11 +102,23 @@ class Guest:
             preferred_auth=['publickey'], connect_timeout=10, login_timeout=10,
         )
 
-    async def run_vm_command(self, agent_id: str, vm_id: str, command: str, timeout: int = 120):  # noqa: ASYNC109
+    async def run_vm_command(self, agent_id: str, vm_id: str, command: str, timeout: int = 120,  # noqa: ASYNC109
+                             env: dict | None = None, *, _stdin: str | None = None):
         if not isinstance(command, str) or not command.strip() or len(command) > 32768 or '\0' in command:
             raise ValueError('Command must contain 1–32768 characters without NUL')
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 600:
             raise ValueError('Timeout must be between 1 and 600 seconds')
+        if env:
+            if (not isinstance(env, dict) or len(env) > 32 or any(
+                    not isinstance(key, str) or not ENV_NAME.fullmatch(key) or not isinstance(value, str)
+                    for key, value in env.items())):
+                raise ValueError('env must map up to 32 variable names to strings')
+            # The script travels over stdin, so expanded secrets never appear in a process list on either side.
+            exports = ''
+            for key, value in env.items():
+                exports += f'export {key}={shlex.quote(await self.service.expand_secrets(agent_id, value))}\n'
+            _stdin = exports + command
+            command = 'sh -c \'eval "$(cat)"\''
         output = {'stdout': bytearray(), 'stderr': bytearray()}
         result = {'exit_code': None, 'stdout': '', 'stderr': '', 'timeout': False, 'error': None, 'executed': False}
         limit = self.service.settings.max_output
@@ -122,6 +136,9 @@ class Guest:
                 async with self._connection(address, record) as connection:
                     async with connection.create_process(command, encoding=None) as process:
                         result['executed'] = True
+                        if _stdin is not None:
+                            process.stdin.write(_stdin.encode())
+                            process.stdin.write_eof()
                         tasks = [asyncio.create_task(drain(process.stdout, 'stdout')),
                                  asyncio.create_task(drain(process.stderr, 'stderr')),
                                  asyncio.create_task(process.wait_closed())]
@@ -147,6 +164,17 @@ class Guest:
         result.update({name: value.decode('utf-8', errors='replace') for name, value in output.items()})
         self.service.store.audit(agent_id, 'run_vm_command', vm_id, 'error' if result['error'] else 'ok')
         return self.service.redact(result)
+
+    async def write_vm_secret_file(self, agent_id: str, vm_id: str, path: str, content: str):
+        """Write content with {{secret:NAME}} placeholders to a mode 600 file on an enrolled VM, fed through stdin."""
+        if (not isinstance(path, str) or not isinstance(content, str) or not 1 <= len(path) <= 1024 or '\0' in path
+                or not path.startswith(('/', '~/')) or len(content) > MAX_FILE):
+            raise ValueError('Path must be absolute or start with ~/ and content must fit the transfer limit')
+        content = await self.service.expand_secrets(agent_id, content)
+        script = ('umask 077; p=$1; case $p in "~/"*) p=$HOME/${p#"~/"};; esac; '
+                  'mkdir -p "$(dirname "$p")" && cat > "$p" && chmod 600 "$p"')
+        result = await self.run_vm_command(agent_id, vm_id, f'sh -c {shlex.quote(script)} sh {shlex.quote(path)}', _stdin=content)
+        return {**result, 'path': path, 'bytes': len(content.encode())} if result['exit_code'] == 0 else result
 
     def _workspace(self, agent_id):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', agent_id):

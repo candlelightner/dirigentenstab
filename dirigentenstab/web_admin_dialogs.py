@@ -210,6 +210,30 @@ def setup_admin_dialogs(ctx):
             request_limit = ui.number('Open escalation requests per agent', value=service.escalation_request_limit(),
                                       min=1, step=1, precision=0).classes('w-full')
             ui.label('Global limit across all conversations. Pending requests and commands being applied count as open.').classes('text-sm')
+            ui.separator()
+            ui.label('Secrets').classes('font-semibold')
+            ui.label('Write-only named values injected by the hub into VM commands and files; agents see names only. '
+                     'Granting is per agent in its settings. Setting an existing name replaces its value.').classes('text-sm')
+            secret_name = ui.select(service.secret_names(), label='Secret name', with_input=True,
+                                    new_value_mode='add-unique').classes('w-full').mark('secret-name')
+            secret_value = ui.input('Value (never shown again)', password=True, password_toggle_button=True).classes('w-full').mark('secret-value')
+
+            async def set_secret():
+                service.save_secret(await actor(), secret_name.value or '', secret_value.value or '')
+                secret_value.set_value('')
+                secret_name.set_options(service.secret_names(), value=secret_name.value)
+                ui.notify('Secret saved.', type='positive')
+
+            async def delete_secret():
+                service.delete_secret(await actor(), secret_name.value or '')
+                secret_name.set_options(service.secret_names(), value=None)
+                secret_value.set_value('')
+                ui.notify('Secret deleted.', type='positive')
+            with ui.row().classes('w-full gap-2'):
+                ui.button('Set secret', on_click=lambda: protect(set_secret)).props('outline').mark('set-secret')
+                ui.button('Delete secret', on_click=lambda: protect(delete_secret), color='negative').props('flat').mark('delete-secret')
+            ui.separator()
+
             async def save():
                 actor_identity = await actor()
                 if (type(request_limit.value) not in {int, float} or not math.isfinite(request_limit.value)

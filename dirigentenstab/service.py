@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 import httpx
 
@@ -24,6 +24,8 @@ from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
 from . import platform_status
 
 _UNSET = object()
+SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
+SECRET_PLACEHOLDER = re.compile(r'\{\{secret:([A-Za-z_][A-Za-z0-9_]{0,63})\}\}')
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
 DEFAULT_INSTRUCTIONS = '''\
@@ -114,6 +116,16 @@ class Service:
             self._remember(token)
             if token:
                 self._remember('Bearer ' + token)
+        for row in store.all('SELECT value FROM secrets'):
+            self._remember_secret(store.open(row['value']))
+
+    def _remember_secret(self, value):
+        """Scrub a named secret and its base64 and URL-encoded forms from everything shown to models."""
+        raw = value.encode()
+        for form in (value, base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode(),
+                     base64.b64encode(raw).decode().rstrip('='), base64.urlsafe_b64encode(raw).decode().rstrip('='),
+                     quote(value, safe=''), quote_plus(value)):
+            self._remember(form)
 
     def _remember(self, value):
         if isinstance(value, str):
@@ -263,8 +275,9 @@ class Service:
                 'available_api_names': sorted(catalogue),
                 'approved_guest_assets': await self.guest_assets(agent['id']),
                 'skills': await self.list_skills({'_agent_id': agent['id']}),
+                'secret_names': sorted(await self.effective_secrets(agent)),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
-                          'run_vm_command', 'transfer_vm_file', 'configure_agent',
+                          'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file', 'configure_agent',
                           'list_skills', 'get_skill', 'save_skill', 'share_skill']
                          + (['request_escalation', 'request_skill_global', 'remove_skill'] if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
@@ -721,6 +734,55 @@ class Service:
             allowed &= self.selected_providers(member)
         return allowed
 
+    def secret_names(self):
+        return sorted(row['name'] for row in self.store.all('SELECT name FROM secrets'))
+
+    def selected_secrets(self, agent):
+        # Unlike providers, an unset selection grants nothing: a new secret is never exposed by default.
+        return set(json.loads(agent['enabled_secrets'])) if agent.get('enabled_secrets') else set()
+
+    async def effective_secrets(self, agent):
+        chain = await self.agent_chain(agent)
+        allowed = self.selected_secrets(chain[0])
+        for member in chain[1:]:
+            allowed &= self.selected_secrets(member)
+        return allowed & set(self.secret_names())
+
+    def save_secret(self, identity, name, value):
+        if identity.get('_agent_id') or identity['type'] != 1:
+            raise PermissionError('Secrets require platform administrator')
+        if not isinstance(name, str) or not SECRET_NAME.fullmatch(name):
+            raise ValueError('Secret names use letters, digits and underscores, up to 64 characters')
+        if not isinstance(value, str) or not 8 <= len(value) <= 65536:
+            raise ValueError('Secret values must be 8 to 65536 characters')
+        self._remember_secret(value)
+        self.store.execute('INSERT INTO secrets(name,value,updated) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE '
+                           'SET value=excluded.value,updated=excluded.updated', (name, self.store.seal(value), time.time()))
+        self.store.audit(identity['userid'], 'save-secret', name)
+
+    def delete_secret(self, identity, name):
+        if identity.get('_agent_id') or identity['type'] != 1:
+            raise PermissionError('Secrets require platform administrator')
+        self.store.execute('DELETE FROM secrets WHERE name=?', (name,))
+        for row in self.store.all('SELECT id,enabled_secrets FROM agents WHERE enabled_secrets IS NOT NULL'):
+            self.store.execute('UPDATE agents SET enabled_secrets=? WHERE id=?',
+                               (json.dumps([n for n in json.loads(row['enabled_secrets']) if n != name]), row['id']))
+        self.store.audit(identity['userid'], 'delete-secret', name)
+
+    async def expand_secrets(self, agent_id, text):
+        """Replace {{secret:NAME}} with granted values at execution time; unknown or ungranted names fail closed."""
+        names = set(SECRET_PLACEHOLDER.findall(text))
+        if not names:
+            return text
+        granted = await self.effective_secrets(await self.agent(agent_id))
+        values = {}
+        for name in names:
+            row = self.store.one('SELECT value FROM secrets WHERE name=?', (name,)) if name in granted else None
+            if not row:
+                raise PermissionError(f'Secret {name} is unknown or not granted to this agent')
+            values[name] = self.store.open(row['value'])
+        return SECRET_PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+
     async def providers(self, identity):
         if identity['type'] not in {1, 2}:
             raise PermissionError('Administrator required')
@@ -736,6 +798,15 @@ class Service:
         chain = await self.agent_chain(agent)
         allowed = await self.effective_providers(chain[-2]) if len(chain) > 1 else None
         return {'providers': await self.providers(identity), 'selected': sorted(self.selected_providers(agent)),
+                'allowed': sorted(allowed) if allowed is not None else None}
+
+    async def secret_configuration(self, identity, agent):
+        chain = await self.agent_chain(agent)
+        allowed = await self.effective_secrets(chain[-2]) if len(chain) > 1 else None
+        names = self.secret_names()
+        if identity.get('_agent_id'):
+            names = [name for name in names if name in await self.effective_secrets(await self.agent(identity['_agent_id']))]
+        return {'names': names, 'selected': sorted(self.selected_secrets(agent)),
                 'allowed': sorted(allowed) if allowed is not None else None}
 
     async def affected_agents(self, agent_id):
@@ -1250,12 +1321,13 @@ class Service:
                     'thinking', 'compaction_provider_id', 'compaction_model', 'auto_compact_percent', 'context_window')},
                     'enabled_providers': providers['selected'], 'allowed_providers': providers['allowed'],
                     'providers': providers['providers'], 'mcp_servers': mcp['servers'],
+                    'secrets': await self.secret_configuration(identity, target),
                     'escalation_access': await self.escalation_access(target),
                     'owner_ssh_key_access': key_access, 'owner_ssh_public_key': owner_key['value'] if owner_key else None}
         if not isinstance(settings, dict) or not settings:
             raise ValueError('Supply agent settings')
         allowed = {'provider_id', 'model', 'instructions', 'thinking', 'compaction_provider_id',
-                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'mcp_tools', 'owner_ssh_key_enabled', 'escalation_requests_enabled'}
+                   'compaction_model', 'auto_compact_percent', 'context_window', 'enabled_providers', 'enabled_mcp_servers', 'enabled_secrets', 'mcp_tools', 'owner_ssh_key_enabled', 'escalation_requests_enabled'}
         if set(settings) - allowed:
             raise ValueError('Unsupported agent setting')
         if actor_id == target_id and set(settings) != {'instructions'}:
@@ -1306,7 +1378,7 @@ class Service:
 
     async def update_agent(self, identity, agent_id, provider_id, model, instructions,
                            *, thinking=None, compaction_provider_id=_UNSET, compaction_model=_UNSET,
-                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, owner_ssh_key_enabled=_UNSET, escalation_requests_enabled=_UNSET):
+                           auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, enabled_secrets=_UNSET, owner_ssh_key_enabled=_UNSET, escalation_requests_enabled=_UNSET):
         agent = await self.authorize(identity, agent_id)
         if provider_id and not self.store.one('SELECT id FROM providers WHERE id=?', (provider_id,)):
             raise ValueError('Provider missing')
@@ -1344,7 +1416,7 @@ class Service:
         chain = await self.agent_chain(agent)
         actor_id = identity.get('_agent_id')
         if actor_id == agent_id and (provider_id != agent['provider_id'] or model != agent['model'] or
-                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or owner_ssh_key_enabled is not _UNSET or escalation_requests_enabled is not _UNSET or any(
+                thinking is not None or enabled_providers is not _UNSET or enabled_mcp_servers is not _UNSET or enabled_secrets is not _UNSET or owner_ssh_key_enabled is not _UNSET or escalation_requests_enabled is not _UNSET or any(
                     value is not _UNSET for value in (compaction_provider_id, compaction_model, auto_compact_percent, context_window))):
             raise PermissionError('An agent may only edit its own system prompt')
         if actor_id and actor_id != agent_id and actor_id != GLOBAL_ADMIN_AGENT and actor_id not in {member['id'] for member in chain[:-1]}:
@@ -1396,15 +1468,28 @@ class Service:
         if any(not policy.server_enabled(server_ancestors, server_id)
                for server_id in selected_servers - policy.selected_servers(agent)):
             raise PermissionError('MCP selections cannot widen ancestor access')
+        secrets = self.selected_secrets(agent) if enabled_secrets is _UNSET else enabled_secrets
+        if not isinstance(secrets, (set, list)) or any(not isinstance(item, str) for item in secrets):
+            raise ValueError('Enabled secrets must be a list of secret names')
+        secrets = set(secrets)
+        if enabled_secrets is not _UNSET and not secrets <= set(self.secret_names()):
+            raise ValueError('Secret is unavailable')
+        if enabled_secrets is not _UNSET:
+            secret_ceiling = await self.effective_secrets(chain[-2]) if len(chain) > 1 else secrets
+            if actor_id and actor_id != agent_id:
+                secret_ceiling &= await self.effective_secrets(await self.agent(actor_id))
+            if not secrets - self.selected_secrets(agent) <= secret_ceiling:
+                raise PermissionError('Secret selections cannot widen ancestor access')
         affected = await self.affected_agents(agent_id)
         async with self.configuration_change(affected):
             self.store.execute('UPDATE agents SET provider_id=?,model=?,instructions=?,thinking=COALESCE(?,thinking),'
                                'compaction_provider_id=?,compaction_model=?,auto_compact_percent=?,context_window=?,'
-                               'enabled_providers=?,enabled_mcp_servers=?,owner_ssh_key_enabled=?,escalation_requests_enabled=? WHERE id=?',
+                               'enabled_providers=?,enabled_mcp_servers=?,enabled_secrets=?,owner_ssh_key_enabled=?,escalation_requests_enabled=? WHERE id=?',
                                (provider_id or None, model, instructions, thinking, compaction['compaction_provider_id'],
                                 compaction['compaction_model'], percentage, window,
                                 json.dumps(sorted(selection)) if enabled_providers is not _UNSET else agent.get('enabled_providers'),
                                 json.dumps(sorted(selected_servers)) if enabled_mcp_servers is not _UNSET else agent.get('enabled_mcp_servers'),
+                                json.dumps(sorted(secrets)) if enabled_secrets is not _UNSET else agent.get('enabled_secrets'),
                                 agent['owner_ssh_key_enabled'] if owner_ssh_key_enabled is _UNSET else owner_ssh_key_enabled,
                                 agent['escalation_requests_enabled'] if escalation_requests_enabled is _UNSET else escalation_requests_enabled, agent_id))
         self.store.audit(identity['userid'], 'configure-agent', agent_id)

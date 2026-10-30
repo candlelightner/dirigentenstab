@@ -782,9 +782,17 @@ class Runtime:
             return await invoke(self.service.create_subgroup, agent_id, name, model, instructions, **selections)
 
         @agent.tool(sequential=True)
-        async def run_vm_command(ctx: RunContext, vm_id: str, command: str, timeout: int = 120) -> dict:  # noqa: ASYNC109
-            """Execute inside an authorized guest VM with its managed SSH identity and pinned host key."""
-            return await invoke(self.guest.run_vm_command, agent_id, vm_id, command, timeout, call_id=ctx.tool_call_id)
+        async def run_vm_command(ctx: RunContext, vm_id: str, command: str, timeout: int = 120,  # noqa: ASYNC109
+                                 env: dict[str, str] | None = None) -> dict:
+            """Execute inside an authorized guest VM with its managed SSH identity and pinned host key.
+            env values may contain {{secret:NAME}} placeholders for names listed in secret_names; the hub injects the value."""
+            return await invoke(self.guest.run_vm_command, agent_id, vm_id, command, timeout, env, call_id=ctx.tool_call_id)
+
+        @agent.tool(sequential=True)
+        async def write_vm_secret_file(ctx: RunContext, vm_id: str, path: str, content: str) -> dict:
+            """Write content to a mode 600 file on an authorized guest VM (absolute or ~/ path). Put {{secret:NAME}}
+            placeholders in content, for example the oauth_token line of ~/.config/gh/hosts.yml; the hub injects the value."""
+            return await invoke(self.guest.write_vm_secret_file, agent_id, vm_id, path, content, call_id=ctx.tool_call_id)
 
         @agent.tool(sequential=True)
         async def transfer_vm_file(ctx: RunContext, vm_id: str, source: str, destination: str, direction: str) -> dict:

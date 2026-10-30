@@ -68,6 +68,10 @@ exists; the script has a marked TODO.
 3. Destroy the builder and the test clone. Keep the template. Report the commit
    and template id to the owner.
 
+## Token-based tools: named secrets
+
+For token-based tools such as `gh`, the owner can set a named secret in Platform settings, grant it to the agent, and the agent writes it with `write_vm_secret_file` (for example `~/.config/gh/hosts.yml` containing `oauth_token: {{secret:GH_TOKEN}}`) or passes it through `run_vm_command` `env`. This replaces the shared-login NFS folder (skill `dev-vm-shared-logins`) for token-based tools. Interactive OAuth logins (Claude Code, Codex, Gemini, opencode) still need that folder or the one-time login below. See SECURITY.md for limits.
+
 ## One-time owner login in each new dev VM
 
 Agents must not do these steps or read the resulting credential files; the owner

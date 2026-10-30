@@ -466,6 +466,33 @@ async def test_cloudstack_dashboard_header_mobile_and_platform_configuration(bro
         await browser.close()
 
 
+async def test_owner_sets_and_deletes_write_only_secret_on_mobile(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await page.get_by_role('button', name='Settings', exact=True).click()
+        await page.get_by_role('button', name='Platform settings', exact=True).click()
+        name = page.get_by_label('Secret name', exact=True)
+        await name.fill('GH_TOKEN')
+        await name.press('Enter')
+        await page.get_by_label('Value (never shown again)', exact=True).fill('ghp_browser_secret_value')
+        await page.get_by_role('button', name='Set secret', exact=True).click()
+        await page.get_by_text('Secret saved.').wait_for()
+        assert await page.get_by_label('Value (never shown again)', exact=True).input_value() == ''
+        assert 'ghp_browser_secret_value' not in await page.content()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        from dirigentenstab.store import Store
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        assert [row['name'] for row in store.all('SELECT name FROM secrets')] == ['GH_TOKEN']
+        await page.get_by_role('button', name='Delete secret', exact=True).click()
+        await page.get_by_text('Secret deleted.').wait_for()
+        assert store.all('SELECT name FROM secrets') == []
+        await browser.close()
+
+
 async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:
