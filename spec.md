@@ -161,6 +161,16 @@ inherits its parent's model/provider configuration, system prompt, and enabled
 provider/MCP selections. The parent can narrow the enabled selections during
 creation.
 
+The Main Agent and Global Admin start with a shipped default system prompt
+(`DEFAULT_INSTRUCTIONS`): short sections on role and hierarchy, working method,
+CloudStack practice, VMs and guests, skills, safety, diagnosis and reporting. It
+is only an editable default: the owner, a parent, or the agent itself can change
+or clear it, and the hub hardcodes no behavioral guidance beyond it. The runtime
+appends only tool/API semantics and enforced safety invariants (list formatting,
+`managed=True`, saved/uncertain operations, untrusted MCP output, environment
+state). A migration upgrades prompts equal to the former one-line default and
+leaves customized prompts untouched.
+
 | Setting or action | Human owner | Parent agent | Agent itself |
 | --- | --- | --- | --- |
 | Manage central provider/MCP endpoints and credentials | Yes | No | No |
@@ -345,7 +355,8 @@ are not approved requirements merely because they appeared in the audit.
 6. A new subgroup inherits configuration and permitted external tools. Disabling
    a tool at its parent prevents subsequent child calls while retaining the child
    selection. Re-enabling it restores access subject to other ancestor restrictions.
-7. An agent can change its own prompt but cannot change its own model or enabled
+7. A new install seeds the default prompt, and clearing it leaves only the
+   hardcoded tool semantics. An agent can change its own prompt but cannot change its own model or enabled
    tools. Its parent can change those settings only within its own allowance.
    Configuration changes pause the affected agent's active work and resume it
    under the new state without restarting explicitly stopped conversations.

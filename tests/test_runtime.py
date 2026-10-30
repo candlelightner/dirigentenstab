@@ -442,7 +442,8 @@ async def test_managed_gpu_dispatch_uses_private_server_context_without_exposing
     async def model(messages, info):
         assert session not in str(messages) + str(info.instructions) + str(info.function_tools)
         assert 'managed=True for controller-prepared GPU deployment and lifecycle operations' in info.instructions
-        assert all(section in info.instructions for section in ('How to work.', 'Permissions.', 'Diagnosis.', 'Ownership.', 'Reporting.', 'Never delegate work'))
+        assert all(section in info.instructions for section in ('Ownership.', 'Never delegate work')
+                   ) and not any(section in info.instructions for section in ('How to work.', 'Permissions.', 'Diagnosis.', 'Reporting.'))
         if messages[-1].parts[0].part_kind == 'tool-return':
             yield 'GPU VM ready'
         else:

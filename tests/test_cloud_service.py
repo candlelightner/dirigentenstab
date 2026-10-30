@@ -1599,3 +1599,36 @@ async def test_bootstrap_resume_still_adopts_existing_names(store):
     assert cloud.domains and cloud.accounts
     await service.bootstrap({})
     assert store.one('SELECT phase FROM provisioning WHERE id=?', (APP_ROOT_AGENT,))['phase'] == 'complete'
+
+
+async def test_bootstrap_seeds_default_instructions_for_main_agent_and_global_admin(store):
+    from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
+    from dirigentenstab.service import DEFAULT_INSTRUCTIONS, GLOBAL_ADMIN_INSTRUCTIONS
+    service = await bootstrap_service(store, ProvisioningCloud())
+    await service.bootstrap({})
+    rows = {r['id']: r['instructions'] for r in store.all('SELECT id,instructions FROM provisioning')}
+    assert rows == {APP_ROOT_AGENT: DEFAULT_INSTRUCTIONS, GLOBAL_ADMIN_AGENT: GLOBAL_ADMIN_INSTRUCTIONS}
+    assert GLOBAL_ADMIN_INSTRUCTIONS.startswith('Manage CloudStack globally using your own native root administrator identity.\n\n')
+    assert DEFAULT_INSTRUCTIONS.count('\n') >= 40 and 'Only the human owner assigns work' in DEFAULT_INSTRUCTIONS
+
+
+def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
+    from dirigentenstab.service import DEFAULT_INSTRUCTIONS, GLOBAL_ADMIN_INSTRUCTIONS
+    master = tmp_path / 'master'
+    master.write_bytes(Fernet.generate_key())
+    path = tmp_path / 'state.db'
+    old = 'Manage this domain safely. Only the human owner assigns work.'
+    store = Store(str(path), str(master))
+    store.execute('PRAGMA user_version=21')
+    old_admin = ('Manage CloudStack globally using your own native root administrator identity. '
+                 'Only the human owner assigns work.')
+    for name, text in (('old', old), ('admin', old_admin), ('custom', old + ' Extra.'), ('empty', '')):
+        store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model,instructions) '
+                      'VALUES(?,?,?,?,?,?,?,?)', (name, name, 'd' + name, 'a' + name, 'u' + name, store.seal({}), 'm', text))
+        store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) VALUES(?,?,?,?,?,?)',
+                      (name, None, name, 'm', text, 1))
+    reopened = Store(str(path), str(master))
+    for table in ('agents', 'provisioning'):
+        rows = {row['id']: row['instructions'] for row in reopened.all(f'SELECT id,instructions FROM {table}')}
+        assert rows['old'] == DEFAULT_INSTRUCTIONS and rows['admin'] == GLOBAL_ADMIN_INSTRUCTIONS
+        assert rows['custom'] == old + ' Extra.' and rows['empty'] == ''
