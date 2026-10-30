@@ -144,11 +144,32 @@ async def open_sidebar(page):
     await search.wait_for()
 
 
+async def tree_settled(page):
+    # The server persists the view before it sends the new nodes, and the tree animates its height
+    # while expanding: its children overflow the clipped scroll area (and its scrollbar thumb
+    # intercepts pointer events) until it is done.
+    await page.wait_for_function(
+        """() => { const t = document.querySelector('.q-drawer .q-tree') || document.querySelector('.q-tree');
+            if (!t) return false;
+            const settled = t.getBoundingClientRect().height + 1 >= t.scrollHeight
+                && !t.querySelector('.q-slide-transition-enter-active, .q-slide-transition-leave-active, .q-transition--fade-enter-active');
+            if (!settled) return false;
+            const key = Math.round(t.getBoundingClientRect().height) + ':' + t.scrollHeight;
+            const stable = t.__settledKey === key; t.__settledKey = key; return stable; }""")
+
+
+async def click_tree_node(page, name):
+    node = page.locator('.q-tree').get_by_text(name, exact=True)
+    await node.wait_for()
+    await tree_settled(page)
+    await node.click()
+
+
 async def select_agent(page, name):
     await open_sidebar(page)
     search = page.get_by_label('Search agents and domains', exact=True)
     await search.fill(name)
-    await page.locator('.q-tree').get_by_text(name, exact=True).click()
+    await click_tree_node(page, name)
     if page.viewport_size['width'] < 900:  # the drawer closes on narrow widths only
         await search.wait_for(state='hidden')
     await page.get_by_role('button', name='Agent details', exact=True).get_by_text(name, exact=True).wait_for()
@@ -1417,7 +1438,7 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         # Selecting an agent tears down the iframe, even without using Close.
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await search.fill('Research Admin')
-        await page.locator('.q-tree').get_by_text('Research Admin', exact=True).click()
+        await click_tree_node(page, 'Research Admin')
         if page.viewport_size['width'] < 900:
             await search.wait_for(state='hidden')
         await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
@@ -1484,12 +1505,6 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
                         arg=current)
             await page.keyboard.press('Escape')
 
-        async def tree_settled():
-            # The server persists the view before it sends the new nodes, and the tree animates its
-            # height while expanding: its children overflow the clipped scroll area until it is done.
-            await page.wait_for_function(
-                "() => { const t = document.querySelector('.q-drawer .q-tree'); return t.getBoundingClientRect().height + 1 >= t.scrollHeight }")
-
         assert existing_text not in await page.content()
         views_to_check = [['Agents', 'Skills'], ['Skills']] if width == 1440 else [
             ['Agents', 'Skills'], ['VMs', 'Skills'], ['Skills'], ['Agents', 'VMs', 'Skills']]
@@ -1497,7 +1512,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await select_views(views)
             existing = page.locator('.q-tree').get_by_text('Existing research skill', exact=True)
             await existing.wait_for()
-            await tree_settled()
+            await tree_settled(page)
             assert 'Research Admin' in await existing.evaluate(
                 "el => el.closest('.q-tree__node').parentElement.closest('.q-tree__node').querySelector('.q-tree__node-header').innerText")
             await existing.click()
@@ -1505,7 +1520,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await page.get_by_role('dialog').get_by_role('button', name='Close', exact=True).click()
             await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
             await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-            await tree_settled()
+            await tree_settled(page)
             await existing.click()
             existing_text += f' Edit {index}.'
             await page.get_by_label('Full text', exact=True).fill(existing_text)
@@ -1528,7 +1543,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await playwright.expect(sidebar).to_contain_text('Skills')
         await playwright.expect(sidebar).not_to_contain_text('Agents')
-        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await click_tree_node(page, 'GPU checklist')
         await playwright.expect(page.get_by_label('Full text', exact=True)).to_have_value(full_text)
         sharing = page.get_by_label('Share with children', exact=True)
         await sharing.click()
@@ -1537,7 +1552,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
         await page.get_by_role('button', name='Save skill', exact=True).click()
         await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await click_tree_node(page, 'GPU checklist')
         await playwright.expect(sharing).to_have_value('Research Admin')
         await page.get_by_role('button', name='Approve global sharing', exact=True).click()
         review = page.get_by_role('dialog').filter(has=page.get_by_role('button', name='Approve', exact=True))
@@ -1545,13 +1560,13 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
         await review.get_by_role('button', name='Approve', exact=True).click()
         await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await click_tree_node(page, 'GPU checklist')
         await page.get_by_text('This revision is shared globally. Editing requires approval again.', exact=True).wait_for()
         await page.get_by_label('Full text', exact=True).fill(full_text + ' Updated.')
         await page.get_by_role('button', name='Save skill', exact=True).click()
         await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-        await page.locator('.q-tree').get_by_text('GPU checklist', exact=True).click()
+        await click_tree_node(page, 'GPU checklist')
         await page.get_by_role('button', name='Approve global sharing', exact=True).wait_for()
         assert await page.get_by_text('This revision is shared globally. Editing requires approval again.', exact=True).count() == 0
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
@@ -1719,7 +1734,7 @@ async def test_browser_reload_restores_open_agent_vm_mode_and_skill(browser_app,
             await playwright.expect(page.locator('.q-drawer .sidebar-view-select')).not_to_have_class(
                 re.compile(r'.*q-field--disabled.*'))
             await search.fill(label)
-            await page.locator('.q-tree').get_by_text(label, exact=True).click()
+            await click_tree_node(page, label)
 
         # A non-default agent and its open conversation come back after a reload.
         await select_agent(page, 'Research Admin')
