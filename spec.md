@@ -75,6 +75,10 @@ users. There is no new hub account or registration system.
   change the agent's persistent permissions. Reuse the existing native API
   execution and asynchronous-job handling. This path does not execute host
   commands or bypass the GPU controller for host-device operations.
+- The owner's decision view shows the exact parameters that will run, including
+  password, token and similar fields, with `userdata` decoded from base64 and
+  labelled as decoded. Agent-facing results and logs keep these fields redacted.
+  The visible-domain set used to list requests is cached per session for 30 seconds.
 - Keep one durable queue. Migrate existing compute-offering requests as explicit
   `createServiceOffering` commands, preserving their parameters, decisions,
   results, history and notifications. Persist submitted asynchronous job IDs

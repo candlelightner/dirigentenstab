@@ -1,3 +1,4 @@
+import time
 import asyncio
 from types import SimpleNamespace
 
@@ -267,3 +268,24 @@ async def test_owner_session_transport_classifies_native_rejection_and_hides_sec
     assert failure.value.rejected
     assert '431' in str(failure.value)
     assert all(secret not in str(failure.value) for secret in ('tiny-secret', 'session-private', 'cookie-private'))
+
+
+async def test_owner_sees_exact_sensitive_params_but_agent_result_stays_redacted(environment):
+    e = environment
+    params = {'name': 'vm', 'password': 'hunter2hunter2', 'userdata': 'I2Nsb3VkLWNvbmZpZw=='}
+    agent_view = await request(e, params, command='updateUser')
+    assert agent_view['params']['password'] == agent_view['params']['userdata'] == '[redacted]'
+    assert [r['params'] for r in await e.service.list_escalation_requests(e.owner)] == [params]
+    assert (await e.service.decide_escalation(e.owner, agent_view['id'], False))['params']['password'] == '[redacted]'
+
+
+async def test_owner_polls_reuse_visible_domains_for_a_short_ttl(environment, monkeypatch):
+    e = environment
+    await request(e)
+    for _ in range(3):
+        assert len(await e.service.list_escalation_requests(e.owner)) == 1
+    assert [c for c, _ in e.calls].count('listDomains') == 1
+    now = time.monotonic()
+    monkeypatch.setattr(time, 'monotonic', lambda: now + 31)
+    await e.service.list_escalation_requests(e.owner)
+    assert [c for c, _ in e.calls].count('listDomains') == 2
