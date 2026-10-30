@@ -1,3 +1,4 @@
+import os
 import time
 from types import SimpleNamespace
 
@@ -126,3 +127,17 @@ async def test_download_refused_for_other_session_expired_grant_or_failed_author
     client.service.allowed = True
     assert (await client.http.get(client.files.grant({'_session': 'sess-1'}, 'vm-1', '/dir'))).status_code == 403
     assert (await client.http.get(client.files.grant({'_session': 'sess-1'}, 'vm-1', '/missing'))).status_code == 404
+
+
+def test_use_spool_dir_replaces_tmpfs_tempdir(tmp_path, monkeypatch):
+    import tempfile
+    from dirigentenstab.files import use_spool_dir
+    spool = tmp_path / 'tmp'
+    spool.mkdir()
+    (spool / 'stale').write_text('x')
+    monkeypatch.setattr(tempfile, 'tempdir', None)
+    use_spool_dir(str(spool))
+    assert tempfile.gettempdir() == str(spool)
+    assert list(spool.iterdir()) == [] and spool.stat().st_mode & 0o777 == 0o700
+    with tempfile.NamedTemporaryFile() as f:
+        assert os.path.dirname(f.name) == str(spool)

@@ -265,7 +265,8 @@ current compaction settings.
   administrator access is not permission to execute arbitrary commands on the
   physical host running the hub or CloudStack.
 - V1 supplies connection details, CloudStack links, an embedded SSH terminal,
-  a file browser (browse, download, upload up to 100 MiB per file) over the
+  a file browser (browse, download, upload up to 100 MiB per file, spooled on the data volume rather than
+  tmpfs and rejected with a visible message when too large) over the
   managed SFTP connection after the same native authorization, and
   CloudStack's native noVNC console (embedded or in a new tab). Console
   endpoints are requested just in time through the signed-in owner's own

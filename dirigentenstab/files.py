@@ -1,8 +1,11 @@
 """VM file transfers over the managed SFTP connection: session-bound download grants and upload helper."""
 import posixpath
+import os
 import re
 import secrets
+import shutil
 import stat
+import tempfile
 import time
 from urllib.parse import quote
 
@@ -13,6 +16,14 @@ PREFIX = '/vm-files/'
 GRANT_SECONDS = 60
 MAX_UPLOAD = 100 * 1024 * 1024
 CHUNK = 256 * 1024
+UPLOAD_LIMIT_TEXT = f'{MAX_UPLOAD // 1024 // 1024} MiB'
+
+
+def use_spool_dir(path):
+    """Spool uploads on disk (the data volume) instead of the small /tmp tmpfs; wipe leftovers from a previous run."""
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, mode=0o700)
+    tempfile.tempdir = path
 
 
 def disposition(path):
@@ -26,7 +37,7 @@ async def store_upload(sftp, directory, upload, overwrite=False):
     if not name or name in {'.', '..'} or '/' in name or '\0' in name:
         raise ValueError(f'Invalid file name: {name!r}')
     if upload.size() > MAX_UPLOAD:
-        raise ValueError(f'{name} exceeds the {MAX_UPLOAD // 1024 // 1024} MiB upload limit')
+        raise ValueError(f'{name} exceeds the {UPLOAD_LIMIT_TEXT} upload limit')
     target = posixpath.join(directory, name)
     if not overwrite and await sftp.exists(target):
         raise FileExistsError(name)
