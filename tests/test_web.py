@@ -927,6 +927,49 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
         assert runtime.restored == ['second']
 
 
+async def test_poll_tick_never_renews_session():
+    identity = {'userid': 'owner', 'username': 'owner', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account'}
+    renewals = []
+
+    class Auth:
+        async def identity(self, token, renew=True):
+            renewals.append(renew)
+            return identity
+
+    class Service(AgentCapabilities):
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent]}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        queued = set()
+
+        async def conversations(self, current, agent_id):
+            return [{'id': 'first', 'title': 'First task'}]
+
+        async def restore(self, current, conversation_id):
+            return {'id': conversation_id, 'agent_id': 'agent', 'messages': [], 'runs': []}
+
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
+        await user.should_see('Configure')
+        poll = next(element for element in user.client.elements.values()
+                    if isinstance(element, ui.timer) and element.callback.__name__ == 'poll_activity')
+        poll.deactivate()
+        renewals.clear()
+        await poll.callback()  # includes the histories() refresh
+        assert renewals and not any(renewals)
+
+
 async def test_polling_updates_text_and_tool_status_without_replacing_history(monkeypatch):
     from types import SimpleNamespace
 

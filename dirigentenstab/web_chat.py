@@ -263,8 +263,8 @@ def setup_chat(ctx):
         ctx.context_label.set_text('')
         ctx.compaction_status.set_text('')
 
-    async def histories():
-        current = await actor()
+    async def histories(renew=True):
+        current = await actor(renew=renew)
         if state['agent']:
             rows = await runtime.conversations(current, state['agent'])
             options = {row['id']: (MARKERS[key][0] + ' ' if (key := activity_marker(row, runtime.queued)) else '') + row['title']
@@ -522,7 +522,7 @@ def setup_chat(ctx):
                     if state['agent'] == agent_id and state['conversation'] == conversation_id:
                         await ctx.render_history(restored)
                         state['activity_token'] = activity_token
-            await histories()
+            await histories(renew=False)
             markers = [(row['agent_id'], activity_marker(row)) for row in rows if row['id'] != conversation_id]
             attention = {agent: 'blocked' if (agent, 'blocked') in markers else 'unread'
                          for agent, marker in markers if marker in ('blocked', 'unread')}
