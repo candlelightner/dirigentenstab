@@ -124,6 +124,11 @@ async def login(page, url):
     await page.wait_for_function('window.socket?.connected && window.did_handshake')
 
 
+def conversation_name(title):
+    """Option name of a conversation whose marker (if any) precedes its title."""
+    return re.compile(r'(^|\s)' + re.escape(title) + '$')
+
+
 async def open_sidebar(page):
     """Open the agent drawer unless it is open. Wait for Quasar's show-if-above transition first: a drawer that is
     mid-close still counts as visible, so deciding early skipped the click and left it offscreen."""
@@ -849,7 +854,7 @@ async def test_browser_stop_agent_current_and_restored_running_conversation(brow
                 await page.wait_for_function('window.socket?.connected && window.did_handshake')
                 await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
                 await page.get_by_label('Conversation', exact=True).fill(title)
-                await page.get_by_role('option', name=title, exact=True).click()
+                await page.get_by_role('option', name=conversation_name(title)).click()
                 await page.get_by_role('button', name='Stop conversation', exact=True).wait_for()
             await page.get_by_role('button', name='Stop conversation', exact=True).click()
             await page.get_by_role('button', name='Stop conversation', exact=True).wait_for(state='hidden')
@@ -937,7 +942,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill(title)
-        await page.get_by_role('option', name=title, exact=True).click()
+        await page.get_by_role('option', name=conversation_name(title)).click()
         await playwright.expect(meter).not_to_be_visible()
         await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
         await page.locator('.thinking-indicator').wait_for(state='hidden')
@@ -953,7 +958,7 @@ async def test_browser_compaction_configuration_and_context_meter_persist(browse
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await page.get_by_label('Conversation', exact=True).fill(title)
-        await page.get_by_role('option', name=title, exact=True).click()
+        await page.get_by_role('option', name=conversation_name(title)).click()
         await page.get_by_role('button', name='Run details', exact=True).click()
         await page.get_by_text('Context usage unavailable for this activity.', exact=True).wait_for()
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
@@ -976,13 +981,13 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
             await page.get_by_role('button', name='Send', exact=True).click()
         async def choose(title):
             await page.get_by_label('Conversation', exact=True).fill(title)
-            await page.get_by_role('option', name=title, exact=True).click()
+            await page.get_by_role('option', name=conversation_name(title)).click()
             await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for()
         async def conversation_options():
             await page.get_by_label('Conversation', exact=True).fill('')
             await playwright.expect(page.get_by_role('option')).to_have_count(2)
-            await page.get_by_role('option', name='stop fixture first independent conversation', exact=True).wait_for()
-            await page.get_by_role('option', name='stop fixture second independent conversation', exact=True).wait_for()
+            await page.get_by_role('option', name=conversation_name('stop fixture first independent conversation')).wait_for()
+            await page.get_by_role('option', name=conversation_name('stop fixture second independent conversation')).wait_for()
             labels = await page.get_by_role('option').locator('.q-item__label').all_text_contents()
             await page.keyboard.press('Escape')
             return labels
@@ -1011,7 +1016,7 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
         await playwright.expect(page.get_by_role('button', name='Stop conversation', exact=True)).not_to_be_visible()
         await page.locator('.thinking-indicator').wait_for(state='hidden')
         assert run('stop fixture second independent conversation')['status'] == 'running'
-        assert await conversation_options() == options_before_stop
+        assert sorted(await conversation_options()) == sorted(options_before_stop)
         await choose('stop fixture second independent conversation')
         await send('Inspect resources after interrupting this conversation')
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
@@ -1065,7 +1070,7 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         page = await browser.new_page(ignore_https_errors=True)
         await login(page, url)
         await page.get_by_label('Conversation', exact=True).fill('Large history fixture')
-        await page.get_by_role('option', name='Large history fixture', exact=True).click()
+        await page.get_by_role('option', name=conversation_name('Large history fixture')).click()
         await page.get_by_text('Previous answer 149', exact=True).wait_for()
         await page.evaluate("window.socketFailures = []; window.socket.on('disconnect', reason => socketFailures.push(reason))")
         await asyncio.sleep(6)
@@ -1081,7 +1086,7 @@ async def test_browser_large_running_history_keeps_socket_and_transcript_nodes(b
         await page.reload()
         await page.wait_for_function('window.socket?.connected && window.did_handshake')
         await page.get_by_label('Conversation', exact=True).fill('Large history fixture')
-        await page.get_by_role('option', name='Large history fixture', exact=True).click()
+        await page.get_by_role('option', name=conversation_name('Large history fixture')).click()
         await page.get_by_text('Heartbeat 0.', exact=False).wait_for()
         await page.evaluate("window.retainedMessage = document.querySelector('.q-message'); window.socketFailures = []; window.socket.on('disconnect', reason => socketFailures.push(reason))")
         await asyncio.sleep(3)
@@ -1817,4 +1822,61 @@ async def test_browser_sidebar_tree_geometry_selection_and_overflow(browser_app)
             assert await scroll.evaluate('el => el.scrollWidth <= el.clientWidth')
             assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
             await page.close()
+        await browser.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_browser_unread_and_blocked_markers_in_selector_and_sidebar(browser_app, width, height):
+    url, state = browser_app
+    from dirigentenstab.store import Store
+
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    title = f'Marker conversation {width}'
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        context = await browser.new_context(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        page = await context.new_page()
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await page.get_by_label('Message', exact=True).fill(title)
+        await page.get_by_role('button', name='Send', exact=True).click()
+        await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
+        await page.get_by_role('button', name='New conversation', exact=True).click()
+        selector = page.get_by_label('Conversation', exact=True)
+        badge = page.locator('.q-tree [role=img]:visible')
+        markers = page.get_by_role('option', name=conversation_name(title)).locator('[role=img]')
+
+        async def open_selector():
+            await selector.click()
+            await page.get_by_role('option', name=conversation_name(title)).wait_for()
+
+        # An opened conversation is seen: no marker. Finished output the owner has not seen is unread.
+        await open_selector()
+        assert await markers.count() == 0
+        await page.keyboard.press('Escape')
+        store.execute('UPDATE conversation_seen SET seen=0 WHERE conversation_id=(SELECT id FROM conversations WHERE title LIKE ?)',
+                      (title + '%',))
+        await open_selector()
+        await playwright.expect(markers).to_have_attribute('aria-label', 'Unread output')
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.keyboard.press('Escape')
+        await select_agent(page, 'Main Agent')
+        await open_sidebar(page)
+        await page.get_by_label('Search agents and domains', exact=True).fill('')
+        await playwright.expect(badge).to_have_attribute('aria-label', 'Unread conversation output')
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.screenshot(path=str(state / f'markers-{width}x{height}.png'), full_page=True)
+
+        # A paused conversation shows the blocked marker until it is opened.
+        store.execute("UPDATE chat_runs SET status='interrupted' WHERE conversation_id=(SELECT id FROM conversations WHERE title LIKE ?)",
+                      (title + '%',))
+        await playwright.expect(badge).to_have_attribute('aria-label', 'Blocked or paused conversation')
+        await select_agent(page, 'Research Admin')
+        await open_selector()
+        await playwright.expect(markers).to_have_attribute('aria-label', 'Blocked or paused')
+        await page.get_by_role('option', name=conversation_name(title)).click()
+        await page.locator('.q-message').get_by_text(title, exact=True).wait_for()
+        await page.get_by_role('button', name='Open agent hierarchy', exact=True).or_(
+            page.get_by_role('button', name='Close agent hierarchy', exact=True)).first.wait_for()
+        await playwright.expect(badge).to_have_count(0)
         await browser.close()

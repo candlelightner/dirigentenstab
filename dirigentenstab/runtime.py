@@ -155,6 +155,7 @@ class Runtime:
         self.guest = Guest(service)
         self.slots = asyncio.Semaphore(4)
         self.running = set()
+        self.queued = set()
         self.active = {}
         self.service.runtime = self
         self.locks = {}
@@ -301,8 +302,9 @@ class Runtime:
     async def conversations(self, identity, agent_id):
         await self.service.authorize(identity, agent_id)
         return self.service.store.all(
-            "SELECT c.id,c.title,c.created,r.status,r.updated FROM conversations c LEFT JOIN chat_runs r "
-            "ON r.id=(SELECT id FROM chat_runs WHERE conversation_id=c.id ORDER BY created DESC LIMIT 1) "
+            "SELECT c.id,c.title,c.created,r.id AS operation_id,r.status,r.updated,s.seen FROM conversations c "
+            "LEFT JOIN chat_runs r ON r.id=(SELECT id FROM chat_runs WHERE conversation_id=c.id ORDER BY created DESC LIMIT 1) "
+            "LEFT JOIN conversation_seen s ON s.conversation_id=c.id AND s.human_id=c.human_id "
             "WHERE c.human_id=? AND c.agent_id=? ORDER BY COALESCE(r.updated,c.created) DESC",
             (identity['userid'], agent_id))
 
@@ -1029,6 +1031,7 @@ class Runtime:
         active_tool = None
         partial_text, partial_message_index = '', None
         self.service.store.execute("UPDATE chat_runs SET status='running',category=NULL WHERE id=?", (operation_id,))
+        self.queued.add(operation_id)
 
         def checkpoint():
             nonlocal last_checkpoint, accounted_requests, accounted_tools
@@ -1106,6 +1109,7 @@ class Runtime:
             identity = await self.service.execution_identity(agent_id, conversation['human_id'])
             await emit({'type': 'run_started', 'conversation_id': conversation_id})
             async with self.slots:
+                self.queued.discard(operation_id)
                 while True:
                     await self._gate(agent_id).wait()
                     agent = await self._agent(identity, agent_id, budget, emit, conversation_id=conversation_id)
@@ -1151,6 +1155,7 @@ class Runtime:
                                            (status, time.time(), operation_id))
             finally:
                 self.running.discard(conversation_id)
+                self.queued.discard(operation_id)
                 self.active.pop(operation_id, None)
                 self.config_changed.discard(operation_id)
                 CURRENT_RUN.reset(context_token)

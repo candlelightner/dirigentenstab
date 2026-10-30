@@ -98,7 +98,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
         agents = {row['id']: row for row in data.get('agents', [])}
-        state = {'agent': None, 'conversation': None, 'busy': False, 'waiting': False, 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'indicator': 'Thinking…', 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}}
         ctx = SimpleNamespace(service=service, auth=auth, runtime=runtime, console_proxy=console_proxy,
                              vm_files=vm_files, client=client, token=token, identity=identity, data=data,
                              state=state, agents=agents, actor=actor, protect=protect)

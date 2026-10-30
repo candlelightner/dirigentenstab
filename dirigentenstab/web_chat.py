@@ -1,12 +1,13 @@
 import asyncio
 import json
+import time
 from urllib.parse import urlencode
 
 from nicegui import ui
 
 from . import thinking
 from .diagnostics import diagnose
-from .web_sidebar import agent_label
+from .web_sidebar import agent_label, mark_attention
 
 
 def tool_label(event):
@@ -113,10 +114,26 @@ def conversation_activity(store, human_id, agent_ids):
         return []
     placeholders = ','.join('?' for _ in agent_ids)
     return store.all(
-        'SELECT c.id,c.agent_id,c.title,r.id AS operation_id,r.status,r.updated FROM conversations c JOIN chat_runs r '
+        'SELECT c.id,c.agent_id,c.title,r.id AS operation_id,r.status,r.updated,s.seen FROM conversations c JOIN chat_runs r '
         'ON r.id=(SELECT id FROM chat_runs WHERE conversation_id=c.id ORDER BY created DESC LIMIT 1) '
+        'LEFT JOIN conversation_seen s ON s.conversation_id=c.id AND s.human_id=c.human_id '
         f'WHERE c.human_id=? AND c.agent_id IN ({placeholders}) ORDER BY r.updated DESC',
         (human_id, *agent_ids))
+
+
+MARKERS = {'queued': ('◷', 'Queued'), 'running': ('▶', 'Running'),
+           'blocked': ('‖', 'Blocked or paused'), 'unread': ('●', 'Unread output')}
+
+
+def activity_marker(row, queued=()):
+    """Marker key for a conversation's latest run; blocked and finished runs clear once the conversation is seen."""
+    status, unseen = row.get('status'), (row.get('updated') or 0) > (row.get('seen') or 0)
+    if status == 'running':
+        return 'queued' if row.get('operation_id') in queued else 'running'
+    if unseen and status in ('interrupted', 'reconciliation'):
+        return 'blocked'
+    if unseen and status in ('completed', 'failed'):
+        return 'unread'
 
 
 def save_setting(store, name, value):
@@ -132,6 +149,12 @@ def build_chat_view(ctx):
 
     with ui.row().classes('conversation-controls w-full items-center no-wrap gap-2') as ctx.conversation_controls:
         ctx.history_select = ui.select({}, label='Conversation', with_input=True).props('dense').classes('flex-1 min-w-0')
+        # A marked title starts with its glyph and a space; the option slot renders the glyph as a labelled marker.
+        glyphs = repr(dict(MARKERS.values()))  # a JS object literal in single quotes, safe inside attributes
+        ctx.history_select.add_slot('option', '''<q-item v-bind="props.itemProps"><q-item-section side v-if="%s[props.opt.label[0]]">
+            <span role="img" class="text-teal-8" :aria-label="%s[props.opt.label[0]]">{{ props.opt.label[0] }}</span></q-item-section>
+            <q-item-section><q-item-label class="ellipsis">{{ %s[props.opt.label[0]] ? props.opt.label.slice(2) : props.opt.label }}
+            </q-item-label></q-item-section></q-item>''' % (glyphs, glyphs, glyphs))
         ctx.new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
         with ui.button(icon='info_outline').props(
                 'flat round aria-label="Run details" aria-haspopup="menu"').mark('run_details_toggle'):
@@ -152,10 +175,9 @@ def build_chat_view(ctx):
             ctx.transcript = ui.column().classes('w-full min-w-0 gap-3 p-2')
         with ui.row().classes('thinking-indicator items-center gap-2 text-sm text-stone-600').props(
                 'role=status aria-live=polite').bind_visibility_from(state, 'busy').mark('thinking_indicator'):
-            ui.label().bind_text_from(
-                state, 'waiting', lambda waiting: 'Waiting for your decision on an escalation request' if waiting else 'Thinking…')
+            ui.label().bind_text_from(state, 'indicator')
             with ui.row().classes('items-center gap-1').props('aria-hidden=true').bind_visibility_from(
-                    state, 'waiting', lambda waiting: not waiting):
+                    state, 'indicator', lambda text: text == 'Thinking…'):
                 for dot in range(3):
                     ui.element('span').classes('thinking-dot').style(f'animation-delay:{dot * .15}s')
         with ui.row().classes('composer gap-2'):
@@ -245,7 +267,8 @@ def setup_chat(ctx):
         current = await actor()
         if state['agent']:
             rows = await runtime.conversations(current, state['agent'])
-            options = {row['id']: row['title'] for row in rows}
+            options = {row['id']: (MARKERS[key][0] + ' ' if (key := activity_marker(row, runtime.queued)) else '') + row['title']
+                       for row in rows}
             # Keep numeric select values stable when only activity ordering changes.
             if ctx.history_select.options != options:
                 ctx.history_select.set_options(options, value=state['conversation'])
@@ -291,7 +314,7 @@ def setup_chat(ctx):
         finally:
             ctx.prompt.enable()
         ctx.prompt.set_value(state['drafts'].get((agent_id, None), ''))
-        state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, waiting=False, activity_token=None)
+        state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, indicator='Thinking…', activity_token=None)
         ctx.sync_url()
         sync_composer()
         ctx.prompt.enable()
@@ -392,7 +415,11 @@ def setup_chat(ctx):
         state['conversation'] = restored['id']
         state['imported'] = bool(restored.get('imported'))
         state['active_operation'] = None
-        state['busy'] = state['waiting'] = False
+        state['busy'] = False
+        state['indicator'] = 'Thinking…'
+        service.store.execute(
+            'INSERT INTO conversation_seen(human_id,conversation_id,seen) SELECT human_id,id,? FROM conversations WHERE id=? '
+            'ON CONFLICT(human_id,conversation_id) DO UPDATE SET seen=excluded.seen', (time.time(), restored['id']))
         reset_run_details()
         if restored.get('runs'):
             run = restored['runs'][-1]
@@ -400,10 +427,12 @@ def setup_chat(ctx):
             state['busy'] = bool(state['active_operation'])
             waiting = state['busy'] and service.store.one(
                 "SELECT 1 FROM escalation_requests WHERE run_id=? AND status='pending'", (run['id'],))
-            state['waiting'] = bool(waiting)
+            queued = run['id'] in runtime.queued
+            state['indicator'] = ('Queued · waiting for a free run slot' if queued else
+                                  'Waiting for your decision on an escalation request' if waiting else 'Thinking…')
             reason = (run.get('budget') or {}).get('reason')
             label = ('Blocked / paused' if run['status'] == 'reconciliation' else 'Stopped' if reason == 'stopped' else 'Blocked / paused' if run['status'] == 'interrupted'
-                     else run['status'].capitalize())
+                     else 'Queued' if queued else run['status'].capitalize())
             pause_reason = (run.get('budget') or {}).get('pause_reason')
             ctx.status_label.set_text(label + (' · ' + str(pause_reason) if pause_reason else ''))
             ctx.status_label.props(f'data-operation-id="{run["id"]}"')
@@ -481,18 +510,24 @@ def setup_chat(ctx):
         try:
             current = await actor(renew=False)
             await ctx.refresh_escalations(current)
-            await histories()
             rows = conversation_activity(service.store, current['userid'], list(agents))
             selected = next((row for row in rows if row['id'] == conversation_id), None)
             if selected:
                 decisions = tuple((row['id'], row['status'], row['updated']) for row in ctx.escalation_rows
                                   if row['conversation_id'] == conversation_id)
-                activity_token = (selected['operation_id'], selected['status'], selected['updated'], decisions)
+                activity_token = (selected['operation_id'], selected['status'], selected['updated'], decisions,
+                                  selected['operation_id'] in runtime.queued)
                 if activity_token != state['activity_token']:
                     restored = await runtime.restore(current, conversation_id)
                     if state['agent'] == agent_id and state['conversation'] == conversation_id:
                         await ctx.render_history(restored)
                         state['activity_token'] = activity_token
+            await histories()
+            markers = [(row['agent_id'], activity_marker(row)) for row in rows if row['id'] != conversation_id]
+            attention = {agent: 'blocked' if (agent, 'blocked') in markers else 'unread'
+                         for agent, marker in markers if marker in ('blocked', 'unread')}
+            if mark_attention(ctx.tree.props['nodes'], attention):
+                ctx.tree.update()
         except Exception:
             # Authentication redirects through actor; transient refresh failures retry next tick.
             return
@@ -503,7 +538,7 @@ def setup_chat(ctx):
         remember_conversation(None)
         state['drafts'][(state['agent'], state['conversation'])] = ctx.prompt.value or ''
         ctx.prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
-        state.update(conversation=None, active_operation=None, busy=False, waiting=False, imported=False,
+        state.update(conversation=None, active_operation=None, busy=False, imported=False,
                      activity_token=None)
         sync_composer()
         reset_run_details()

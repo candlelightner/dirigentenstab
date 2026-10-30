@@ -601,6 +601,7 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     store.execute('DROP TABLE escalation_requests')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
     store.execute('DROP TABLE secrets')
+    store.execute('DROP TABLE conversation_seen')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)', ('parent', 'pending', journal, journal, 'validating', 1))
@@ -1621,6 +1622,7 @@ def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
     store = Store(str(path), str(master))
     store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
     store.execute('DROP TABLE secrets')
+    store.execute('DROP TABLE conversation_seen')
     store.execute('PRAGMA user_version=21')
     old_admin = ('Manage CloudStack globally using your own native root administrator identity. '
                  'Only the human owner assigns work.')
