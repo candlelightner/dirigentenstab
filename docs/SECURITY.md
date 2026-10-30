@@ -40,6 +40,12 @@ Managed template cloud-init includes a generated *guest host* private key, allow
 
 Managed cloud-init disables password and root SSH and adds no sudo by default. Enrollment does not remove privileges or secrets already baked into an image; prepare and sanitize custom templates before reuse. File transfers expose only that agent's application workspace; local path arguments are basenames, with an 8 MiB file limit. The application has no Docker socket, hypervisor socket, SSH agent or arbitrary host directory mount.
 
+## Named secrets
+
+The platform administrator sets named secrets (for example `gh` tokens) in Platform settings. They are write-only, Fernet-sealed with the master key, and replaced or deleted but never displayed. Agents see only the names granted to them; grants follow strict ancestor inheritance and an unset selection grants nothing. The hub substitutes `{{secret:NAME}}` at execution time in the `env` of `run_vm_command` and in the content of `write_vm_secret_file` (a mode 600 file on an enrolled VM). The value travels over the guest SSH channel's stdin, never on a command line. Unknown or ungranted names fail closed. Tool results, histories and events are scrubbed of the exact value and its base64 and URL-encoded forms.
+
+Limits: this guards against accidental leaks, not hostile agents. An agent with a shell on the VM can read the value (for example from the environment of its own command or from the written file), and encodings other than those above are not recognized. Values shorter than 8 characters are refused so scrubbing stays reliable.
+
 ## External MCP tools
 
 MCP is optional and uses Pydantic AI's existing remote Streamable HTTP support. Only HTTPS endpoints without embedded credentials, query strings or fragments are accepted; local stdio/process transports are unavailable. Endpoint and bearer-credential administration requires a human CloudStack administrator authorized for the main agent's domain. Child administrators cannot replace an inherited endpoint or secret; they may assign only tools allowed by every ancestor agent. This application tool assignment does not grant CloudStack infrastructure permissions.

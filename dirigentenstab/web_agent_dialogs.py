@@ -289,6 +289,10 @@ def setup_agent_dialogs(ctx):
                 value=provider_access['selected']).classes('w-full')
             if provider_access['allowed'] is not None:
                 ui.label('Ancestor access limits currently available providers. Saved selections are retained.').classes('text-sm text-stone-600')
+            secret_access = await service.secret_configuration(current, agent)
+            enabled_secrets = ui.select(secret_access['names'], label='Granted secrets', multiple=True,
+                value=secret_access['selected']).classes('w-full').mark('enabled-secrets')
+            ui.label('Agents see granted secret names only. Ancestor access limits what can be granted.').classes('text-sm text-stone-600')
             provider = ui.select(options, label='Model provider', value=agent.get('provider_id')).classes('w-full')
             original_model = agent.get('model', '')
             model = ui.select([original_model] if original_model else [], label='Model ID', value=original_model or None,
@@ -460,7 +464,7 @@ def setup_agent_dialogs(ctx):
                       on_click=lambda: protect(lambda: mcp_dialog(agent['id']))).props('outline')
 
             async def save():
-                options = {'enabled_providers': enabled_providers.value}
+                options = {'enabled_providers': enabled_providers.value, 'enabled_secrets': enabled_secrets.value}
                 if escalation_access['allowed']:
                     options['escalation_requests_enabled'] = escalation_enabled.value
                 if key_access['allowed']:

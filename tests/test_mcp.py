@@ -214,6 +214,8 @@ def test_migration_preserves_existing_agents(environment):
     e.store.execute('ALTER TABLE agents DROP COLUMN thinking')
     e.store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     e.store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    e.store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    e.store.execute('DROP TABLE secrets')
     e.store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     e.store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     e.store.execute('DROP TABLE escalation_requests')
@@ -223,7 +225,7 @@ def test_migration_preserves_existing_agents(environment):
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 22
+    assert store.one('PRAGMA user_version')['user_version'] == 23
     assert all(row['owner_ssh_key_enabled'] == 1 for row in store.all('SELECT * FROM agents'))
 
 
@@ -673,3 +675,54 @@ async def test_global_settings_updates_cannot_widen_own_allowances(environment):
                                  owner_ssh_key_enabled=True, enabled_mcp_servers=[server])
     main = await e.service.agent(APP_ROOT_AGENT)
     assert main['owner_ssh_key_enabled'] == 1 and json.loads(main['enabled_mcp_servers']) == [server]
+
+
+async def grant_secrets(e):
+    native_actor_clients(e)
+    e.service.save_secret(e.root, 'GH_TOKEN', 'ghp_sample/secret+value==')
+    for agent_id in (APP_ROOT_AGENT, 'middle-agent', 'leaf-agent'):
+        await e.service.update_agent(e.root, agent_id, None, '', '', enabled_secrets=['GH_TOKEN'])
+
+
+async def test_secrets_are_write_only_names_granted_by_strict_ancestor_inheritance(environment):
+    e = environment
+    await grant_secrets(e)
+    leaf = await e.service.agent('leaf-agent')
+    assert e.service.secret_names() == ['GH_TOKEN']
+    assert 'ghp_sample' not in json.dumps(await e.service.secret_configuration(e.root, leaf))
+    assert await e.service.expand_secrets('leaf-agent', 'a={{secret:GH_TOKEN}}') == 'a=ghp_sample/secret+value=='
+    assert 'ghp_sample' not in json.dumps((await e.service.context(leaf)).get('secret_names'))
+    assert (await e.service.context(leaf))['secret_names'] == ['GH_TOKEN']
+    # An ancestor revoking the grant removes access below it without touching the child's stored selection.
+    await e.service.update_agent(e.root, 'middle-agent', None, '', '', enabled_secrets=[])
+    with pytest.raises(PermissionError, match='unknown or not granted'):
+        await e.service.expand_secrets('leaf-agent', '{{secret:GH_TOKEN}}')
+    # A child cannot widen beyond its ancestor, 
+    e.service.save_secret(e.root, 'OTHER', 'other-secret-value')
+    with pytest.raises(PermissionError, match='cannot widen'):
+        await e.service.update_agent(e.root, 'leaf-agent', None, '', '', enabled_secrets=['GH_TOKEN', 'OTHER'])
+    # Replacing keeps the grant; deleting prunes it so a recreated name starts ungranted.
+    e.service.save_secret(e.root, 'GH_TOKEN', 'replacement-value')
+    await e.service.update_agent(e.root, 'middle-agent', None, '', '', enabled_secrets=['GH_TOKEN'])
+    assert await e.service.expand_secrets('leaf-agent', '{{secret:GH_TOKEN}}') == 'replacement-value'
+    e.service.delete_secret(e.root, 'GH_TOKEN')
+    e.service.save_secret(e.root, 'GH_TOKEN', 'recreated-value')
+    with pytest.raises(PermissionError, match='unknown or not granted'):
+        await e.service.expand_secrets('leaf-agent', '{{secret:GH_TOKEN}}')
+    with pytest.raises(PermissionError, match='administrator'):
+        e.service.save_secret({'userid': 'agent', 'type': 1, '_agent_id': 'leaf-agent'}, 'X', 'abcdefgh1')
+    with pytest.raises(ValueError, match='Secret is unavailable'):
+        await e.service.update_agent(e.root, 'leaf-agent', None, '', '', enabled_secrets=['MISSING'])
+
+
+async def test_secret_values_are_scrubbed_in_plain_base64_and_url_forms_and_survive_restart(environment):
+    import base64
+    from urllib.parse import quote, quote_plus
+    e = environment
+    value = 'ghp_sample/secret+value== &'
+    e.service.save_secret(e.root, 'GH_TOKEN', value)
+    forms = [value, base64.b64encode(value.encode()).decode(), base64.urlsafe_b64encode(value.encode()).decode(),
+             base64.b64encode(value.encode()).decode().rstrip('='), quote(value, safe=''), quote_plus(value)]
+    for service in (e.service, Service(e.store, SimpleNamespace())):
+        for form in forms:
+            assert service.redact({'out': f'x {form} y'}) == {'out': 'x [redacted] y'}

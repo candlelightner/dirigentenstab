@@ -53,6 +53,12 @@ class AgentCapabilities:
         providers = await self.providers(identity)
         return {'providers': providers, 'selected': [row['id'] for row in providers], 'allowed': None}
 
+    def secret_names(self):
+        return []
+
+    async def secret_configuration(self, identity, agent):
+        return {'names': [], 'selected': [], 'allowed': None}
+
 
 def test_tree_uses_cloudstack_parents_and_only_safe_agent_labels():
     data = {

@@ -80,12 +80,14 @@ def test_compaction_migration_retains_original_encrypted_history_and_keys(servic
         store.execute('ALTER TABLE agents DROP COLUMN ' + column)
     store.execute('ALTER TABLE agents DROP COLUMN enabled_mcp_servers')
     store.execute('ALTER TABLE agents DROP COLUMN enabled_providers')
+    store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
+    store.execute('DROP TABLE secrets')
     store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('PRAGMA user_version=13')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 22
+    assert reopened.one('PRAGMA user_version')['user_version'] == 23
     assert reopened.one('SELECT messages FROM conversations')['messages'] == history
     assert reopened.one('SELECT credentials FROM agents')['credentials'] == original
     assert reopened.one('SELECT auto_compact_percent FROM agents')['auto_compact_percent'] is None
@@ -145,7 +147,7 @@ async def test_runtime_uses_selected_compactor_and_keeps_full_archive_across_tur
     original = [ModelRequest(parts=[UserPromptPart('Original task: ' + 'important facts ' * 1800)]),
                 ModelResponse(parts=[TextPart('Old completed work ' * 1000)]),
                 ModelRequest(parts=[UserPromptPart('Preserve resource R-123')]),
-                ModelResponse(parts=[TextPart('Recent result ' * 100)])]
+                ModelResponse(parts=[TextPart('Recent result ' * 40)])]
     store = service.store
     store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
                   ('conversation', 'agent', 'owner', 'Long task', 1,

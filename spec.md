@@ -203,6 +203,19 @@ Each of those is refused for a domain administrator and for every agent identity
 - Disabling a provider, server, or tool at an ancestor makes it unavailable to
   every descendant immediately for subsequent dispatches. Preserve descendants'
   selections so access can return when the ancestor enables it again.
+- Named secrets (for example `gh` tokens or dev-VM API keys) are set write-only
+  by the human owner in Platform settings: a value can be replaced or deleted,
+  never shown again, and is sealed with the master key. Agents see granted
+  names only. Grants follow the same strict ancestor inheritance as providers
+  and MCP servers, except that an unset selection grants nothing. The hub
+  injects values at execution time through exactly two sinks: `{{secret:NAME}}`
+  placeholders in the `env` of `run_vm_command`, and `write_vm_secret_file`
+  (mode 600 file on an enrolled VM). Both send values over SSH stdin, never on
+  a command line. Unknown or ungranted names fail closed. All tool output,
+  histories and events are scrubbed of each value and its base64 and
+  URL-encoded forms. This guards against accidental leaks, not hostile agents:
+  an agent with a shell on the VM can read the value. Rotation UI, external
+  vaults, per-secret ACLs and audit dashboards are out of scope.
 - These small inherited provider/MCP rules belong to the hub because CloudStack
   does not manage external model and tool access. They are not a second system
   for infrastructure permissions.

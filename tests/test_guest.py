@@ -40,6 +40,13 @@ def guest(tmp_path):
         def redact(self, result):
             return result
 
+        async def expand_secrets(self, agent_id, text):
+            if '{{secret:' not in text:
+                return text
+            if '{{secret:GH_TOKEN}}' not in text:
+                raise PermissionError('Secret is unknown or not granted to this agent')
+            return text.replace('{{secret:GH_TOKEN}}', 'ghp_value')
+
     return Guest(Service())
 
 
@@ -253,3 +260,52 @@ async def test_ancestor_guest_access_uses_the_acting_native_identity_and_existin
     with pytest.raises(PermissionError, match='not accessible'):
         await guest._target('sibling', 'vm')
     assert actors == ['parent', 'sibling']
+
+
+async def test_secret_env_and_file_travel_over_stdin_never_the_command_line(guest, monkeypatch):
+    client_key = asyncssh.generate_private_key('ssh-ed25519')
+    host_key = asyncssh.generate_private_key('ssh-ed25519')
+    seen = []
+
+    class Server(asyncssh.SSHServer):
+        def begin_auth(self, username):
+            return True
+
+        def public_key_auth_supported(self):
+            return True
+
+        def validate_public_key(self, username, key):
+            return key == client_key.convert_to_public()
+
+    async def process_handler(process):
+        seen.append((process.command, await process.stdin.read()))
+        process.exit(0)
+
+    async with asyncssh.create_server(Server, '127.0.0.1', 0, server_host_keys=[host_key],
+                                     process_factory=process_handler) as server:
+        record = {'username': 'dirigent', 'private_key': guest.service.store.seal(client_key.export_private_key().decode()),
+                  'host_key': host_key.export_public_key().decode(), 'port': server.get_port()}
+
+        async def target(*args):
+            return '127.0.0.1', record
+
+        monkeypatch.setattr(guest, '_target', target)
+        await guest.run_vm_command('agent', 'vm', 'gh auth status', env={'GH_TOKEN': '{{secret:GH_TOKEN}}'})
+        command, stdin = seen[-1]
+        assert 'ghp_value' not in command and 'GH_TOKEN' not in command
+        assert stdin == 'export GH_TOKEN=ghp_value\ngh auth status'
+        await guest.write_vm_secret_file('agent', 'vm', '~/.config/gh/hosts.yml',
+                                         'github.com:\n  oauth_token: {{secret:GH_TOKEN}}\n')
+        command, stdin = seen[-1]
+        assert 'ghp_value' not in command and 'chmod 600' in command and 'umask 077' in command
+        assert stdin == 'github.com:\n  oauth_token: ghp_value\n'
+        count = len(seen)
+        with pytest.raises(PermissionError, match='not granted'):
+            await guest.run_vm_command('agent', 'vm', 'id', env={'X': '{{secret:OTHER}}'})
+        with pytest.raises(PermissionError, match='not granted'):
+            await guest.write_vm_secret_file('agent', 'vm', '/tmp/x', '{{secret:OTHER}}')
+        with pytest.raises(ValueError, match='env must'):
+            await guest.run_vm_command('agent', 'vm', 'id', env={'bad-name': 'x'})
+        with pytest.raises(ValueError, match='Path must'):
+            await guest.write_vm_secret_file('agent', 'vm', 'relative/path', 'x')
+        assert len(seen) == count
