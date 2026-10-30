@@ -77,6 +77,7 @@ End with a short report:
 - What is still open or uncertain.
 - What you need from the owner, as concrete questions each with your recommended answer.
 '''
+GLOBAL_ADMIN_INSTRUCTIONS = 'Manage CloudStack globally using your own native root administrator identity.\n\n' + DEFAULT_INSTRUCTIONS
 
 
 def first(response, key):
@@ -1684,7 +1685,7 @@ class Service:
                                (GLOBAL_ADMIN_AGENT, 'Global Admin', root['id'],
                                 main['provider_id'] if main and main['provider_id'] else provider['id'] if provider else None,
                                 main['model'] if main and main['provider_id'] else provider['default_model'] if provider else '',
-                                DEFAULT_INSTRUCTIONS, time.time()))
+                                GLOBAL_ADMIN_INSTRUCTIONS, time.time()))
             op = self.store.one('SELECT * FROM provisioning WHERE id=?', (GLOBAL_ADMIN_AGENT,))
             return await self._provision(op, cloud, root['id'], fresh)
 
