@@ -157,7 +157,11 @@ account or registration system; roles come solely from CloudStack.
   action details, known outcomes, and inspection tools so it can decide whether
   to retry, continue, or pause. Do not build a universal recovery framework for
   every possible SSH command or external service; agents handle those situations.
-- Show completion, unread activity, and blocked/paused status in the hub.
+- Show completion, unread activity, and blocked/paused status in the hub: each
+  conversation in the selector carries a compact running, queued, blocked/paused,
+  or unread-output marker, and the sidebar tree dots agents with unread or
+  blocked/paused conversations. Opening a conversation marks it seen (tracked per
+  human). A run waiting for one of the 4 global run slots shows as Queued.
   External notifications are not required for V1.
 
 ## Agent configuration and external services

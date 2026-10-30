@@ -93,6 +93,19 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
     return all_nodes
 
 
+def mark_attention(nodes, attention):
+    """Set attention markers (blocked/unread) in place on agent nodes and their ancestors; True when any node changed."""
+    changed = False
+    for node in nodes:
+        changed = mark_attention(node.get('children', []), attention) or changed
+        found = {attention.get(node['id'].removeprefix('agent:')) if node['id'].startswith('agent:') else None}
+        found |= {child.get('attention') for child in node.get('children', [])}
+        marker = 'blocked' if 'blocked' in found else 'unread' if 'unread' in found else None
+        if node.get('attention') != marker:
+            node['attention'], changed = marker, True
+    return changed
+
+
 def build_sidebar(ctx):
     data, identity, protect = ctx.data, ctx.identity, ctx.protect
 
@@ -121,7 +134,9 @@ def build_sidebar(ctx):
                 ctx.tree = ui.tree(hierarchy_nodes(data, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value)).props('dense selected-color=primary').classes('w-full').mark('hierarchy')
                 ctx.tree.add_slot('default-header', '''<div class="row items-center no-wrap" style="min-width:0" :title="props.node.label">
                     <q-icon :name="props.node.icon" size="sm" class="q-mr-sm" />
-                    <span class="ellipsis">{{ props.node.label }}</span></div>''')
+                    <span class="ellipsis">{{ props.node.label }}</span>
+                    <q-badge v-if="props.node.attention" rounded color="teal-8" class="q-ml-sm" role="img"
+                    :aria-label="props.node.attention === 'blocked' ? 'Blocked or paused conversation' : 'Unread conversation output'" /></div>''')
             ctx.status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
             if identity.get('type') == 1:
                 ctx.dashboard_link('dashboard-mobile w-full text-teal-900')

@@ -219,13 +219,14 @@ def test_migration_preserves_existing_agents(environment):
     e.store.execute('ALTER TABLE agents DROP COLUMN owner_ssh_key_enabled')
     e.store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     e.store.execute('DROP TABLE escalation_requests')
+    e.store.execute('DROP TABLE conversation_seen')
     e.store.execute('PRAGMA user_version=10')
     store = Store(str(e.store.path), str(e.key))
     assert {row['id']: row['credentials'] for row in store.all('SELECT id,credentials FROM agents')} == original
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 23
+    assert store.one('PRAGMA user_version')['user_version'] == 24
     assert all(row['owner_ssh_key_enabled'] == 1 for row in store.all('SELECT * FROM agents'))
 
 

@@ -872,6 +872,31 @@ async def test_stop_cancels_execution_queued_before_model_dispatch(service, monk
     assert not manager.active and not manager.running
 
 
+async def test_run_is_queued_until_it_gets_a_slot(service, monkeypatch):
+    import asyncio
+
+    async def model(messages, info):
+        yield 'Done'
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    manager.slots = asyncio.Semaphore(0)
+    started = asyncio.Event()
+
+    async def emit(event):
+        if event['type'] == 'run_started':
+            started.set()
+
+    task = asyncio.create_task(manager.chat({'userid': 'human'}, 'parent', None, 'Inspect', emit))
+    await asyncio.wait_for(started.wait(), 2)
+    operation_id = service.store.one('SELECT id FROM chat_runs')['id']
+    assert manager.queued == {operation_id}
+    assert (await manager.conversations({'userid': 'human'}, 'parent'))[0]['operation_id'] == operation_id
+    manager.slots.release()
+    assert (await asyncio.wait_for(task, 5))['status'] == 'completed'
+    assert not manager.queued
+
+
 async def test_stop_rejects_other_humans_and_current_domain_scope_even_for_known_run(service, monkeypatch):
     async def model(messages, info):
         yield 'Complete'

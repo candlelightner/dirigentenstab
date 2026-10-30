@@ -185,6 +185,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
                 agent['owner_ssh_key_enabled'] = compaction['owner_ssh_key_enabled']
 
     class Runtime:
+        queued = set()
         async def start(self):
             pass
 
@@ -367,6 +368,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
             return []
 
     class Runtime:
+        queued = set()
         async def start(self):
             pass
 
@@ -551,6 +553,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
             agent.update(provider_id=provider_id, model=model, instructions=instructions, thinking=thinking)
 
     class Runtime:
+        queued = set()
         async def start(self):
             pass
 
@@ -639,6 +642,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
             return []
 
     class Runtime:
+        queued = set()
         async def start(self):
             pass
 
@@ -736,6 +740,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
             agent.update(provider_id=provider_id, model=model, instructions=instructions, **settings)
 
     class Runtime:
+        queued = set()
         async def start(self):
             pass
 
@@ -829,6 +834,8 @@ def test_hub_activity_only_includes_owner_visible_agents_and_latest_run():
     database.row_factory = sqlite3.Row
     database.executescript('CREATE TABLE conversations(id,agent_id,human_id,title);'
                            'CREATE TABLE chat_runs(id,conversation_id,status,created,updated);'
+                           'CREATE TABLE conversation_seen(human_id,conversation_id,seen);'
+                           "INSERT INTO conversation_seen VALUES('owner','c',2.5);"
                            "INSERT INTO conversations VALUES('c','visible','owner','Owned task'),"
                            "('hidden','hidden','owner','Hidden task'),('other','visible','other','Other owner');"
                            "INSERT INTO chat_runs VALUES('old','c','running',1,1),('new','c','completed',2,3),"
@@ -837,8 +844,34 @@ def test_hub_activity_only_includes_owner_visible_agents_and_latest_run():
         def all(self, sql, params):
             return [dict(row) for row in database.execute(sql, params)]
     assert conversation_activity(Store(), 'owner', ['visible']) == [
-        {'id': 'c', 'agent_id': 'visible', 'title': 'Owned task', 'operation_id': 'new', 'status': 'completed', 'updated': 3}]
+        {'id': 'c', 'agent_id': 'visible', 'title': 'Owned task', 'operation_id': 'new', 'status': 'completed', 'updated': 3, 'seen': 2.5}]
     assert conversation_activity(Store(), 'owner', []) == []
+
+
+def test_activity_marker_tracks_seen_state_and_queue():
+    from dirigentenstab.web_chat import activity_marker
+
+    run = {'operation_id': 'run', 'updated': 5, 'seen': 4}
+    assert activity_marker(run | {'status': 'running'}) == 'running'
+    assert activity_marker(run | {'status': 'running'}, {'run'}) == 'queued'
+    assert activity_marker(run | {'status': 'completed'}) == 'unread'
+    assert activity_marker(run | {'status': 'completed', 'seen': None}) == 'unread'
+    assert activity_marker(run | {'status': 'completed', 'seen': 5}) is None
+    assert activity_marker(run | {'status': 'interrupted'}) == 'blocked'
+    assert activity_marker(run | {'status': 'reconciliation', 'seen': 6}) is None
+    assert activity_marker({'status': None}) is None
+
+
+def test_mark_attention_sets_agent_and_ancestor_nodes_in_place_and_reports_changes():
+    from dirigentenstab.web_sidebar import mark_attention
+
+    nodes = [{'id': 'agent:p', 'children': [{'id': 'agent:a', 'children': []}, {'id': 'agent:b', 'children': []}]}]
+    assert mark_attention(nodes, {'a': 'unread'})
+    assert [nodes[0]['attention'], nodes[0]['children'][0]['attention'], nodes[0]['children'][1].get('attention')] == [
+        'unread', 'unread', None]
+    assert not mark_attention(nodes, {'a': 'unread'})
+    assert mark_attention(nodes, {'a': 'unread', 'b': 'blocked'}) and nodes[0]['attention'] == 'blocked'
+    assert mark_attention(nodes, {}) and nodes[0]['attention'] is None
 
 
 async def test_polling_preserves_conversation_option_values_when_activity_reorders_rows():
@@ -860,6 +893,7 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
             return []
 
     class Runtime:
+        queued = set()
         rows = [{'id': 'second', 'title': 'Second task'}, {'id': 'first', 'title': 'First task'}]
         restored = []
 
@@ -913,6 +947,7 @@ async def test_polling_updates_text_and_tool_status_without_replacing_history(mo
             return []
 
     class Runtime:
+        queued = set()
         version = 0
         async def conversations(self, current, agent_id):
             return [{'id': 'conversation', 'title': 'Task'}]
@@ -1057,6 +1092,7 @@ async def test_unknown_main_pane_query_ids_fall_back_to_default_agent():
             return []
 
     class Runtime:
+        queued = set()
         async def conversations(self, current, agent_id):
             return []
 
