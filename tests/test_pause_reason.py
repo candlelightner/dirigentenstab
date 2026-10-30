@@ -66,3 +66,13 @@ def test_escalation_notices_are_placed_after_their_request_activity():
         ('agent', None), ('activity', None), ('Escalation approved', ('escalation', 'e2')), ('agent', None),
         ('Escalation approved, but the command failed', ('escalation', 'e6')),
     ]
+
+
+def test_history_parts_strips_gemma_channel_thought_and_skips_empty_bubbles():
+    def reply(*texts):
+        return {'messages': [{'kind': 'response', 'parts': [{'part_kind': 'text', 'content': t} for t in texts]}]}
+
+    assert list(history_parts(reply('<|channel>thought\n<channel|>', '<|channel>thought'))) == []
+    assert list(history_parts(reply('<|channel>thought\nPlan the call.<channel|>Done.'))) == [('agent', 'Done.')]
+    assert list(history_parts(reply('<|channel>thought\nFinal answer'))) == [('agent', 'Final answer')]
+    assert list(history_parts(reply('<|channel>Done.'))) == [('agent', 'Done.')]

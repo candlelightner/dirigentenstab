@@ -99,6 +99,9 @@ def build_sidebar(ctx):
     # QDrawer owns responsive visibility; a server model can lag a viewport change and reopen it.
     with ui.left_drawer(value=False).props('show-if-above breakpoint=900 bordered width=300 '
             ':model-value="null"').classes('bg-stone-50') as ctx.drawer:
+        # Same 900px as the breakpoint above: wide screens keep the drawer pinned open.
+        ctx.close_drawer = lambda: ui.run_javascript(
+            f'if (innerWidth < 900) runMethod({ctx.drawer.id}, "hide", [])')
         with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
             with ui.row().classes('w-full items-center no-wrap'):
                 ctx.sidebar_select = ui.select(['Agents', 'VMs', 'Skills'], multiple=True, value=['Agents']).props(
@@ -183,7 +186,7 @@ def setup_sidebar(ctx):
             if identifier != state.get('requested_agent', state['agent']) or ctx.terminal_pane.visible:
                 await ctx.show_agent(identifier)
             else:
-                ctx.drawer.run_method('hide')
+                ctx.close_drawer()
         elif kind == 'domain':
             current = await actor()
             updated = await service.hierarchy(current)

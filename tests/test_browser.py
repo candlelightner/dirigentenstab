@@ -138,7 +138,8 @@ async def select_agent(page, name):
     search = page.get_by_label('Search agents and domains', exact=True)
     await search.fill(name)
     await page.locator('.q-tree').get_by_text(name, exact=True).click()
-    await search.wait_for(state='hidden')
+    if page.viewport_size['width'] < 900:  # the drawer closes on narrow widths only
+        await search.wait_for(state='hidden')
     await page.get_by_role('button', name='Agent details', exact=True).get_by_text(name, exact=True).wait_for()
 
 
@@ -183,7 +184,7 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await page.get_by_label('Conversation', exact=True).fill('Inspect the research VM')
         await page.get_by_role('option', name='Inspect the research VM', exact=True).click()
         await page.get_by_text(output, exact=True).wait_for()
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await open_sidebar(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('button', name='Model providers', exact=True).click()
         await page.get_by_label('Base URL (including /v1)', exact=True).wait_for()
@@ -717,7 +718,8 @@ async def test_browser_global_admin_separate_entry_and_configuration(browser_app
             global_box, main_box = await global_node.bounding_box(), await main_node.bounding_box()
             assert global_box and main_box and global_box['y'] < main_box['y']
             await global_node.click()
-            await search.wait_for(state='hidden')
+            if width < 900:
+                await search.wait_for(state='hidden')
             await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Global Admin', exact=True).wait_for()
             await page.get_by_role('button', name='Agent details', exact=True).click()
             await page.locator('.agent-details').get_by_text('Root administrator', exact=True).wait_for()
@@ -1107,11 +1109,12 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await page.screenshot(path=str(state / 'escalation-pending-mobile.png'), full_page=True, animations='disabled')
         await page.get_by_role('button', name='Approve', exact=True).click()
-        await page.get_by_text('Approved', exact=True).wait_for()
+        await dialog.get_by_text('Approved', exact=True).wait_for()
         executed = json.loads((state / 'escalation-executed.json').read_text())
         assert executed == {'command': 'updateVirtualMachine', 'params': {
             'id': '00000000-0000-0000-0000-000000000004', 'name': 'Research revised'}}
         await dialog.get_by_role('button', name='Back to requests', exact=True).click()
+        await playwright.expect(request_list.locator('.escalation-summary').first).to_contain_text('Approved')
         await page.get_by_role('button', name='Close', exact=True).click()
         await page.get_by_text('Escalation result available.', exact=True).wait_for()
         await page.reload()
@@ -1130,6 +1133,7 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         await dialog.get_by_role('button', name='Dismiss', exact=True).click()
         await dialog.get_by_text('Dismissed', exact=True).wait_for()
         await dialog.get_by_role('button', name='Back to requests', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog').locator('.escalation-summary').first).to_contain_text('Dismissed')
         await page.get_by_role('button', name='Close', exact=True).click()
         await page.get_by_text('Escalation declined', exact=True).wait_for()
         store = Store(str(state / 'browser.db'), str(state / 'master'))
@@ -1143,6 +1147,34 @@ async def test_escalation_requests_review_approve_dismiss_and_inheritance(browse
         assert store.one("SELECT escalation_requests_enabled FROM agents WHERE id='research'")['escalation_requests_enabled'] == 1
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await page.screenshot(path=str(state / 'escalation-mobile.png'), full_page=True, animations='disabled')
+        await browser.close()
+
+
+@pytest.mark.parametrize('width,drawer_open', [(1440, True), (390, False)])
+async def test_selecting_agent_closes_drawer_only_on_narrow_widths(browser_app, width, drawer_open):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': width, 'height': 844})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await page.wait_for_timeout(500)
+        assert await page.get_by_label('Search agents and domains', exact=True).is_visible() == drawer_open
+        await browser.close()
+
+
+async def test_configure_prefills_empty_model_from_provider_default(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    Store(str(state / 'browser.db'), str(state / 'master')).execute("UPDATE agents SET model='' WHERE id='research'")
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await open_configuration(page)
+        await playwright.expect(page.get_by_label('Model ID', exact=True)).to_have_value('fixture-model')
         await browser.close()
 
 
@@ -1348,13 +1380,14 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
         await search.fill('Research Admin')
         await page.locator('.q-tree').get_by_text('Research Admin', exact=True).click()
-        await search.wait_for(state='hidden')
+        if page.viewport_size['width'] < 900:
+            await search.wait_for(state='hidden')
         await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Research Admin', exact=True).wait_for()
         await playwright.expect(page.locator('.q-tree')).not_to_have_attribute('aria-disabled', 'true')
         await page.get_by_label('Message', exact=True).wait_for()
         await playwright.expect(frame).to_have_attribute('src', 'about:blank')
         await playwright.expect(terminal_pane).not_to_be_visible()
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await open_sidebar(page)
         await search.fill('research-vm')
         await vm_node.click()
         await terminal_pane.wait_for()
@@ -1493,7 +1526,7 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await page.locator('.messages table').wait_for()
         await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_visible()
         scroll = page.locator('.messages .q-scrollarea__container')
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await open_sidebar(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         toggle = page.get_by_role('switch', name='Chat autoscroll', exact=True)
         await playwright.expect(toggle).to_be_checked()
@@ -1515,7 +1548,7 @@ async def test_browser_chat_autoscroll_setting_persists_and_controls_tool_update
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         assert await page.get_by_text('execute_api · Completed', exact=False).count() >= 1
         assert abs(await scroll.evaluate('el => el.scrollTop') - 100) < 5
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await open_sidebar(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         await toggle.click()
         await playwright.expect(toggle).to_be_checked()
@@ -1543,7 +1576,7 @@ async def test_browser_autoscroll_off_keeps_position_when_declined_notice_shifts
         await page.get_by_role('button', name='Send', exact=True).click()
         await page.locator('.messages table').wait_for()
         await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_visible()
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+        await open_sidebar(page)
         await page.get_by_role('button', name='Settings', exact=True).click()
         await page.get_by_role('switch', name='Chat autoscroll', exact=True).click()
         await page.keyboard.press('Escape')

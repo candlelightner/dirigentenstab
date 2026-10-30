@@ -4,6 +4,7 @@ from urllib.parse import urlencode
 
 from nicegui import ui
 
+from . import thinking
 from .diagnostics import diagnose
 from .web_sidebar import agent_label
 
@@ -58,7 +59,11 @@ def history_parts(history):
                     or kind == 'system-prompt' and part.get('dynamic_ref') == 'compute_offering_decision'):
                 yield 'notice', 'Compute offering approved and now available.'
             elif kind in {'user-prompt', 'text'}:
-                yield 'human' if kind == 'user-prompt' else 'agent', str(part.get('content', ''))
+                text = str(part.get('content', ''))
+                if kind == 'text':
+                    text = thinking.visible_text(text)
+                if text or kind == 'user-prompt':
+                    yield 'human' if kind == 'user-prompt' else 'agent', text
             elif kind in {'tool-call', 'tool-return'}:
                 event_type = 'tool_call' if kind == 'tool-call' else 'tool_result'
                 key = (event_type, part.get('tool_call_id'))
@@ -298,7 +303,7 @@ def setup_chat(ctx):
         ctx.tree.props['selected'] = 'agent:' + agent_id
         ctx.tree.update()
         if close_navigation:
-            ctx.drawer.run_method('hide')
+            ctx.close_drawer()
         ctx.details.clear()
         domain = next((d for d in state['data'].get('domains', []) if d['id'] == agent['domain_id']), {})
         with ctx.details:

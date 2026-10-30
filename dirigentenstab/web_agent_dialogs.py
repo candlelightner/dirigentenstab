@@ -255,7 +255,9 @@ def setup_agent_dialogs(ctx):
         ctx.details_menu.close()
         current = await actor()
         agent = await service.authorize(current, state['agent'])
-        options = {p['id']: p['name'] for p in await service.providers(current)}
+        provider_rows = await service.providers(current)
+        options = {p['id']: p['name'] for p in provider_rows}
+        default_models = {p['id']: p.get('default_model') for p in provider_rows}
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-xl gap-4'):
             ui.label('Configure ' + agent['name']).classes('text-xl font-semibold')
             key_access = await service.owner_ssh_key_access(agent)
@@ -416,7 +418,7 @@ def setup_agent_dialogs(ctx):
                     choices = await runtime.models(await actor(), selected_provider) if selected_provider else []
                     if provider.value != selected_provider:
                         return
-                    selected_model = model.value
+                    selected_model = model.value or default_models.get(selected_provider) or None
                     model.set_options(list(dict.fromkeys(([selected_model] if selected_model else []) + choices)),
                                       value=selected_model)
                     model_status.set_text(f'{len(choices)} models available. Custom IDs can be entered.' if choices
