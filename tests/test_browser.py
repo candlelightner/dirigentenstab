@@ -93,6 +93,12 @@ async def test_browser_vm_file_browser_lists_downloads_uploads_and_restores(brow
         await page.get_by_text('Overwrite upload.txt?', exact=True).wait_for()
         await page.get_by_role('button', name='Cancel', exact=True).click()
         assert (state / 'vm-files' / 'docs' / 'upload.txt').read_bytes() == b'uploaded'
+        huge = state / 'huge.bin'
+        with huge.open('wb') as out:
+            out.truncate(100 * 1024 * 1024 + 1)  # Sparse; Playwright caps in-memory buffers at 50 MB.
+        await files.locator('input[type=file]').set_input_files(huge)
+        await page.get_by_text('File too large (limit 100 MiB per file)', exact=True).wait_for()
+        assert not (state / 'vm-files' / 'docs' / 'huge.bin').exists()
         await pane.get_by_role('button', name='Parent directory', exact=True).click()
         await playwright.expect(pane.get_by_label('Path', exact=True)).to_have_value('/')
         await pane.get_by_label('Path', exact=True).fill('/b.txt')

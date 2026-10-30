@@ -6,7 +6,7 @@ import time
 import asyncssh
 from nicegui import ui
 
-from .files import MAX_UPLOAD, store_upload
+from .files import MAX_UPLOAD, UPLOAD_LIMIT_TEXT, store_upload
 from .web_sidebar import agent_label
 
 
@@ -99,8 +99,9 @@ def build_vm_view(ctx):
             ctx.files_list = ui.list().props('dense separator').classes('w-full flex-1 min-h-0 overflow-auto').mark('files_list')
             ctx.files_upload = ui.upload(label='Upload to this folder', multiple=True, auto_upload=True, max_file_size=MAX_UPLOAD,
                                      on_multi_upload=lambda e: protect(lambda: ctx.upload_files(e.files)),
-                                     on_rejected=lambda: ctx.terminal_error.set_text('A file exceeds the upload limit') or ctx.terminal_error.set_visibility(True),
+                                     on_rejected=lambda: ui.notify(f'File too large (limit {UPLOAD_LIMIT_TEXT} per file)', type='negative'),
                                      ).props('flat bordered dense').classes('w-full max-w-full').mark('files_upload')
+            ctx.files_upload.on('failed', lambda: ui.notify('Upload failed', type='negative'))
         ctx.files_pane.set_visibility(False)
 
 
@@ -377,8 +378,7 @@ def setup_vm(ctx):
                         await store_upload(files_sftp, ctx.files_dir, upload, overwrite=True)
                     service.store.audit(current['userid'], 'vm-file-upload', vm_id)
                 except (OSError, ValueError, asyncssh.Error) as exc:
-                    ctx.terminal_error.set_text(f'{upload.name}: {exc}')
-                    ctx.terminal_error.set_visibility(True)
+                    ui.notify(f'{upload.name}: {exc}', type='negative')
         finally:
             ctx.files_upload.reset()
         if request == ssh_request:

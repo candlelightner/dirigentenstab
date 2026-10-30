@@ -10,7 +10,7 @@ from .auth import transient
 from .cloud import CloudError
 from .console import ConsoleProxy
 from .diagnostics import diagnose
-from .files import VMFiles
+from .files import VMFiles, use_spool_dir
 from .platform_status import banner
 from .runtime import Runtime
 from .settings import Settings
@@ -252,6 +252,7 @@ def main():
     from .service import Service
 
     settings = Settings.load()
+    use_spool_dir(os.path.join(os.path.dirname(settings.database), '.dirigentenstab-upload-spool'))
     service = Service(Store(settings.database, settings.key_file), settings)
     auth = Auth(service)
     attach(app, auth, settings)
