@@ -21,6 +21,8 @@ UPLOAD_LIMIT_TEXT = f'{MAX_UPLOAD // 1024 // 1024} MiB'
 
 def use_spool_dir(path):
     """Spool uploads on disk (the data volume) instead of the small /tmp tmpfs; wipe leftovers from a previous run."""
+    if os.path.islink(path) or (os.path.exists(path) and (not os.path.isdir(path) or os.stat(path).st_uid != os.getuid())):
+        raise RuntimeError(f'Upload spool {path} is not a directory owned by this user')
     shutil.rmtree(path, ignore_errors=True)
     os.makedirs(path, mode=0o700)
     tempfile.tempdir = path

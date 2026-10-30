@@ -252,7 +252,7 @@ def main():
     from .service import Service
 
     settings = Settings.load()
-    use_spool_dir(os.path.join(os.path.dirname(settings.database), 'tmp'))
+    use_spool_dir(os.path.join(os.path.dirname(settings.database), '.dirigentenstab-upload-spool'))
     service = Service(Store(settings.database, settings.key_file), settings)
     auth = Auth(service)
     attach(app, auth, settings)

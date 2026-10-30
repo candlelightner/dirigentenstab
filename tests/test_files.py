@@ -139,5 +139,9 @@ def test_use_spool_dir_replaces_tmpfs_tempdir(tmp_path, monkeypatch):
     use_spool_dir(str(spool))
     assert tempfile.gettempdir() == str(spool)
     assert list(spool.iterdir()) == [] and spool.stat().st_mode & 0o777 == 0o700
+    link = tmp_path / 'link'
+    link.symlink_to(spool)
+    with pytest.raises(RuntimeError):
+        use_spool_dir(str(link))
     with tempfile.NamedTemporaryFile() as f:
         assert os.path.dirname(f.name) == str(spool)
