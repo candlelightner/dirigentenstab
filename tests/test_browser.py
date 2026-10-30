@@ -1440,6 +1440,12 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
                         arg=current)
             await page.keyboard.press('Escape')
 
+        async def tree_settled():
+            # The server persists the view before it sends the new nodes, and the tree animates its
+            # height while expanding: its children overflow the clipped scroll area until it is done.
+            await page.wait_for_function(
+                "() => { const t = document.querySelector('.q-drawer .q-tree'); return t.getBoundingClientRect().height + 1 >= t.scrollHeight }")
+
         assert existing_text not in await page.content()
         views_to_check = [['Agents', 'Skills'], ['Skills']] if width == 1440 else [
             ['Agents', 'Skills'], ['VMs', 'Skills'], ['Skills'], ['Agents', 'VMs', 'Skills']]
@@ -1447,6 +1453,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await select_views(views)
             existing = page.locator('.q-tree').get_by_text('Existing research skill', exact=True)
             await existing.wait_for()
+            await tree_settled()
             assert 'Research Admin' in await existing.evaluate(
                 "el => el.closest('.q-tree__node').parentElement.closest('.q-tree__node').querySelector('.q-tree__node-header').innerText")
             await existing.click()
@@ -1454,6 +1461,7 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
             await page.get_by_role('dialog').get_by_role('button', name='Close', exact=True).click()
             await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
             await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
+            await tree_settled()
             await existing.click()
             existing_text += f' Edit {index}.'
             await page.get_by_label('Full text', exact=True).fill(existing_text)
