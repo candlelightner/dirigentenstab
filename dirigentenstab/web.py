@@ -73,9 +73,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         ui.colors(primary='#31595c', secondary='#ae7644', accent='#31595c')
 
-        async def actor():
+        async def actor(renew=True):
             try:
-                current = await auth.identity(token)
+                current = await auth.identity(token, renew)
                 if not current:
                     raise PermissionError('Session expired')
                 state['session_expired'] = False

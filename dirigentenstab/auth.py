@@ -83,11 +83,13 @@ class Auth:
         self.store.audit(private['userid'], 'login')
         return token, csrf
 
-    async def identity(self, token):
+    async def identity(self, token, renew=True):
         if not token or len(token) > 100:
             raise PermissionError('Login required')
         hashed = self.digest(token)
         identity = await self.identity_from_session(hashed)
+        if not renew:  # timer-driven polling revalidates but is not user activity
+            return identity
         now, idle = time.time(), self.service.settings.session_seconds
         self.store.execute('UPDATE sessions SET expires=? WHERE token_hash=? AND expires<?',
                            (now + idle, hashed, now + idle - min(RENEW_AFTER_SECONDS, idle // 2)))

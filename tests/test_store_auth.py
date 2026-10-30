@@ -362,10 +362,13 @@ async def test_activity_renews_throttled_and_idle_session_expires(store, monkeyp
     await auth.identity('live')
     assert _expires(store, auth, 'live') == now + 3600
     now += 30  # within the throttle window: no write
+    await auth.identity('live', renew=False)
     await auth.identity('live')
     assert _expires(store, auth, 'live') == 1000.0 + 3600
     now += 61
-    await auth.identity('live')
+    await auth.identity('live', renew=False)  # polling alone never extends the session
+    assert _expires(store, auth, 'live') == 1000.0 + 3600
+    await auth.identity('live')  # a user action does
     assert _expires(store, auth, 'live') == now + 3600
     now += 3600  # idle for the full timeout
     with pytest.raises(PermissionError, match='Session expired'):
