@@ -91,6 +91,8 @@ def setup_admin_dialogs(ctx):
                             'flat no-caps aria-haspopup="dialog"').classes(
                                 'escalation-summary w-full min-w-0 p-3 border rounded'):
                     with ui.column().classes('w-full min-w-0 gap-1'):
+                        ui.label('Dismissed' if row['status'] == 'deferred' else row['status'].capitalize()).classes(
+                            'text-xs text-left text-stone-600')
                         ui.label(row['description']).classes('w-full truncate text-left text-base font-bold')
                         ui.label(row['reason']).classes('w-full truncate text-left text-sm text-stone-600')
         render_escalation_detail()
