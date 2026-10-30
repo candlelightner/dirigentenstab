@@ -268,7 +268,9 @@ class Service:
                                     (parent['model'] if parent else provider['default_model'] if provider else ''),
                                     parent['instructions'] if parent else DEFAULT_INSTRUCTIONS, time.time()))
                 op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
-            return await self._provision(op, HumanCloud(), domain_id)
+            result = await self._provision(op, HumanCloud(), domain_id)
+            self.store.audit(identity['userid'], 'add-domain-agent', result['id'])
+            return result
 
     async def authorize(self, identity, agent_id, *, include_disabled=False):
         agent = (self.store.one('SELECT * FROM agents WHERE id=?', (agent_id,)) if include_disabled

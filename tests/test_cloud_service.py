@@ -1662,6 +1662,8 @@ async def test_add_domain_agent_uses_human_session_in_existing_domain_and_inheri
     assert row['provider_id'] == 'provider' and row['model'] == 'parent-model'
     assert row['instructions'] == 'Parent instructions'
     assert store.one('SELECT parent_id FROM provisioning WHERE id=?', (child['id'],))['parent_id'] == 'parent'
+    assert store.one("SELECT actor FROM audit WHERE operation='add-domain-agent' AND target=?",
+                     (child['id'],))['actor'] == 'owner'
 
 
 async def test_add_domain_agent_rejects_agents_unknown_domains_and_occupied_domains(store):
