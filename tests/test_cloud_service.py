@@ -13,6 +13,7 @@ from dirigentenstab import cloud as cloud_module
 from dirigentenstab import service as service_module
 from dirigentenstab.cloud import Cloud, CloudError, redact, validate
 from dirigentenstab.gpu import GPU_COMMANDS, GPU_CONTEXT
+from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from dirigentenstab.service import Service
 from dirigentenstab.store import Store
 
@@ -282,9 +283,10 @@ class ProvisioningCloud:
                     (not params.get('name') or a['name'] == params['name']) and
                     (not params.get('domainid') or a['domainid'] == params['domainid'])]}
         elif command == 'createAccount':
-            user = {'id': 'child-user', 'username': params['username'], 'account': params['account'],
-                    'accountid': 'child-account', 'domainid': params['domainid'], 'state': 'enabled', 'accounttype': 2}
-            result = {'id': 'child-account', 'name': params['account'], 'domainid': params['domainid'],
+            suffix = str(len(self.accounts) or '')
+            user = {'id': 'child-user' + suffix, 'username': params['username'], 'account': params['account'],
+                    'accountid': 'child-account' + suffix, 'domainid': params['domainid'], 'state': 'enabled', 'accounttype': 2}
+            result = {'id': 'child-account' + suffix, 'name': params['account'], 'domainid': params['domainid'],
                       'accounttype': params['accounttype'], 'state': 'enabled', 'user': [user]}
             self.accounts.append(result)
             response = {'account': result}
@@ -1532,3 +1534,68 @@ async def test_one_failing_row_does_not_stop_reconciliation_of_the_others(failed
     await service.reconcile_deployments()
     assert store.one('SELECT phase FROM vm_deployments WHERE id=?', ('second',))['phase'] == 'prepared'
     assert store.one('SELECT phase FROM vm_deployments WHERE id=?', (operation_id,))['phase'] == 'rejected'
+
+
+async def bootstrap_service(store, cloud, instance=None):
+    settings = SimpleNamespace(max_output=65536, **({'instance_name': instance} if instance is not None else {}))
+    service = provisioning_service(store, cloud)
+    service.settings = settings
+    service.client = lambda credentials: cloud
+    cloud_root = {'id': 'root-domain', 'name': 'ROOT', 'path': 'ROOT', 'level': 0}
+    cloud.parent_domain.update(cloud_root)
+    cloud.parent_account['domainid'] = 'root-domain'
+    cloud.parent_user['domainid'] = 'root-domain'
+    original = cloud.raw
+
+    async def raw(command, params=None):
+        if command == 'listCapabilities':
+            return {'capability': {'cloudstackversion': '4.23.0.0'}}
+        if command == 'listDomains' and not (params or {}).get('id') and not (params or {}).get('name'):
+            return {'domain': [cloud_root]}
+        if command == 'listDomains' and (params or {}).get('id') == 'root-domain':
+            return {'domain': [cloud_root]}
+        return await original(command, params)
+
+    cloud.raw = raw
+    return service
+
+
+@pytest.mark.parametrize('instance,names', [
+    (None, {'ds-00000000000000000000', 'ds-global-admin'}),
+    ('', {'ds-00000000000000000000', 'ds-global-admin'}),
+    ('staging', {'ds-00000000000000000000-staging', 'ds-global-admin-staging'})])
+async def test_fixed_agents_get_instance_suffix_only_when_configured(store, instance, names):
+    cloud = ProvisioningCloud()
+    service = await bootstrap_service(store, cloud, instance)
+    await service.bootstrap({})
+    assert {a['name'] for a in cloud.accounts} == names
+
+
+async def test_fresh_bootstrap_refuses_existing_names_and_leaves_no_row(store):
+    cloud = ProvisioningCloud()
+    cloud.domains.append({'id': 'other-domain', 'name': 'Agents--ds-00000000000000000000',
+                          'parentdomainid': 'root-domain'})
+    service = await bootstrap_service(store, cloud)
+    with pytest.raises(RuntimeError, match='INSTANCE_NAME'):
+        await service.bootstrap({})
+    assert not store.all('SELECT id FROM provisioning') and not cloud.keys
+
+
+async def test_fresh_global_admin_refuses_existing_account(store):
+    cloud = ProvisioningCloud()
+    cloud.accounts.append({'id': 'other-admin', 'name': 'ds-global-admin-staging', 'domainid': 'root-domain',
+                           'user': []})
+    service = await bootstrap_service(store, cloud, 'staging')
+    with pytest.raises(RuntimeError, match='INSTANCE_NAME'):
+        await service.bootstrap({})
+    assert not store.one('SELECT id FROM provisioning WHERE id=?', (GLOBAL_ADMIN_AGENT,))
+
+
+async def test_bootstrap_resume_still_adopts_existing_names(store):
+    cloud = ProvisioningCloud('createAccount')
+    service = await bootstrap_service(store, cloud)
+    with pytest.raises(CloudError):
+        await service.bootstrap({})
+    assert cloud.domains and cloud.accounts
+    await service.bootstrap({})
+    assert store.one('SELECT phase FROM provisioning WHERE id=?', (APP_ROOT_AGENT,))['phase'] == 'complete'

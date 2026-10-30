@@ -47,6 +47,8 @@ docker compose up -d
 sudo ./setup.sh --verify --existing
 ```
 
+If another Dirigentenstab hub (for example production) already uses this CloudStack, set a unique `INSTANCE_NAME` in `.env` (a-z, 0-9, `-`, up to 20 characters) before the first `setup.sh --install`. It suffixes the fixed Main Agent and Global Admin domain/account names (`ds-global-admin-<name>`). Without it, a fresh install that finds those names already present stops with an error instead of taking over the other hub's accounts and keys. Existing single-hub installs leave it empty; changing it later creates new identities.
+
 This path prepares only application prerequisites, credentials, SQLite and the first agent. It neither installs CloudStack nor modifies its zone, storage or hypervisor. The remote API and approved guest networks must be reachable from the application container. Register trusted Linux cloud-init templates through the platform administrator configuration before managed guest creation.
 
 ## Stopped VM capacity reservations
