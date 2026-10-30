@@ -17,9 +17,15 @@ The hierarchy defines administrative scope, not a chain for distributing tasks.
 Only the human owner assigns work. A parent can administer resources in its
 descendants' scope itself; it does not hand tasks to child agents.
 
-V1 serves one human owner, authenticated through the existing CloudStack
-administrator login. Subgroup administrators are agents, not additional human
-users. There is no new hub account or registration system.
+V1 is built around one human owner, the CloudStack root administrator, who is
+authenticated through the existing CloudStack administrator login. The hub also
+admits any other CloudStack root or domain administrator account (CloudStack
+account types 1 and 2); a user of any other type is refused. Each such human has
+a separate set of conversations (keyed by their CloudStack user) and sees only
+the part of the hierarchy in the domains CloudStack makes visible to them, so a
+domain administrator works inside their own domain subtree. Subgroup
+administrators are agents, not additional human users. There is no new hub
+account or registration system; roles come solely from CloudStack.
 
 ## Hierarchy and infrastructure permissions
 
@@ -27,8 +33,8 @@ users. There is no new hub account or registration system.
 - Provide a separate Global Admin above the existing sidebar hierarchy, with its
   own dedicated native CloudStack root administrator account and encrypted key.
   Preserve Main Agent, its domain hierarchy, configuration and conversations.
-  Only the human root administrator can open/configure Global Admin; other
-  agents cannot access it. Global Admin uses the same agent settings and starts
+  Only a human root administrator can open/configure Global Admin; domain
+  administrators and other agents cannot access it. Global Admin uses the same agent settings and starts
   with all central providers, MCP servers/tools and owner SSH access enabled.
   Explicit selections persist on subsequent setup. Main Agent's inherited
   external-service settings remain independent; new Global Admin subgroups
@@ -110,10 +116,10 @@ users. There is no new hub account or registration system.
   awareness, not a guarantee against conflicting operations on the same VM.
 - Work continues when the browser closes or the owner selects another agent
   or conversation. Reopening the hub shows saved history and current status.
-- The hub keeps the owner's CloudStack login alive server-side for the hub session's lifetime and never signs the owner out because CloudStack was briefly unreachable; only a definitive CloudStack rejection ends the session early.
+- The hub session is an idle timeout: signed-in activity renews it and it ends after `SESSION_SECONDS` (default one hour) without any. The browser cookie has no expiry of its own; the server-side session is the only authority. The hub keeps the owner's CloudStack login alive server-side while that session lasts (the background keepalive revalidates it but does not extend it) and never signs the owner out because CloudStack was briefly unreachable; only a definitive CloudStack rejection ends the session early.
   Revalidation is retried every 5 minutes and an unreachable CloudStack is tolerated for 15 minutes since the last success. Reloading during an outage shows a "CloudStack unreachable, retrying" page that retries on its own, never the sign-in page, and open VM consoles stay up within that window.
 - Failed sign-ins are limited to 8 per account per 15 minutes and 40 in total; the client IP is not used because the hub sits behind a shared proxy address.
-- Signing out or expiration of the owner's browser session does not stop accepted
+- Signing out or expiration of a human's browser session does not stop accepted
   tasks. A valid human login authorizes submitting instructions; background work
   runs under the agent's own credentials and current native permissions, without
   requiring a live human session. This does not bypass revoked agent authority.
@@ -170,6 +176,13 @@ appends only tool/API semantics and enforced safety invariants (list formatting,
 `managed=True`, saved/uncertain operations, untrusted MCP output, environment
 state). A migration upgrades prompts equal to the former one-line default and
 leaves customized prompts untouched.
+
+Throughout, "owner" means a human root administrator. Domain administrators sign
+in with the same hub but have no platform-level authority: central provider/MCP
+endpoints and credentials, platform settings (CloudStack dashboard link, summary
+model, escalation request limit), GPU policy, the owner SSH public key,
+escalation decisions, global skill approval, and Global Admin are root-only.
+Each of those is refused for a domain administrator and for every agent identity.
 
 | Setting or action | Human owner | Parent agent | Agent itself |
 | --- | --- | --- | --- |

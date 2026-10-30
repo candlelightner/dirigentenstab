@@ -146,7 +146,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         calls = 0
         enabled = True
 
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             assert token == 'session'
             self.calls += 1
             if not self.enabled:
@@ -342,7 +342,7 @@ async def test_mcp_ui_separates_server_administration_and_agent_assignments(monk
         calls = 0
         enabled = True
 
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             assert token == 'session'
             self.calls += 1
             if not self.enabled:
@@ -525,7 +525,7 @@ async def test_thinking_selector_uses_reported_levels_preserves_settings_and_ign
     identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return identity
 
     class Service(AgentCapabilities):
@@ -618,7 +618,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
     agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account'}
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return identity
 
     class Service(AgentCapabilities):
@@ -713,7 +713,7 @@ async def test_compaction_configuration_persists_and_context_meter_restores():
     identity = {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return identity
 
     class Service(AgentCapabilities):
@@ -840,7 +840,7 @@ async def test_polling_preserves_conversation_option_values_when_activity_reorde
     agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account'}
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return identity
 
     class Service(AgentCapabilities):
@@ -919,7 +919,7 @@ async def test_polling_updates_text_and_tool_status_without_replacing_history(mo
             ], 'runs': [{'id': 'run', 'status': 'running', 'events': [call] + ([result] if self.version else [])}]}
 
     runtime = Runtime()
-    async def current(token):
+    async def current(token, renew=True):
         return identity
 
     monkeypatch.setattr(web_chat, 'conversation_activity', lambda *args: [
@@ -1037,7 +1037,7 @@ async def test_unknown_main_pane_query_ids_fall_back_to_default_agent():
     agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account', 'is_main': True}
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return identity
 
     class Service(AgentCapabilities):
@@ -1067,7 +1067,7 @@ async def test_outage_on_page_load_shows_retry_state_not_login():
     from dirigentenstab.cloud import CloudError
 
     class Auth:
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return {'userid': 'human', 'username': 'alice', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
 
     class Service(AgentCapabilities):

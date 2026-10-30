@@ -1225,7 +1225,7 @@ async def test_admin_migrates_only_legacy_agents_in_the_humans_visible_domains(s
         async def login(self, *args):
             return 'token', 'csrf'
 
-        async def identity(self, token):
+        async def identity(self, token, renew=True):
             return {'userid': 'human', 'type': 2}
 
         async def revoke(self, token):

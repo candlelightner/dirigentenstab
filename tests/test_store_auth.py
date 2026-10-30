@@ -135,7 +135,7 @@ async def test_revoked_cloudstack_account_invalidates_session(store):
             return {'user': [{'id': 'person', 'state': 'enabled' if enabled else 'disabled'}]}
         return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
 
-    app = SimpleNamespace(store=store, human_call=human_call)
+    app = SimpleNamespace(store=store, human_call=human_call, settings=SimpleNamespace(session_seconds=3600))
     auth = Auth(app)
     private = {'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin', 'type': 1,
                'sessionkey': 'secret-session', 'cookies': {'JSESSIONID': 'private-cookie'}}
@@ -164,7 +164,7 @@ async def test_native_revalidation_is_cached_for_thirty_seconds(store, monkeypat
         return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
 
     monkeypatch.setattr('dirigentenstab.auth.time.monotonic', lambda: clock[0])
-    auth = Auth(SimpleNamespace(store=store, human_call=human_call))
+    auth = Auth(SimpleNamespace(store=store, human_call=human_call, settings=SimpleNamespace(session_seconds=3600)))
     private = {'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin', 'type': 1}
     store.execute('INSERT INTO sessions VALUES(?,?,?,?)',
                   (auth.digest('tok'), 'csrf', store.seal(private), time.time() + 300))
@@ -228,7 +228,7 @@ def test_session_lifetime_environment_default_override_and_validation(monkeypatc
         assert settings.Settings.load().session_seconds == expected
 
 
-async def test_configured_login_lifetime_matches_cookie_and_server_expiration(store, monkeypatch):
+async def test_configured_idle_timeout_sets_server_expiry_and_cookie_has_none(store, monkeypatch):
     from http.cookies import SimpleCookie
 
     import httpx
@@ -268,7 +268,8 @@ async def test_configured_login_lifetime_matches_cookie_and_server_expiration(st
     finished = time.time()
     assert response.status_code == 303
     cookie = SimpleCookie(response.headers['set-cookie'])['ds_session']
-    assert cookie['max-age'] == '43200'
+    assert not cookie['max-age'] and not cookie['expires']  # browser-session cookie; server expiry is the authority
+    assert cookie['httponly'] and cookie['secure'] and cookie['samesite'].lower() == 'strict'
     token = cookie.value
     session = store.one('SELECT expires,csrf FROM sessions WHERE token_hash=?', (auth.digest(token),))
     assert started + 43200 <= session['expires'] <= finished + 43200
@@ -276,7 +277,9 @@ async def test_configured_login_lifetime_matches_cookie_and_server_expiration(st
     monkeypatch.setattr(auth_module.time, 'time', lambda: now)
     assert (await auth.identity(token))['userid'] == 'person'
     auth.csrf(token, session['csrf'])
-    now = session['expires']
+    renewed = store.one('SELECT expires FROM sessions WHERE token_hash=?', (auth.digest(token),))['expires']
+    assert renewed == now + 43200  # activity at the end of the first window slides the expiry
+    now = renewed
     with pytest.raises(PermissionError, match='Session expired'):
         await auth.identity(token)
     with pytest.raises(PermissionError, match='Invalid CSRF token'):
@@ -327,7 +330,7 @@ def test_escalation_migration_preserves_single_queue_ciphertext_decisions_and_hi
 
 
 def _session_auth(store, human_call, closed=None):
-    service = SimpleNamespace(store=store, human_call=human_call,
+    service = SimpleNamespace(store=store, human_call=human_call, settings=SimpleNamespace(session_seconds=3600),
                               close_user_terminal_sessions=(closed if closed is not None else []).append)
     auth = Auth(service)
     private = {'userid': 'person', 'username': 'admin', 'domainid': 'root', 'account': 'admin', 'type': 1}
@@ -344,6 +347,40 @@ def _ok(calls=None):
             return {'user': [{'id': 'person', 'state': 'enabled'}]}
         return {'account': [{'name': 'admin', 'domainid': 'root', 'state': 'enabled', 'accounttype': 1}]}
     return human_call
+
+
+def _expires(store, auth, name):
+    return store.one('SELECT expires FROM sessions WHERE token_hash=?', (auth.digest(name),))['expires']
+
+
+async def test_activity_renews_throttled_and_idle_session_expires(store, monkeypatch):
+    from dirigentenstab import auth as auth_module
+    auth = _session_auth(store, _ok())
+    now = 1000.0
+    monkeypatch.setattr(auth_module.time, 'time', lambda: now)
+    store.execute('UPDATE sessions SET expires=? WHERE token_hash=?', (now + 300, auth.digest('live')))
+    await auth.identity('live')
+    assert _expires(store, auth, 'live') == now + 3600
+    now += 30  # within the throttle window: no write
+    await auth.identity('live', renew=False)
+    await auth.identity('live')
+    assert _expires(store, auth, 'live') == 1000.0 + 3600
+    now += 61
+    await auth.identity('live', renew=False)  # polling alone never extends the session
+    assert _expires(store, auth, 'live') == 1000.0 + 3600
+    await auth.identity('live')  # a user action does
+    assert _expires(store, auth, 'live') == now + 3600
+    now += 3600  # idle for the full timeout
+    with pytest.raises(PermissionError, match='Session expired'):
+        await auth.identity('live')
+
+
+async def test_keepalive_and_agent_revalidation_do_not_renew(store):
+    auth = _session_auth(store, _ok())
+    before = _expires(store, auth, 'live')
+    await auth.keepalive()
+    await auth.identity_from_session(auth.digest('live'))
+    assert _expires(store, auth, 'live') == before
 
 
 async def test_keepalive_touches_only_unexpired_sessions(store):

@@ -474,7 +474,7 @@ def setup_chat(ctx):
             return
         agent_id, conversation_id = state['agent'], state['conversation']
         try:
-            current = await actor()
+            current = await actor(renew=False)
             await ctx.refresh_escalations(current)
             await histories()
             rows = conversation_activity(service.store, current['userid'], list(agents))
