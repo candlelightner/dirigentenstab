@@ -41,6 +41,18 @@ account or registration system; roles come solely from CloudStack.
   inherit Global Admin's settings. Native root authority permits administering
   CloudStack-wide resources, including public service offerings.
 - Creating a subgroup also creates its admin agent, visible in the hub hierarchy.
+- The sidebar tree shows by default only the domains that contain this hub's
+  agents plus their ancestors; other visible CloudStack domains (another hub's
+  tree, plain domains) are hidden. A "Show all domains" switch in the sidebar
+  header shows every domain CloudStack makes visible to the human again; the
+  choice is remembered per browser with the other sidebar view choices.
+- Selecting an agent-less domain opens its dialog with "Add agent here". It
+  provisions an admin agent inside that existing domain (no new domain) using the
+  human's own CloudStack session, as Global Admin provisioning does; the nearest
+  ancestor domain's agent, if any, is the parent whose provider, model,
+  instructions and allowances it inherits. The action is disabled with a tooltip
+  unless the human's native API catalogue offers `createAccount` and
+  `registerUserKeys`; CloudStack still decides each call.
 - Agents may create subgroups autonomously by default, unless that capability
   has been disabled. Creation does not require a separate human approval.
 - The owner can request a subgroup and its restrictions in ordinary language,

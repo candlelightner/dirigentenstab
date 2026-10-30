@@ -1636,3 +1636,57 @@ def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
         rows = {row['id']: row['instructions'] for row in reopened.all(f'SELECT id,instructions FROM {table}')}
         assert rows['old'] == DEFAULT_INSTRUCTIONS and rows['admin'] == GLOBAL_ADMIN_INSTRUCTIONS
         assert rows['custom'] == old + ' Extra.' and rows['empty'] == ''
+
+
+def _domain_agent_setup(store):
+    add_parent(store)
+    cloud = ProvisioningCloud()
+    cloud.domains.extend([cloud.parent_domain,
+                          {'id': 'empty', 'name': 'Empty', 'parentdomainid': 'parent-domain', 'path': 'ROOT/Parent/Empty', 'level': 2}])
+    service = provisioning_service(store, cloud)
+
+    async def human_call(identity, command, params=None):
+        return await cloud.raw(command, params)
+    service.human_call = human_call
+    return service, cloud, {'userid': 'owner', 'type': 2, '_session': 's'}
+
+
+async def test_add_domain_agent_uses_human_session_in_existing_domain_and_inherits_nearest_ancestor(store):
+    service, cloud, human = _domain_agent_setup(store)
+    child = await service.add_domain_agent(human, 'empty', 'Empty')
+    assert child['domain_id'] == 'empty'
+    assert not any(command == 'createDomain' for command, _ in cloud.calls)
+    creation = next(params for command, params in cloud.calls if command == 'createAccount')
+    assert creation['domainid'] == 'empty' and creation['accounttype'] == 2
+    row = await service.agent(child['id'])
+    assert row['provider_id'] == 'provider' and row['model'] == 'parent-model'
+    assert row['instructions'] == 'Parent instructions'
+    assert store.one('SELECT parent_id FROM provisioning WHERE id=?', (child['id'],))['parent_id'] == 'parent'
+
+
+async def test_add_domain_agent_rejects_agents_unknown_domains_and_occupied_domains(store):
+    service, cloud, human = _domain_agent_setup(store)
+    with pytest.raises(PermissionError):
+        await service.add_domain_agent({**human, '_agent_id': 'parent'}, 'empty', 'Empty')
+    with pytest.raises(PermissionError, match='Domain unavailable'):
+        await service.add_domain_agent(human, 'hidden', 'Empty')
+    with pytest.raises(ValueError, match='already has an agent'):
+        await service.add_domain_agent(human, 'parent-domain', 'Again')
+    with pytest.raises(ValueError, match='short agent name'):
+        await service.add_domain_agent(human, 'empty', '../x')
+    assert not any(command in {'createAccount', 'createDomain'} for command, _ in cloud.calls)
+
+
+@pytest.mark.parametrize('apis,allowed', [(['createAccount', 'registerUserKeys'], True), (['createAccount'], False)])
+async def test_hierarchy_add_agent_permission_follows_human_api_catalogue(store, apis, allowed):
+    add_parent(store)
+    service = Service(store, SimpleNamespace())
+
+    async def human_call(identity, command, params=None):
+        if command == 'listApis':
+            return {'api': [{'name': name} for name in apis]}
+        if command == 'listDomains':
+            return {'domain': [{'id': 'parent-domain', 'name': 'Parent'}]}
+        return {}
+    service.human_call = human_call
+    assert (await service.hierarchy({'type': 2}))['can_add_agent'] is allowed

@@ -197,6 +197,10 @@ class Service:
         agents = [a | {'is_main': bool(main and a['id'] == main['id']), 'is_global': a['id'] == GLOBAL_ADMIN_AGENT}
                   for a in agents if a['domain_id'] in visible and a['enabled'] and (a['id'] != GLOBAL_ADMIN_AGENT or identity['type'] == 1)]
         users = (await self.human_call(identity, 'listUsers', {'listall': 'true'})).get('user', [])
+        try:  # CloudStack decides: the human's own API catalogue must offer the provisioning calls.
+            apis = {api['name'] for api in (await self.human_call(identity, 'listApis')).get('api', [])}
+        except Exception:
+            apis = set()
         visible_agents = {a['id'] for a in agents}
         pending = [op for op in self.store.all(
             "SELECT id,parent_id,name,phase FROM provisioning WHERE phase<>'complete'")
@@ -223,7 +227,48 @@ class Service:
                           for user in users if user.get('domainid') in visible],
                 'vms': vms,
                 'skills': await self.list_skills(identity),
+                'can_add_agent': {'createAccount', 'registerUserKeys'} <= apis,
                 'status': 'CloudStack connected'}
+
+    async def add_domain_agent(self, identity, domain_id, name):
+        """Provision an admin agent inside an existing, agent-less visible domain with the human's own session.
+
+        Like Global Admin, the human's native authority creates the account; CloudStack refuses what that human
+        may not do. The nearest ancestor agent, if any, is the parent whose settings the new agent inherits.
+        """
+        if identity['type'] not in {1, 2} or identity.get('_agent_id'):
+            raise PermissionError('A human CloudStack administrator account is required')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _-]{0,63}', name):
+            raise ValueError('Use a short agent name with letters, numbers, spaces, underscores or dashes')
+        domains = {d['id']: d for d in (await self.human_call(identity, 'listDomains', {'listall': 'true'})).get('domain', [])}
+        if domain_id not in domains:
+            raise PermissionError('Domain unavailable')
+        if self.store.one('SELECT id FROM agents WHERE domain_id=?', (domain_id,)):
+            raise ValueError('This domain already has an agent')
+        parent, ancestor, seen = None, domains[domain_id].get('parentdomainid'), set()
+        while ancestor in domains and ancestor not in seen and not parent:
+            seen.add(ancestor)
+            parent = self.store.one('SELECT * FROM agents WHERE domain_id=? AND enabled=1 AND id<>?',
+                                    (ancestor, GLOBAL_ADMIN_AGENT))
+            ancestor = domains[ancestor].get('parentdomainid')
+        service = self
+
+        class HumanCloud:
+            async def raw(self, command, params=None):
+                return await service.human_call(identity, command, params)
+        async with self._provision_lock:
+            op = self.store.one("SELECT * FROM provisioning WHERE domain_id=? AND phase<>'complete'", (domain_id,))
+            if not op:
+                provider = parent or self.store.one('SELECT id,default_model FROM providers ORDER BY id LIMIT 1')
+                op_id = uuid.uuid4().hex
+                self.store.execute('INSERT INTO provisioning(id,parent_id,name,domain_id,provider_id,model,instructions,updated) '
+                                   'VALUES(?,?,?,?,?,?,?,?)',
+                                   (op_id, parent['id'] if parent else None, name, domain_id,
+                                    (parent['provider_id'] if parent else provider['id'] if provider else None),
+                                    (parent['model'] if parent else provider['default_model'] if provider else ''),
+                                    parent['instructions'] if parent else DEFAULT_INSTRUCTIONS, time.time()))
+                op = self.store.one('SELECT * FROM provisioning WHERE id=?', (op_id,))
+            return await self._provision(op, HumanCloud(), domain_id)
 
     async def authorize(self, identity, agent_id, *, include_disabled=False):
         agent = (self.store.one('SELECT * FROM agents WHERE id=?', (agent_id,)) if include_disabled

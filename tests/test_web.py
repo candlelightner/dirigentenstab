@@ -78,7 +78,8 @@ def test_tree_uses_cloudstack_parents_and_only_safe_agent_labels():
 
 
 def test_tree_preserves_scoped_root_without_inventing_missing_parent():
-    nodes = hierarchy_nodes({'domains': [{'id': 'research', 'name': 'Research', 'parentdomainid': 'hidden'}]})
+    nodes = hierarchy_nodes({'domains': [{'id': 'research', 'name': 'Research', 'parentdomainid': 'hidden'}]},
+                            show_all_domains=True)
     assert nodes == [{'id': 'domain:research', 'label': 'Research', 'icon': 'folder', 'children': []}]
 
 
@@ -330,7 +331,7 @@ def test_main_agent_metadata_and_literal_legacy_names_are_not_guessed():
         'agents': [{'id': 'main', 'name': 'Agents', 'domain_id': 'main-domain', 'is_main': True},
                     {'id': 'child', 'name': 'Research', 'domain_id': 'child-domain'}],
         'users': [{'id': 'human', 'username': 'alice', 'domainid': 'main-domain'}],
-    })
+    }, show_all_domains=True)
     assert nodes[0]['label'] == 'Main Agent' and nodes[0]['icon'] == 'smart_toy'
     assert nodes[0]['children'][0]['label'] == 'Research'
     assert nodes[0]['children'][0]['children'][0]['label'] == 'Meaningful--ds-1234'
@@ -1174,3 +1175,39 @@ async def test_outage_on_page_load_shows_retry_state_not_login():
         service.error = CloudError('bad account', rejected=True)
         await user.open('/')
         await user.should_not_see('CloudStack unreachable')
+
+
+def _foreign_domains_data():
+    return {
+        'domains': [{'id': 'native', 'name': 'ROOT', 'level': 0},
+                    {'id': 'mine', 'name': 'Mine', 'parentdomainid': 'native'},
+                    {'id': 'mine-child', 'name': 'Child', 'parentdomainid': 'mine'},
+                    {'id': 'foreign', 'name': 'Agents--ds-x-staging', 'parentdomainid': 'native'},
+                    {'id': 'foreign-child', 'name': 'Plain', 'parentdomainid': 'foreign'}],
+        'agents': [{'id': 'child', 'name': 'Child', 'domain_id': 'mine-child'}],
+    }
+
+
+def _node_ids(nodes):
+    return [n['id'] for node in nodes for n in [node, *_node_ids_children(node)]]
+
+
+def _node_ids_children(node):
+    return [{'id': i} for c in node.get('children', []) for i in _node_ids([c])]
+
+
+def test_sidebar_hides_foreign_domains_by_default_and_keeps_agent_ancestors():
+    ids = _node_ids(hierarchy_nodes(_foreign_domains_data()))
+    assert ids == ['domain:mine', 'agent:child']
+    assert 'foreign' not in str(hierarchy_nodes(_foreign_domains_data()))
+
+
+def test_sidebar_shows_all_visible_domains_when_toggled():
+    ids = _node_ids(hierarchy_nodes(_foreign_domains_data(), show_all_domains=True))
+    assert set(ids) == {'domain:mine', 'agent:child', 'domain:foreign', 'domain:foreign-child'}
+
+
+def test_sidebar_without_any_agent_shows_nothing_until_toggled():
+    data = {**_foreign_domains_data(), 'agents': []}
+    assert hierarchy_nodes(data) == []
+    assert hierarchy_nodes(data, show_all_domains=True)

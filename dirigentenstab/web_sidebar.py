@@ -10,7 +10,7 @@ def agent_label(agent):
     return 'Main Agent' if agent.get('is_main') else agent['name']
 
 
-def hierarchy_nodes(data, mode='Agents', show_aliases=False):
+def hierarchy_nodes(data, mode='Agents', show_aliases=False, show_all_domains=False):
     """Join authoritative CloudStack parents to managed-agent presentation metadata."""
     selected = set(mode) if isinstance(mode, (list, tuple, set)) else set(mode.split(' and '))
 
@@ -31,8 +31,17 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
             resources_by_agent.setdefault(skill['creator_agent_id'], []).append({
                 'id': 'skill:' + skill['id'], 'label': skill['name'], 'icon': 'description', 'children': []})
 
+    # By default keep only domains holding this hub's agents plus the path of ancestors leading to them.
+    parents = {d['id']: d.get('parentdomainid') for d in data.get('domains', [])}
+    keep = set()
+    for domain_id in agents:
+        while domain_id in parents and domain_id not in keep:
+            keep.add(domain_id)
+            domain_id = parents[domain_id]
+    shown = [d for d in data.get('domains', []) if show_all_domains or d['id'] in keep]
+
     domains, roots = {}, []
-    for domain in data.get('domains', []):
+    for domain in shown:
         agent = agents.get(domain['id'])
         node_id = 'agent:' + agent['id'] if agent else 'domain:' + domain['id']
         label = agent_label(agent) if agent else domain['name']
@@ -40,7 +49,7 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False):
         children = list(resources_by_agent.get(agent['id'], [])) if agent else []
         domains[domain['id']] = {'id': node_id, 'label': label, 'icon': icon, 'children': children}
 
-    for domain in data.get('domains', []):
+    for domain in shown:
         node = domains[domain['id']]
         parent = domains.get(domain.get('parentdomainid'))
         if parent is None or parent is node:
@@ -127,11 +136,15 @@ def build_sidebar(ctx):
                 'sidebar-show-aliases text-xs text-stone-600').mark('sidebar_show_aliases')
             ctx.alias_switch.disable()
             ctx.alias_switch.set_visibility('VMs' in (ctx.sidebar_select.value or []))
+            ctx.domains_switch = ui.switch('Show all domains', value=False).props('dense').classes(
+                'sidebar-show-domains text-xs text-stone-600').mark('sidebar_show_domains')
+            ctx.domains_switch.disable()
             ctx.new_skill_button = ui.button('New skill', icon='add', on_click=lambda: protect(lambda: ctx.open_skill())).props('outline').classes('w-full')
             ctx.new_skill_button.set_visibility(False)
             ctx.search = ui.input('Search agents and domains').props('clearable').classes('w-full')
             with ui.scroll_area().classes('w-full flex-1 min-h-0'):
-                ctx.tree = ui.tree(hierarchy_nodes(data, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value)).props('dense selected-color=primary').classes('w-full').mark('hierarchy')
+                ctx.tree = ui.tree(hierarchy_nodes(data, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value,
+                                                show_all_domains=ctx.domains_switch.value)).props('dense selected-color=primary').classes('w-full').mark('hierarchy')
                 ctx.tree.add_slot('default-header', '''<div class="row items-center no-wrap" style="min-width:0" :title="props.node.label">
                     <q-icon :name="props.node.icon" size="sm" class="q-mr-sm" />
                     <span class="ellipsis">{{ props.node.label }}</span>
@@ -168,9 +181,11 @@ def setup_sidebar(ctx):
         ctx.alias_switch.set_visibility(has_vms)
         ctx.new_skill_button.set_visibility('Skills' in (ctx.sidebar_select.value or []))
         ui.run_javascript(f'try {{ localStorage.setItem({sidebar_key}, '
-                          + json.dumps(json.dumps({'view': ctx.sidebar_select.value, 'aliases': ctx.alias_switch.value})) + ') } catch (_) {}')
+                          + json.dumps(json.dumps({'view': ctx.sidebar_select.value, 'aliases': ctx.alias_switch.value,
+                                                                      'all_domains': ctx.domains_switch.value})) + ') } catch (_) {}')
         ctx.tree.props['nodes'] = hierarchy_nodes(
-            state.get('data', {}), mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value
+            state.get('data', {}), mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value,
+            show_all_domains=ctx.domains_switch.value
         )
         if has_vms or 'Skills' in (ctx.sidebar_select.value or []):
             ctx.tree.expand()
@@ -183,7 +198,8 @@ def setup_sidebar(ctx):
         agents.clear()
         agents.update({row['id']: row for row in updated.get('agents', [])})
         ctx.tree.props['nodes'] = hierarchy_nodes(
-            updated, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value
+            updated, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value,
+            show_all_domains=ctx.domains_switch.value
         )
         if set(ctx.sidebar_select.value or []) & {'VMs', 'Skills'}:
             ctx.tree.expand()
@@ -219,6 +235,25 @@ def setup_sidebar(ctx):
                     if agent['domain_id'] == identifier:
                         ui.button('Chat with ' + agent['name'],
                                   on_click=lambda _, aid=agent['id']: protect(lambda: choose_domain_agent(aid)))
+                if not any(a['domain_id'] == identifier for a in updated.get('agents', [])):
+                    allowed = bool(updated.get('can_add_agent'))
+                    with ui.row().classes('w-full items-center no-wrap') as add_row:
+                        name = ui.input('Agent name', value=domain['name'][:64]).props('maxlength=64').classes('flex-1')
+                        add_button = ui.button('Add agent here', icon='add', on_click=lambda: protect(add_agent)).props(
+                            'outline' + ('' if allowed else ' disable')).mark('add_domain_agent')
+                    if not allowed:
+                        add_row.tooltip('Your CloudStack role cannot create accounts here')
+                        name.disable()
+
+                    async def add_agent():
+                        add_button.disable()
+                        try:
+                            child = await service.add_domain_agent(await actor(), identifier, name.value.strip())
+                        finally:
+                            add_button.enable()
+                        domain_dialog.close()
+                        await ctx.refresh()
+                        await ctx.show_agent(child['id'])
                 ui.button('Close', on_click=domain_dialog.close).props('flat')
             ctx.drawer.run_method('hide')
             domain_dialog.open()
@@ -255,6 +290,7 @@ def setup_sidebar(ctx):
 
     ctx.sidebar_select.on_value_change(select_sidebar_view)
     ctx.alias_switch.on_value_change(lambda _: update_sidebar_view())
+    ctx.domains_switch.on_value_change(lambda _: update_sidebar_view())
     sidebar_key = json.dumps('dirigentenstab.sidebar.' + str(identity.get('userid', '')))
 
     async def restore_sidebar():
@@ -265,6 +301,7 @@ def setup_sidebar(ctx):
             view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs', 'Skills'}]
                     if isinstance(raw_view, list) else [])
             ctx.alias_switch.set_value(saved.get('aliases') is True)
+            ctx.domains_switch.set_value(saved.get('all_domains') is True)
             if view:
                 ctx.sidebar_select.set_value(view)
         except (ValueError, TypeError, AttributeError):
@@ -272,6 +309,7 @@ def setup_sidebar(ctx):
         finally:
             ctx.sidebar_select.enable()
             ctx.alias_switch.enable()
+            ctx.domains_switch.enable()
 
     ui.timer(0.01, lambda: protect(restore_sidebar), once=True)
 

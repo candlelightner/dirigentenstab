@@ -48,6 +48,8 @@ for branch in range(12):
         DOMAINS.append({'id': identifier, 'name': f'Team {branch} Level {depth}', 'parentdomainid': parent,
                         'path': f'ROOT/Agents/Research/Team-{branch}/Level-{depth}', 'level': depth + 3})
         parent = identifier
+DOMAINS.append({'id': 'empty-domain', 'name': 'Foreign Empty', 'path': 'ROOT/Foreign Empty',
+                'parentdomainid': ROOT_DOMAIN, 'level': 1})
 
 
 def fake_api(state):
@@ -143,7 +145,9 @@ ws.onmessage = e => document.getElementById('status').textContent = e.data;
             elif command == 'listApis':
                 value = {'api': [{'name': 'updateVirtualMachine', 'params': [
                     {'name': 'id', 'type': 'uuid', 'required': True},
-                    {'name': 'name', 'type': 'string'}], 'isasync': False}]}
+                    {'name': 'name', 'type': 'string'}], 'isasync': False},
+                    {'name': 'createAccount', 'params': [], 'isasync': False},
+                    {'name': 'registerUserKeys', 'params': [], 'isasync': False}]}
             elif command == 'updateVirtualMachine':
                 (state / 'escalation-executed.json').write_text(json.dumps({
                     'command': command, 'params': {key: value for key, value in params.items()
