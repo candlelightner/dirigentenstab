@@ -1680,15 +1680,13 @@ async def test_add_domain_agent_rejects_agents_unknown_domains_and_occupied_doma
 
 
 @pytest.mark.parametrize('apis,allowed', [(['createAccount', 'registerUserKeys'], True), (['createAccount'], False)])
-async def test_hierarchy_add_agent_permission_follows_human_api_catalogue(store, apis, allowed):
+async def test_add_agent_permission_follows_human_api_catalogue(store, apis, allowed):
     add_parent(store)
     service = Service(store, SimpleNamespace())
 
     async def human_call(identity, command, params=None):
         if command == 'listApis':
             return {'api': [{'name': name} for name in apis]}
-        if command == 'listDomains':
-            return {'domain': [{'id': 'parent-domain', 'name': 'Parent'}]}
         return {}
     service.human_call = human_call
-    assert (await service.hierarchy({'type': 2}))['can_add_agent'] is allowed
+    assert await service.can_add_agent({'type': 2}) is allowed

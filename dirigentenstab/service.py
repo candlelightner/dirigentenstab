@@ -197,10 +197,6 @@ class Service:
         agents = [a | {'is_main': bool(main and a['id'] == main['id']), 'is_global': a['id'] == GLOBAL_ADMIN_AGENT}
                   for a in agents if a['domain_id'] in visible and a['enabled'] and (a['id'] != GLOBAL_ADMIN_AGENT or identity['type'] == 1)]
         users = (await self.human_call(identity, 'listUsers', {'listall': 'true'})).get('user', [])
-        try:  # CloudStack decides: the human's own API catalogue must offer the provisioning calls.
-            apis = {api['name'] for api in (await self.human_call(identity, 'listApis')).get('api', [])}
-        except Exception:
-            apis = set()
         visible_agents = {a['id'] for a in agents}
         pending = [op for op in self.store.all(
             "SELECT id,parent_id,name,phase FROM provisioning WHERE phase<>'complete'")
@@ -227,8 +223,15 @@ class Service:
                           for user in users if user.get('domainid') in visible],
                 'vms': vms,
                 'skills': await self.list_skills(identity),
-                'can_add_agent': {'createAccount', 'registerUserKeys'} <= apis,
                 'status': 'CloudStack connected'}
+
+    async def can_add_agent(self, identity):
+        """CloudStack decides: the human's own API catalogue must offer the provisioning calls."""
+        try:
+            apis = {api['name'] for api in (await self.human_call(identity, 'listApis')).get('api', [])}
+        except Exception:
+            return False
+        return {'createAccount', 'registerUserKeys'} <= apis
 
     async def add_domain_agent(self, identity, domain_id, name):
         """Provision an admin agent inside an existing, agent-less visible domain with the human's own session.

@@ -236,7 +236,7 @@ def setup_sidebar(ctx):
                         ui.button('Chat with ' + agent['name'],
                                   on_click=lambda _, aid=agent['id']: protect(lambda: choose_domain_agent(aid)))
                 if not any(a['domain_id'] == identifier for a in updated.get('agents', [])):
-                    allowed = bool(updated.get('can_add_agent'))
+                    allowed = await service.can_add_agent(current)
                     with ui.row().classes('w-full items-center no-wrap') as add_row:
                         name = ui.input('Agent name', value=domain['name'][:64]).props('maxlength=64').classes('flex-1')
                         add_button = ui.button('Add agent here', icon='add', on_click=lambda: protect(add_agent)).props(
