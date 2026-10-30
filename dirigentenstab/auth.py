@@ -19,6 +19,9 @@ NATIVE_POLL_SECONDS = 30
 # CloudStack idles out its own login session after 30 minutes without calls, and a sleeping phone sends none,
 # so the server touches every live session this often to keep the wrapped CloudStack session alive.
 KEEPALIVE_SECONDS = 300
+# Human activity pushes a session's expiry out to now + SESSION_SECONDS (an idle timeout), but writes the database
+# only once the expiry is this stale. Keepalive and agent work revalidate without renewing.
+RENEW_AFTER_SECONDS = 60
 # During a transient CloudStack outage a session last verified within this window is let through unchanged;
 # beyond it requests fail with a retryable error. The session itself is never deleted for a transient error.
 # At least two keepalive periods, so a tab woken just after one failed keepalive still has a full period of grace.
@@ -83,7 +86,12 @@ class Auth:
     async def identity(self, token):
         if not token or len(token) > 100:
             raise PermissionError('Login required')
-        return await self.identity_from_session(self.digest(token))
+        hashed = self.digest(token)
+        identity = await self.identity_from_session(hashed)
+        now, idle = time.time(), self.service.settings.session_seconds
+        self.store.execute('UPDATE sessions SET expires=? WHERE token_hash=? AND expires<?',
+                           (now + idle, hashed, now + idle - min(RENEW_AFTER_SECONDS, idle // 2)))
+        return identity
 
     async def identity_from_session(self, hashed, fresh=False):
         session = self.store.one('SELECT * FROM sessions WHERE token_hash=? AND expires>?', (hashed, time.time()))
@@ -229,8 +237,9 @@ def attach(app, auth, settings):
             if old:
                 await auth.revoke(old)
             response = RedirectResponse('/', status_code=303)
-            response.set_cookie(COOKIE, token, httponly=True, secure=True, samesite='strict',
-                                max_age=settings.session_seconds, path='/')
+            # No max_age: a browser-session cookie. The sliding server-side `expires` is the only authority, and
+            # websocket-driven activity cannot refresh a cookie, so a fixed max_age would cut active sessions short.
+            response.set_cookie(COOKIE, token, httponly=True, secure=True, samesite='strict', path='/')
             return response
         except (PermissionError, httpx.HTTPError, ValueError):
             return RedirectResponse('/login?failed=1', status_code=303)
