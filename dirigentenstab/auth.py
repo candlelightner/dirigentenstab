@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.datastructures import Headers
 
 from .cloud import CloudError
@@ -18,10 +18,23 @@ COOKIE = 'ds_session'
 NATIVE_POLL_SECONDS = 30
 # CloudStack idles out its own login session after 30 minutes without calls, and a sleeping phone sends none,
 # so the server touches every live session this often to keep the wrapped CloudStack session alive.
-KEEPALIVE_SECONDS = 600
+KEEPALIVE_SECONDS = 300
 # During a transient CloudStack outage a session last verified within this window is let through unchanged;
 # beyond it requests fail with a retryable error. The session itself is never deleted for a transient error.
-TRANSIENT_GRACE_SECONDS = 600
+# At least two keepalive periods, so a tab woken just after one failed keepalive still has a full period of grace.
+TRANSIENT_GRACE_SECONDS = 900
+# Failed logins per user per 15 minutes, and across all users. The client IP is not used: behind tailscale serve
+# and the docker proxy every client shares one gateway address.
+USER_LOGIN_ATTEMPTS, GLOBAL_LOGIN_ATTEMPTS = 8, 40
+RETRY_PAGE = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Dirigentenstab</title></head>
+<body style="font:16px system-ui,sans-serif;margin:2rem"><h1>CloudStack unreachable, retrying</h1>
+<p role="status">You are still signed in. This page reloads every few seconds.</p></body></html>'''
+
+
+def transient(exc):
+    """True for CloudStack outages (unreachable, timeout, 5xx), which never end a session."""
+    return isinstance(exc, httpx.HTTPError) or isinstance(exc, CloudError) and not exc.rejected
 
 
 class Auth:
@@ -33,14 +46,13 @@ class Auth:
     def digest(token):
         return hashlib.sha256(token.encode()).hexdigest()
 
-    async def login(self, username, password, domain, client_ip):
+    async def login(self, username, password, domain):
         now = time.time()
-        buckets = ['ip:' + client_ip, 'user:' + domain + '/' + username]
-        buckets = [self.digest(bucket) for bucket in buckets]
+        buckets = [self.digest(bucket) for bucket in ('all', 'user:' + domain + '/' + username)]
         with self.store.connect() as conn:
             conn.execute('DELETE FROM login_attempts WHERE created<?', (now - 900,))
-            for bucket in buckets:
-                if conn.execute('SELECT COUNT(*) FROM login_attempts WHERE bucket=?', (bucket,)).fetchone()[0] >= 8:
+            for bucket, limit in zip(buckets, (GLOBAL_LOGIN_ATTEMPTS, USER_LOGIN_ATTEMPTS), strict=True):
+                if conn.execute('SELECT COUNT(*) FROM login_attempts WHERE bucket=?', (bucket,)).fetchone()[0] >= limit:
                     raise PermissionError('Too many login attempts; retry in 15 minutes')
             conn.executemany('INSERT INTO login_attempts(bucket,created) VALUES(?,?)', [(b, now) for b in buckets])
         if not username or not password or len(username) > 255 or len(password) > 4096 or len(domain) > 1024:
@@ -59,7 +71,7 @@ class Auth:
                 raise PermissionError('Invalid CloudStack login') from None
         if private['type'] not in {1, 2}:
             raise PermissionError('Use a CloudStack root or domain administrator account')
-        self.store.execute('DELETE FROM login_attempts WHERE bucket IN (?,?)', tuple(buckets))
+        self.store.execute('DELETE FROM login_attempts WHERE bucket=?', (buckets[1],))
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         self.store.execute('DELETE FROM sessions WHERE expires<?', (now,))
         self.store.execute('INSERT INTO sessions(token_hash,csrf,identity,expires) VALUES(?,?,?,?)',
@@ -96,7 +108,7 @@ class Auth:
             if int(account.get('accounttype', -1)) != identity['type']:
                 raise PermissionError('CloudStack role changed; log in again')
         except (PermissionError, CloudError, httpx.HTTPError) as exc:
-            if isinstance(exc, httpx.HTTPError) or isinstance(exc, CloudError) and not exc.rejected:
+            if transient(exc):
                 # Transient (unreachable, timeout, 5xx): keep the session; do not refresh `verified`.
                 if now - self.verified.get(hashed, -TRANSIENT_GRACE_SECONDS) < TRANSIENT_GRACE_SECONDS:
                     return identity
@@ -165,8 +177,14 @@ class SessionGuard:
         if not public:
             try:
                 scope['ds_identity'] = await self.auth.identity(request.cookies.get(COOKIE))
-            except (PermissionError, CloudError, httpx.HTTPError):
-                if scope['type'] == 'http' and path == '/' and scope.get('method') == 'GET':
+            except (PermissionError, CloudError, httpx.HTTPError) as exc:
+                landing = scope['type'] == 'http' and path == '/' and scope.get('method') == 'GET'
+                if transient(exc):
+                    if landing:
+                        return await HTMLResponse(RETRY_PAGE, status_code=503, headers={'Retry-After': '5'})(
+                            scope, receive, send)
+                    return await self.reject(scope, receive, send, 503)
+                if landing:
                     return await RedirectResponse('/login', status_code=303)(scope, receive, send)
                 return await self.reject(scope, receive, send, 401)
         async def secure_send(message):
@@ -183,7 +201,7 @@ class SessionGuard:
     @staticmethod
     async def reject(scope, receive, send, status):
         if scope['type'] == 'websocket':
-            await send({'type': 'websocket.close', 'code': 4401 if status == 401 else 4403})
+            await send({'type': 'websocket.close', 'code': {401: 4401, 503: 1013}.get(status, 4403)})
         else:
             await JSONResponse({'detail': 'Authentication or origin verification failed'}, status_code=status)(
                 scope, receive, send)
@@ -206,7 +224,7 @@ def attach(app, auth, settings):
         try:
             form = await fields(request)
             token, _ = await auth.login(form.get('username', ''), form.get('password', ''),
-                                        form.get('domain', '/'), request.client.host)
+                                        form.get('domain', '/'))
             old = request.cookies.get(COOKIE)
             if old:
                 await auth.revoke(old)

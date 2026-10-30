@@ -6,6 +6,8 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from nicegui import app, ui
 
+from .auth import transient
+from .cloud import CloudError
 from .console import ConsoleProxy
 from .diagnostics import diagnose
 from .files import VMFiles
@@ -25,7 +27,7 @@ __all__ = ['TerminalSession', 'XtermSSHSession', 'build_ui', 'conversation_activ
 
 def build_ui(service, auth, runtime=None):
     runtime = runtime or Runtime(service)
-    console_proxy = ConsoleProxy(service)
+    console_proxy = ConsoleProxy(service, auth)
     console_proxy.install(app)
     vm_files = VMFiles(service)
     vm_files.install(app)
@@ -59,7 +61,13 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
         try:
             identity = await auth.identity(token)
             data = await service.hierarchy(identity)
-        except Exception:
+        except Exception as exc:
+            if transient(exc):  # The session is still valid; only CloudStack is unreachable.
+                ui.add_head_html('<meta http-equiv="refresh" content="5">')
+                ui.label('CloudStack unreachable, retrying').props('role=status').classes('text-lg p-6')
+                return
+            if not isinstance(exc, (PermissionError, CloudError)):
+                raise
             ui.navigate.to('/login')
             return
 
@@ -72,7 +80,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     raise PermissionError('Session expired')
                 state['session_expired'] = False
                 return current
-            except Exception:
+            except Exception as exc:
+                if transient(exc):
+                    raise CloudError('CloudStack unreachable, retrying') from None
                 if not state.get('session_expired'):
                     state['session_expired'] = True
                     ui.navigate.to('/login')

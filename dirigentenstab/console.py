@@ -13,7 +13,8 @@ from fastapi.responses import Response
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from .auth import NATIVE_POLL_SECONDS, Auth
+from .auth import NATIVE_POLL_SECONDS
+from .cloud import CloudError
 
 PREFIX = '/vm-console/'
 RESOURCE = '/resource/noVNC/'
@@ -37,9 +38,8 @@ class _Grant:
 
 
 class ConsoleProxy:
-    def __init__(self, service):
-        self.service = service
-        self.auth = Auth(service)
+    def __init__(self, service, auth):
+        self.service, self.auth = service, auth
         self.grants = {}
         self.assets = {}  # (CPVM origin, resource) -> (body, content type); static noVNC files only
 
@@ -190,7 +190,7 @@ class ConsoleProxy:
                     reason = ('client-closed', 'upstream-closed', 'session-ended')[min(tasks.index(t) for t in done)]
                     for task in done:
                         task.result()
-            except (OSError, TimeoutError, WebSocketException, WebSocketDisconnect, PermissionError, httpx.HTTPError) as exc:
+            except (OSError, TimeoutError, WebSocketException, WebSocketDisconnect, PermissionError, CloudError, httpx.HTTPError) as exc:
                 reason = ('upstream-closed' if isinstance(exc, ConnectionClosed) else
                           'client-closed' if isinstance(exc, WebSocketDisconnect) else 'error ' + type(exc).__name__)
                 # Do not expose ticketed upstream URLs in errors sent to the client.
