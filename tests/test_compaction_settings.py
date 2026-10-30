@@ -59,8 +59,7 @@ async def test_compaction_configuration_persists_and_omitted_fields_are_preserve
 async def test_invalid_compaction_settings_never_partially_change_agent(service, options):
     original = await service.agent('agent')
     with pytest.raises(ValueError):
-        await service.update_agent({'userid': 'owner', 'type': 1}, 'agent', 'main', 'changed', 'changed',
-                                   can_provision=False, **options)
+        await service.update_agent({'userid': 'owner', 'type': 1}, 'agent', 'main', 'changed', 'changed', **options)
     assert await service.agent('agent') == original
 
 

@@ -72,6 +72,20 @@ def setup_agent_dialogs(ctx):
                         ui.button('Cancel', on_click=approval_dialog.close).props('flat')
                 approval_dialog.open()
 
+            async def delete():
+                with ui.dialog() as confirm_dialog, ui.card():
+                    ui.label(f'Delete skill {skill["name"]}?')
+                    with ui.row():
+                        ui.button('Delete', on_click=lambda: confirm_dialog.submit(True)).props('color=negative')
+                        ui.button('Cancel', on_click=lambda: confirm_dialog.submit(False)).props('flat')
+                confirmed = await confirm_dialog
+                confirm_dialog.delete()
+                if confirmed:
+                    await service.delete_skill(await actor(), skill_id)
+                    await ctx.refresh()
+                    skill_dialog.close()
+                    ui.notify('Skill deleted', type='positive')
+
             with ui.row().classes('w-full items-center gap-2'):
                 if editable:
                     ui.button('Save skill', on_click=lambda: protect(save))
@@ -84,6 +98,8 @@ def setup_agent_dialogs(ctx):
 
                     for field in (name, description, text):
                         field.on_value_change(changed)
+                if skill_id and current.get('type') == 1:
+                    ui.button('Delete', on_click=lambda: protect(delete)).props('outline color=negative')
                 ui.button('Close', on_click=skill_dialog.close).props('flat')
         ctx.drawer.run_method('hide')
         ctx.sync_url(skill_id)

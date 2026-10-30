@@ -294,6 +294,18 @@ async def test_removal_requires_explicit_human_approval_and_preserves_dismissed_
     assert (await e.service.decide_escalation(e.owner, row['id'], True))['status'] == 'approved'
 
 
+async def test_only_the_human_owner_can_delete_a_skill_directly(env):
+    e = env
+    skill = await create(e)
+    for actor in (e.creator, e.child, {**e.owner, '_agent_id': 'creator'}, {**e.owner, 'type': 2}):
+        with pytest.raises(PermissionError):
+            await e.service.delete_skill(actor, skill['id'])
+    assert await e.service.get_skill(e.creator, skill['id'])
+    await e.service.delete_skill(e.owner, skill['id'])
+    assert not e.store.all('SELECT * FROM skills')
+    assert e.store.one("SELECT 1 FROM audit WHERE operation='delete-skill' AND target=?", (skill['id'],))
+
+
 @pytest.mark.parametrize('sharing', ['selected', 'global'])
 async def test_visible_reader_can_request_removal_but_revocation_blocks_approval(env, sharing):
     e = env

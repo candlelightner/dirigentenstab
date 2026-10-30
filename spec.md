@@ -216,6 +216,8 @@ leaves customized prompts untouched.
   global visibility until the new revision receives approval.
 - `remove_skill` requests removal of a skill the agent can read. Removal always
   requires human owner approval of the exact revision; requests never delete it immediately.
+- The human owner can delete any skill directly with the editor's Delete button
+  (after confirmation); this uses the same removal as an approved request and is audited.
 - The sidebar's existing view selector includes Skills. Selecting a skill opens
   a minimal editor; names and descriptions are listed without loading full text.
 

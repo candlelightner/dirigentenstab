@@ -139,7 +139,7 @@ def test_history_excludes_system_instructions_and_keeps_tool_activity():
 @pytest.mark.asyncio
 async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, caplog):
     agent = {'id': 'agent', 'name': 'Research agent', 'domain_id': 'domain',
-             'account_id': 'cloud-account', 'model': 'local-model', 'can_provision': True,
+             'account_id': 'cloud-account', 'model': 'local-model',
              'instructions': 'Original prompt'}
 
     class Auth:

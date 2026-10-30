@@ -180,7 +180,7 @@ class Service:
         domains = (await self.human_call(identity, 'listDomains', {'listall': 'true'})).get('domain', [])
         visible = {domain['id'] for domain in domains}
         agents = self.store.all('SELECT id,name,domain_id,account_id,user_id,provider_id,model,instructions,'
-                                'can_provision,enabled FROM agents')
+                                'enabled FROM agents')
         main = self.store.one('SELECT id FROM provisioning WHERE id=? AND phase=?', (APP_ROOT_AGENT, 'complete'))
         agents = [a | {'is_main': bool(main and a['id'] == main['id']), 'is_global': a['id'] == GLOBAL_ADMIN_AGENT}
                   for a in agents if a['domain_id'] in visible and a['enabled'] and (a['id'] != GLOBAL_ADMIN_AGENT or identity['type'] == 1)]
@@ -887,6 +887,23 @@ class Service:
         self.store.audit(current['userid'], 'approve-skill-global', skill_id, str(revision))
         return next(s for s in await self.list_skills(current) if s['id'] == skill_id)
 
+    @staticmethod
+    def _delete_skill_row(conn, skill_id, revision):
+        if not conn.execute('DELETE FROM skills WHERE id=? AND revision=?', (skill_id, revision)).rowcount:
+            raise ValueError('Skill changed; request approval for its current revision')
+
+    async def delete_skill(self, identity, skill_id):
+        from .auth import Auth
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Only the human platform administrator may delete a skill')
+        current = await Auth(self).identity_from_session(identity.get('_session'))
+        if current['type'] != 1 or current['userid'] != identity['userid']:
+            raise PermissionError('A current human platform administrator session is required')
+        skill = await self.get_skill(current, skill_id)
+        with self.store.connect() as conn:
+            self._delete_skill_row(conn, skill_id, skill['revision'])
+        self.store.audit(current['userid'], 'delete-skill', skill_id, str(skill['revision']))
+
     async def request_skill_global(self, agent_id, skill_id, reason, **context):
         skill = await self.get_skill({'_agent_id': agent_id}, skill_id)
         if not skill['can_edit']:
@@ -1023,10 +1040,10 @@ class Service:
                 pending = conn.execute("SELECT id FROM escalation_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
                 if pending:
                     if approve:
-                        statement = ('DELETE FROM skills WHERE id=? AND revision=?' if command == 'removeSkill' else
-                                     'UPDATE skills SET global_revision=revision WHERE id=? AND revision=?')
-                        changed = conn.execute(statement, (params['id'], params['revision'])).rowcount
-                        if not changed:
+                        if command == 'removeSkill':
+                            self._delete_skill_row(conn, params['id'], params['revision'])
+                        elif not conn.execute('UPDATE skills SET global_revision=revision WHERE id=? AND revision=?',
+                                              (params['id'], params['revision'])).rowcount:
                             raise ValueError('Skill changed; request approval for its current revision')
                     conn.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',
                                  ('approved' if approve else 'deferred', self.store.seal({'skill_id': params['id'], 'revision': params['revision']}),
@@ -1287,7 +1304,7 @@ class Service:
         self.store.audit(identity['userid'], 'configure-provider', provider_id)
         return provider_id
 
-    async def update_agent(self, identity, agent_id, provider_id, model, instructions, can_provision=None,
+    async def update_agent(self, identity, agent_id, provider_id, model, instructions,
                            *, thinking=None, compaction_provider_id=_UNSET, compaction_model=_UNSET,
                            auto_compact_percent=_UNSET, context_window=_UNSET, enabled_providers=_UNSET, enabled_mcp_servers=_UNSET, owner_ssh_key_enabled=_UNSET, escalation_requests_enabled=_UNSET):
         agent = await self.authorize(identity, agent_id)
@@ -1603,7 +1620,7 @@ class Service:
                              json.dumps(sorted(await self.effective_providers(parent))), parent.get('enabled_mcp_servers'), op_id)
             with self.store.connect() as conn:
                 conn.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,'
-                             'provider_id,model,instructions,can_provision) VALUES(?,?,?,?,?,?,?,?,?,1) '
+                             'provider_id,model,instructions) VALUES(?,?,?,?,?,?,?,?,?) '
                              'ON CONFLICT(id) DO NOTHING',
                              (op_id, op['name'], op['domain_id'], op['account_id'], op['user_id'],
                               self.store.seal(pair), op['provider_id'], op['model'], op['instructions']))

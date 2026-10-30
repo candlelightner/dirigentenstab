@@ -1477,6 +1477,16 @@ async def test_sidebar_skills_editor_sharing_and_revision_approval(browser_app, 
         assert await page.get_by_text('This revision is shared globally. Editing requires approval again.', exact=True).count() == 0
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await page.screenshot(path=str(state / 'skills-editor.png'), full_page=True, animations='disabled')
+        editor = page.get_by_role('dialog')
+        await editor.get_by_role('button', name='Delete', exact=True).click()
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        await playwright.expect(editor).to_have_count(1)
+        assert store.one("SELECT 1 FROM skills WHERE name='GPU checklist'")
+        await editor.get_by_role('button', name='Delete', exact=True).click()
+        confirm = page.get_by_role('dialog').filter(has=page.get_by_role('button', name='Cancel', exact=True))
+        await confirm.get_by_role('button', name='Delete', exact=True).click()
+        await playwright.expect(page.get_by_role('dialog')).to_have_count(0)
+        assert not store.one("SELECT 1 FROM skills WHERE name='GPU checklist'")
         await browser.close()
 
 
