@@ -165,11 +165,15 @@ async def click_tree_node(page, name):
     # tree_settled can pass before the server applies the search filter: the nodes then sit inside clipped, still
     # expanding slide containers (rect is non-empty, but hit-testing reaches the search field or status label beneath).
     # Click only once the node is scrolled within the scroll area, hit-testable and has stopped moving.
-    await node.evaluate('el => el.scrollIntoView({block: "center"})')
+    # Re-resolve the element on every poll: the tree may re-render it.
+    await page.evaluate('window.__clickKey = null')
     await page.wait_for_function(
-        """el => { const r = el.getBoundingClientRect(), at = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-            const key = r.x + ':' + r.y, stable = el.__clickKey === key; el.__clickKey = key;
-            return stable && at && el.contains(at); }""", arg=await node.element_handle())
+        """name => { const el = [...document.querySelectorAll('.q-tree span')].find(e => e.textContent.trim() === name);
+            if (!el) return false;
+            el.scrollIntoView({block: 'center'});
+            const r = el.getBoundingClientRect(), at = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+            const key = name + r.x + ':' + r.y, stable = window.__clickKey === key; window.__clickKey = key;
+            return stable && at && el.contains(at); }""", arg=name)
     await node.click()
 
 
@@ -326,6 +330,26 @@ async def test_browser_disabled_cloudstack_human_loses_existing_socket_access(br
         await browser.close()
 
 
+async def test_browser_provider_switch_replaces_only_the_previous_default_model(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await open_configuration(page)
+        model = page.get_by_label('Model ID', exact=True)
+        await page.get_by_text('2 models available.', exact=False).wait_for()
+        await playwright.expect(model).to_have_value('fixture-model')
+        provider = page.get_by_label('Model provider', exact=True)
+        for name, expected, value in [('Empty', 'No models discovered', ''), ('Local fixture', '2 models available', 'fixture-model')]:
+            await provider.click()  # the previous provider's default model follows the provider
+            await page.get_by_role('option', name=name, exact=True).click()
+            await page.get_by_text(expected, exact=False).last.wait_for()
+            await playwright.expect(model).to_have_value(value)
+        await browser.close()
+
+
 @pytest.mark.parametrize('engine', ['chromium', 'firefox'])
 async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app, engine):
     url, state = browser_app
@@ -352,12 +376,6 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         model = page.get_by_label('Model ID', exact=True)
         await page.get_by_text('2 models available.', exact=False).wait_for()
         provider = page.get_by_label('Model provider', exact=True)
-        await playwright.expect(model).to_have_value('fixture-model')
-        for name, expected, value in [('Empty', 'No models discovered', ''), ('Local fixture', '2 models available', 'fixture-model')]:
-            await provider.click()  # a model that is the previous provider's default follows the provider
-            await page.get_by_role('option', name=name, exact=True).click()
-            await page.get_by_text(expected, exact=False).last.wait_for()
-            await playwright.expect(model).to_have_value(value)
         await model.fill('custom-private-model')
         await model.press('Enter')
         for name, expected in [('Unsupported', 'custom Model ID'), ('Empty', 'No models discovered'),
