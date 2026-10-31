@@ -86,3 +86,11 @@ def test_passed_through_messages_are_redacted_and_bounded():
     for secret in ('hunter2pass', 'AKEY123', 'SIG%2B456', 'SK789', 'tok_abc', 'sk-live12345678', 'abc123', 'PRIVATE KEY'):
         assert secret not in text
     assert 'command=listVMs' in text and len(text) < 1300
+
+
+def test_permission_refusals_show_their_cause_but_session_failures_stay_generic():
+    error = diagnose(PermissionError('Secret API_KEY is unknown or not granted to this agent'), operation_id='op')
+    assert 'Secret API_KEY is unknown or not granted to this agent. Reference: op' == str(error)
+    assert error.category == 'authorization'
+    for message in ('CloudStack session no longer authorized', 'CloudStack role changed; log in again'):
+        assert 'Access denied or session expired' in str(diagnose(PermissionError(message), operation_id='op'))

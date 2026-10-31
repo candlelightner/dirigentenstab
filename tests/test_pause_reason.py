@@ -76,3 +76,14 @@ def test_history_parts_strips_gemma_channel_thought_and_skips_empty_bubbles():
     assert list(history_parts(reply('<|channel>thought\nPlan the call.<channel|>Done.'))) == [('agent', 'Done.')]
     assert list(history_parts(reply('<|channel>thought\nFinal answer'))) == [('agent', 'Final answer')]
     assert list(history_parts(reply('<|channel>Done.'))) == [('agent', 'Done.')]
+
+
+def test_history_parts_strips_gemma_toolcall_markup_but_keeps_real_text():
+    def reply(*texts):
+        return {'messages': [{'kind': 'response', 'parts': [{'part_kind': 'text', 'content': t} for t in texts]}]}
+
+    call = '<|toolcall>call:executeapi{command:<|"|>listTemplates<|"|>,params:{}})'  # as Deepinfra Gemma emitted it
+    assert list(history_parts(reply(call))) == []
+    assert list(history_parts(reply('Checking.\n' + call))) == [('agent', 'Checking.')]
+    assert list(history_parts(reply('<|toolcall>call:x{}<toolcall|>Done.'))) == [('agent', 'Done.')]
+    assert list(history_parts(reply('A call: toolcall is fine <b>'))) == [('agent', 'A call: toolcall is fine <b>')]
