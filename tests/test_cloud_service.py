@@ -1614,7 +1614,7 @@ async def test_bootstrap_seeds_default_instructions_for_main_agent_and_global_ad
 
 
 def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
-    from dirigentenstab.service import DEFAULT_INSTRUCTIONS, GLOBAL_ADMIN_INSTRUCTIONS
+    from dirigentenstab.service import DEFAULT_INSTRUCTIONS
     master = tmp_path / 'master'
     master.write_bytes(Fernet.generate_key())
     path = tmp_path / 'state.db'
@@ -1632,9 +1632,11 @@ def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
         store.execute('INSERT INTO provisioning(id,parent_id,name,model,instructions,updated) VALUES(?,?,?,?,?,?)',
                       (name, None, name, 'm', text, 1))
     reopened = Store(str(path), str(master))
+    # Migration 022 ships a frozen snapshot of the defaults; later default edits do not rewrite it.
+    frozen = ''.join(line for line in DEFAULT_INSTRUCTIONS.splitlines(True) if 'hostname-style' not in line)
     for table in ('agents', 'provisioning'):
         rows = {row['id']: row['instructions'] for row in reopened.all(f'SELECT id,instructions FROM {table}')}
-        assert rows['old'] == DEFAULT_INSTRUCTIONS and rows['admin'] == GLOBAL_ADMIN_INSTRUCTIONS
+        assert rows['old'] == frozen and rows['admin'] == 'Manage CloudStack globally using your own native root administrator identity.\n\n' + frozen
         assert rows['custom'] == old + ' Extra.' and rows['empty'] == ''
 
 
@@ -1690,3 +1692,75 @@ async def test_add_agent_permission_follows_human_api_catalogue(store, apis, all
         return {}
     service.human_call = human_call
     assert await service.can_add_agent({'type': 2}) is allowed
+
+
+OFFER = '00000000-0000-0000-0000-000000000003'
+
+
+def _named_deploy_cloud(store, existing=()):
+    class NamedCloud(Cloud):
+        sent = None
+
+        def __init__(self):
+            super().__init__(SimpleNamespace(), {'apikey': 'parent-api', 'secretkey': 'parent-secret'})
+
+        async def catalogue(self, *, refresh=False):
+            return {'deployVirtualMachine': {'name': 'deployVirtualMachine', 'params': [
+                {'name': 'name', 'type': 'string'}, {'name': 'userdata', 'type': 'string'},
+                {'name': 'serviceofferingid', 'type': 'uuid'}]}}
+
+        async def raw(self, command, request):
+            if command == 'listServiceOfferings':
+                return {'serviceoffering': [{'id': request['id'], 'gpucount': 0}]}
+            if command == 'listVirtualMachines':
+                return {'virtualmachine': list(existing)}
+            assert command == 'deployVirtualMachine'
+            self.sent = request
+            return {'virtualmachine': [{'id': 'new-vm', 'name': request['name']}]}
+
+    cloud = NamedCloud()
+    service = Service(store, SimpleNamespace(max_output=65536))
+
+    async def client(agent, purpose='runtime'):
+        return cloud
+
+    service.cloud_client = client
+    return service, cloud
+
+
+@pytest.mark.parametrize('given', ['web-builder', None])
+async def test_managed_deploy_keeps_agent_name_else_generates_one(store, given):
+    add_parent(store)
+    service, cloud = _named_deploy_cloud(store)
+    await service._deploy_managed(await service.agent('parent'), cloud, {'serviceofferingid': OFFER} | ({'name': given} if given else {}))
+    assert cloud.sent['name'] == given or (given is None and cloud.sent['name'].startswith('ds-vm-'))
+    assert store.one('SELECT name FROM vm_deployments')['name'] == cloud.sent['name']
+
+
+async def test_managed_deploy_rejects_a_name_already_used_in_the_account(store):
+    add_parent(store)
+    service, cloud = _named_deploy_cloud(store, [{'id': 'old', 'name': 'web-builder', 'state': 'Stopped'}])
+    with pytest.raises(ValueError, match='already exists'):
+        await service._deploy_managed(await service.agent('parent'), cloud, {'serviceofferingid': OFFER, 'name': 'web-builder'})
+    assert cloud.sent is None and store.all('SELECT * FROM vm_deployments') == []
+
+
+@pytest.mark.parametrize('listing_fails', [False, True])
+async def test_sidebar_hides_vms_cloudstack_no_longer_lists_unless_listing_fails(store, listing_fails):
+    add_parent(store)
+    for vm_id in ('alive', 'gone'):
+        store.execute('INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
+                      (vm_id, 'parent', 'u', 'k', 'h', 22))
+    service = Service(store, SimpleNamespace(max_output=65536))
+
+    async def human_call(identity, command, params=None):
+        if command == 'listVirtualMachines' and listing_fails:
+            raise CloudError('down')
+        return {'domain': [{'id': 'parent-domain'}], 'virtualmachine': [{'id': 'alive', 'name': 'web'}]}
+
+    async def skills(identity):
+        return []
+
+    service.human_call, service.list_skills = human_call, skills
+    result = await service.hierarchy({'type': 1})
+    assert sorted(v['id'] for v in result['vms']) == (['alive', 'gone'] if listing_fails else ['alive'])
