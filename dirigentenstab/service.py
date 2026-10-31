@@ -54,6 +54,7 @@ Default operating guidance. The owner can edit or clear this per agent.
 - Run commands inside a guest only on enrolled VMs, and check the VM state first (running, reachable) before acting.
 - Enrollment does not remove privileges or secrets already baked into an image; inspect unfamiliar images before trusting them.
 - Check current VM state before any lifecycle change and again afterwards.
+- When creating a VM, always give it a meaningful hostname-style `name` and a human-readable `displayname` alias describing its purpose. Use what the owner supplied, otherwise make one up.
 
 ## Skills
 - Check the skills list for an existing workflow before improvising a procedure.
@@ -208,16 +209,18 @@ class Service:
         )
         cs_names = {}
         cs_displays = {}
+        listed = False
         try:
             cs_vms = (await self.human_call(identity, 'listVirtualMachines', {'listall': 'true'})).get('virtualmachine', [])
             cs_names = {vm['id']: vm.get('name') or vm.get('displayname') for vm in cs_vms if 'id' in vm}
             cs_displays = {vm['id']: vm['displayname'] for vm in cs_vms if 'id' in vm and vm.get('displayname')}
+            listed = True
         except Exception:
             pass
         vms = [{'id': row['id'], 'owner_agent': row['owner_agent'],
                 'name': cs_names.get(row['id']) or row['name'],
                 'displayname': cs_displays.get(row['id'])}
-               for row in managed_vms if row['owner_agent'] in visible_agents]
+               for row in managed_vms if row['owner_agent'] in visible_agents and (not listed or row['id'] in cs_names)]
         return {'domains': domains, 'agents': agents, 'pending_provisioning': pending,
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}
                           for user in users if user.get('domainid') in visible],
@@ -489,7 +492,10 @@ class Service:
         op_id = self.gpu_deployment_id or uuid.uuid4().hex
         guest = Guest(self)
         cloud_init, access = await guest.prepare_vm_config(agent['id'], workspace_disk=workspace_disk)
-        name = 'ds-vm-' + op_id[:20]
+        name = params.get('name') or 'ds-vm-' + op_id[:20]
+        if params.get('name') and any(vm.get('name') == name and vm.get('state') not in {'Expunging', 'Expunged'} for vm in
+                                      (await cloud.raw('listVirtualMachines', {'name': name})).get('virtualmachine', [])):
+            raise ValueError(f'A VM named {name} already exists in this account; choose another name')
         request = {**params, 'name': name, 'userdata': base64.b64encode(cloud_init.encode()).decode()}
         with self.store.connect() as conn:
             conn.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,NULL,?,?)',

@@ -300,6 +300,9 @@ current compaction settings.
   compatible managed deployments. VM enrollment never needs the owner's private
   SSH key. The embedded SSH terminal uses the VM's managed access key after native
   authorization; the hub stores no owner private key.
+- Managed VMs keep the agent-chosen `name` (unique within the account; native CloudStack
+  validates it) and fall back to a generated `ds-vm-` name. The sidebar lists only VMs
+  CloudStack still returns; stored access rows for destroyed VMs are kept, not deleted.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.

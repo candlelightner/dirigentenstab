@@ -381,7 +381,7 @@ class Controller:
         if command == 'deployVirtualMachine':
             row = self.service.store.one('SELECT * FROM vm_deployments WHERE id=? AND agent_id=?', (op['id'], agent['id']))
             if not row or row['phase'] == 'rejected':
-                values = (await cloud.raw('listVirtualMachines', {'name': 'ds-vm-'+op['id'][:20], 'listall': True})).get('virtualmachine', [])
+                values = (await cloud.raw('listVirtualMachines', {'name': params.get('name') or 'ds-vm-'+op['id'][:20], 'listall': True})).get('virtualmachine', [])
                 jobs = (await self.cloud.raw('listAsyncJobs', {'listall': True})).get('asyncjobs', [])
                 if values or any(int(j.get('jobstatus', -1)) == 0 for j in jobs):
                     raise RuntimeError('GPU deployment outcome is ambiguous; no action was repeated')
