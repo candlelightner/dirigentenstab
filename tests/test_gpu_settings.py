@@ -170,3 +170,27 @@ async def test_denial_changes_nothing_and_approval_revalidates(environment):
     finally:
         module.helper_call = original
     assert failed['status'] == 'failed' and saved_order(e) == []
+
+
+async def test_grant_for_a_subagent_is_usable_max_one_and_capacity_requests_on_its_chain(environment):
+    e = environment
+    row = await request(e)
+    plan = await e.service.gpu_grant_plan(e.owner, row['id'])
+    assert [c['domain_id'] for c in plan['changes']] == ['root', 'unmanaged', 'main']
+    assert plan['target']['policy'] == policy(['nvidia-53'], 1, subgroup_requests=True)
+    assert all(c['policy']['subgroup_requests'] and c['policy']['max_allocations'] in {1, -1} for c in plan['changes'])
+    assert 'enable "GPU capacity requests"' in describe_plan(plan)[0]
+
+
+async def test_grant_for_main_agent_does_not_add_capacity_requests(environment):
+    from dirigentenstab.limits import APP_ROOT_AGENT
+    e = environment
+    e.store.execute('UPDATE agents SET id=? WHERE id=?', (APP_ROOT_AGENT, 'main'))
+    e.store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                    ('main-conversation', APP_ROOT_AGENT, 'owner', 'GPU', 1, e.store.seal([])))
+    e.store.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events) VALUES(?,?,?,?,?,?,?)',
+                    ('main-run', 'main-conversation', 'running', APP_ROOT_AGENT, 1, 1, e.store.seal([])))
+    row = await e.service.request_gpu_profiles(APP_ROOT_AGENT, ['GRID P40-8Q'], 'Need it', None, conversation_id='main-conversation',
+                                               run_id='main-run', call_id='main-call')
+    plan = await e.service.gpu_grant_plan(e.owner, row['id'])
+    assert plan['target']['policy'] == policy(['nvidia-51'], 1)

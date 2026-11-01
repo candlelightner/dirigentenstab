@@ -637,6 +637,7 @@ class Runtime:
                 return {'error': str(error), 'category': error.category,
                         'deployment_id': getattr(exc, 'operation_id', None)}
 
+        gpu_requests = bool(getattr(self.service.settings, 'gpu_helper_socket', '')) and (await self.service.escalation_access(record))['enabled']
         agent = Agent(
             model,
             instructions=(instructions + '\nTool rules. Reuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
@@ -648,7 +649,7 @@ class Runtime:
                           'Use save_skill to create or edit skills, share_skill for selected descendants, '
                           'and request_skill_global for human approval of the exact revision. '
                           'remove_skill queues removal of a skill you can read; removal always requires human approval. '
-                          'request_gpu_profiles asks the owner to add vGPU profiles to your policy. '
+                          + ('request_gpu_profiles asks the owner to add vGPU profiles to your policy. ' if gpu_requests else '') +
                           'For the native installation prefer its Dirigentenstab-small offering when available; '
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
@@ -770,7 +771,7 @@ class Runtime:
                 enqueue.__name__ = 'remove_skill'
                 return await invoke(enqueue, agent_id, skill_id, reason, call_id=ctx.tool_call_id)
 
-            if getattr(self.service.settings, 'gpu_helper_socket', ''):
+            if gpu_requests:
                 @agent.tool(sequential=True)
                 async def request_gpu_profiles(ctx: RunContext, profiles: list[str], reason: str,
                                                max_allocations: int | None = None) -> dict:

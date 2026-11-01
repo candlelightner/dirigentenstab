@@ -499,8 +499,10 @@ class Service:
         params = self.store.open(row['params'])
         policy = (await self.gpu_agent_settings(identity, row['agent_id']))['policy']
         policy = {**policy, 'profiles': policy['profiles'] + [p['id'] for p in params['profiles'] if p['id'] not in policy['profiles']]}
-        if params['max_allocations'] is not None and 0 <= policy['max_allocations'] < params['max_allocations']:
-            policy['max_allocations'] = params['max_allocations']
+        if policy['max_allocations'] >= 0:  # an approved grant never leaves the agent at zero allocations
+            policy['max_allocations'] = max(policy['max_allocations'], params['max_allocations'] or 1)
+        if row['agent_id'] not in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:  # the controller requires it on the agent's own chain
+            policy['subgroup_requests'] = True
         return await self.gpu_policy_plan(identity, row['agent_id'], policy)
 
     async def search_api(self, agent_id, query):

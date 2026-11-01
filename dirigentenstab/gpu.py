@@ -14,7 +14,7 @@ GPU_COMMANDS = frozenset({'deployVirtualMachine', 'startVirtualMachine', 'stopVi
                          'restoreVirtualMachine', 'scaleVirtualMachine', 'changeServiceForVirtualMachine'})
 FLAGS = ('release_on_stop', 'reconfigure_unused', 'subgroup_requests')
 FLAG_LABELS = {'release_on_stop': 'Release GPU when its VM stops', 'reconfigure_unused': 'May switch unused GPU sizes',
-               'subgroup_requests': 'Subagents may request GPU capacity'}
+               'subgroup_requests': 'GPU capacity requests'}
 
 
 def validate_policy(value, available):

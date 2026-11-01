@@ -3,6 +3,7 @@ from nicegui import ui
 
 from .diagnostics import diagnose
 from .gpu import FLAG_LABELS, FLAGS, describe_plan
+from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from .web_sidebar import agent_label
 
 
@@ -485,7 +486,9 @@ def setup_agent_dialogs(ctx):
                 gpu_profiles = ui.select(gpu['profiles'], multiple=True, with_input=True, value=policy['profiles'],
                                          label='Allowed vGPU profiles').props('use-chips').classes('w-full')
                 gpu_max = ui.number('Max vGPUs (-1 = unlimited)', value=policy['max_allocations'], min=-1, precision=0).classes('w-full')
-                gpu_flags = {flag: ui.checkbox(FLAG_LABELS[flag], value=policy[flag]) for flag in FLAGS}
+                labels = {**FLAG_LABELS, 'subgroup_requests': 'Subagents may request GPU capacity' if agent['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}
+                          else 'This agent and its subagents may request GPU capacity'}
+                gpu_flags = {flag: ui.checkbox(labels[flag], value=policy[flag]) for flag in FLAGS}
                 if gpu['parent']:
                     ui.label(f"Allowed by {gpu['parent']['name']}: {', '.join(gpu['parent']['profiles']) or 'no profiles'}"
                              f" · max {gpu['parent']['max_allocations']}").classes('text-sm text-stone-600 break-words')
