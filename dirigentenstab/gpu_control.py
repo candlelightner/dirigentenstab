@@ -589,7 +589,7 @@ class Controller:
             raise PermissionError('GPU helper accepts only the authenticated local backend')
         if not isinstance(request, dict) or len(json.dumps(request)) > 65536:
             raise ValueError('Invalid GPU controller request')
-        actions = {'status': {'session'}, 'set_policy': {'session', 'domain_id', 'policy'},
+        actions = {'status': {'session'}, 'profiles': {'run_id'}, 'set_policy': {'session', 'domain_id', 'policy'},
                    'claim': {'session', 'domain_id', 'uuid'},
                    'offering': {'session', 'domain_id', 'profile', 'cpus', 'memory', 'root_disk'},
                    'execute': {'session', 'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
@@ -601,6 +601,10 @@ class Controller:
             raise PermissionError('GPU controller request contains unauthorized operations or fields')
         if action == 'status':
             return await self.status(request['session'])
+        if action == 'profiles':
+            if not self.service.store.one("SELECT 1 FROM chat_runs WHERE id=? AND status='running'", (request['run_id'],)):
+                raise PermissionError('Host vGPU profiles are listed only to an active agent run')
+            return [{'id': p['id'], 'name': p['name']} for p in self.host.profiles().values()]
         async with self.lock:
             if action in {'result', 'recover'}:
                 return await self.owned_result(request, recover=action == 'recover')

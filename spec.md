@@ -75,7 +75,8 @@ account or registration system; roles come solely from CloudStack.
   permitted. When their current native permissions prevent a required action,
   `request_escalation` queues a short goal, a short explanation of that limitation,
   and the exact native command and parameters for the human owner's review.
-  This covers arbitrary native actions, including registering a GPU profile;
+  This covers arbitrary native actions, including registering a GPU profile
+  (the `grantGpuPolicy` pseudo-command, below under vGPU support, requests GPU policy);
   it is not an offering-specific provisioning workflow.
 - Every agent has this tool enabled by default. The owner or an ancestor can
   disable it; inherited disabling immediately blocks descendants while retaining
@@ -327,6 +328,26 @@ infrastructure enforcement. Retain its host safety checks, ownership rules,
 ancestor GPU policies, and existing distinction between agent operations and
 human platform-administrator policy/ownership changes. Agents must not bypass
 those boundaries or use the controller as a fallback for native permission denial.
+
+GPU policy and ownership are configured per agent, not in a separate dialog: the
+human platform administrator's Configure dialog for an agent has a GPU section
+(shown only when the GPU controller is configured) that edits the policy of that
+agent's own domain, shows the parent's effective allowance by agent name, lists
+GPUs owned by the agent, assigns free unclaimed GPUs to it (an owned GPU is usable
+by the agent and its parents, not its subagents) and prepares authorized GPU
+offerings. A policy that exceeds an ancestor is saved only after a confirmation that
+lists, per ancestor, exactly what widens (profiles, a maximum raised only as far as
+needed, flags) and which other descendants' explicit policies become more effective;
+ancestors are then saved top-down before the agent. Recovery of saved GPU operations
+(reconcile, resume) lives in Platform settings.
+
+Agents can never change GPU policy or ownership themselves. When escalation requests
+are enabled and the GPU controller is configured, `request_gpu_profiles` queues a
+`grantGpuPolicy` request in the existing escalation queue for the requesting agent's
+own domain only: host profiles validated against the controller, optional higher
+maximum. The owner's decision view shows the widening plan approval would apply;
+approval recomputes it with the owner's current session and applies it top-down,
+dismissal changes nothing.
 
 Retaining this feature does not automatically add a GPU-worker image factory,
 guest licensing service, or development-workload orchestration to V1.

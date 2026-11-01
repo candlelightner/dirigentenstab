@@ -649,3 +649,11 @@ async def test_gpu_preparation_recovery_keeps_original_identity_and_requires_cur
         with pytest.raises(PermissionError, match='active instruction'):
             await controller.dispatch(recovery, 10001)
         assert not controller.cloud.vms
+
+
+async def test_profiles_are_listed_only_to_an_active_agent_run(controller):
+    listed = await controller.dispatch({'action': 'profiles', 'run_id': 'run-child'}, 10001)
+    assert listed and set(listed[0]) == {'id', 'name'}
+    controller.service.store.execute("UPDATE chat_runs SET status='completed' WHERE id='run-child'")
+    with pytest.raises(PermissionError, match='active agent run'):
+        await controller.dispatch({'action': 'profiles', 'run_id': 'run-child'}, 10001)
