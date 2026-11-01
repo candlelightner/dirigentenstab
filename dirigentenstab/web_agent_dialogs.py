@@ -473,83 +473,101 @@ def setup_agent_dialogs(ctx):
             ui.button('MCP tools', icon='extension',
                       on_click=lambda: protect(lambda: mcp_dialog(agent['id']))).props('outline')
 
-            gpu = None
-            if current.get('type') == 1 and service.settings.gpu_helper_socket:
+            gpu_save = None
+            gpu_loading = bool(current.get('type') == 1 and service.settings.gpu_helper_socket)
+            if gpu_loading:
                 ui.separator()
                 ui.label('GPU').classes('font-semibold')
+                gpu_box = ui.column().classes('w-full')
+                with gpu_box:
+                    ui.label('Loading GPU settings…').classes('text-sm text-stone-600')
+
+            async def load_gpu():
+                nonlocal gpu_save, gpu_loading
                 try:
-                    gpu = await service.gpu_agent_settings(current, agent['id'])
+                    gpu = await service.gpu_agent_settings(await actor(), agent['id'])
                 except Exception as exc:
-                    ui.label(str(diagnose(exc, agent_id=agent['id'], tool='gpu_agent_settings'))).classes('text-sm')
-            if gpu:
-                policy = gpu['policy']
-                gpu_profiles = ui.select(gpu['profiles'], multiple=True, with_input=True, value=policy['profiles'],
-                                         label='Allowed vGPU profiles').props('use-chips').classes('w-full')
-                gpu_max = ui.number('Max vGPUs (-1 = unlimited)', value=policy['max_allocations'], min=-1, precision=0).classes('w-full')
-                labels = {**FLAG_LABELS, 'subgroup_requests': 'Subagents may request GPU capacity' if agent['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}
-                          else 'This agent and its subagents may request GPU capacity'}
-                gpu_flags = {flag: ui.checkbox(labels[flag], value=policy[flag]) for flag in FLAGS}
-                if gpu['parent']:
-                    ui.label(f"Allowed by {gpu['parent']['name']}: {', '.join(gpu['parent']['profiles']) or 'no profiles'}"
-                             f" · max {gpu['parent']['max_allocations']}").classes('text-sm text-stone-600 break-words')
-                ui.label('GPUs owned by this agent').classes('font-semibold')
-                owned_list = ui.column().classes('w-full min-w-0 gap-0')
-                free_device = ui.select(gpu['free'], label='Free GPU').classes('w-full')
-                ui.label('An owned GPU is usable by this agent and its parents, not by its subagents.').classes('text-sm text-stone-600')
+                    gpu = None
+                    gpu_box.clear()
+                    with gpu_box:
+                        ui.label(str(diagnose(exc, agent_id=agent['id'], tool='gpu_agent_settings'))).classes('text-sm')
+                gpu_loading = False
+                if not gpu:
+                    return
+                gpu_box.clear()
+                with gpu_box:
+                    policy = gpu['policy']
+                    gpu_profiles = ui.select(gpu['profiles'], multiple=True, with_input=True, value=policy['profiles'],
+                                             label='Allowed vGPU profiles').props('use-chips').classes('w-full')
+                    gpu_max = ui.number('Max vGPUs (-1 = unlimited)', value=policy['max_allocations'], min=-1, precision=0).classes('w-full')
+                    labels = {**FLAG_LABELS, 'subgroup_requests': 'Subagents may request GPU capacity' if agent['id'] in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}
+                              else 'This agent and its subagents may request GPU capacity'}
+                    gpu_flags = {flag: ui.checkbox(labels[flag], value=policy[flag]) for flag in FLAGS}
+                    if gpu['parent']:
+                        ui.label(f"Allowed by {gpu['parent']['name']}: {', '.join(gpu['parent']['profiles']) or 'no profiles'}"
+                                 f" · max {gpu['parent']['max_allocations']}").classes('text-sm text-stone-600 break-words')
+                    ui.label('GPUs owned by this agent').classes('font-semibold')
+                    owned_list = ui.column().classes('w-full min-w-0 gap-0')
+                    free_device = ui.select(gpu['free'], label='Free GPU').classes('w-full')
+                    ui.label('An owned GPU is usable by this agent and its parents, not by its subagents.').classes('text-sm text-stone-600')
 
-                def render_owned():
-                    owned_list.clear()
-                    with owned_list:
-                        for pool in gpu['owned']:
-                            ui.label(f"{gpu['profiles'].get(pool['profile'], pool['profile'])} · {pool['uuid']}").classes('text-sm break-all')
-                        if not gpu['owned']:
-                            ui.label('None').classes('text-sm')
-                render_owned()
-
-                async def claim():
-                    if not free_device.value:
-                        raise ValueError('Select a free GPU')
-                    await service.gpu_admin(await actor(), 'claim', domain_id=agent['domain_id'], uuid=free_device.value)
-                    gpu.update(await service.gpu_agent_settings(await actor(), agent['id']))
-                    free_device.set_options(gpu['free'], value=None)
+                    def render_owned():
+                        owned_list.clear()
+                        with owned_list:
+                            for pool in gpu['owned']:
+                                ui.label(f"{gpu['profiles'].get(pool['profile'], pool['profile'])} · {pool['uuid']}").classes('text-sm break-all')
+                            if not gpu['owned']:
+                                ui.label('None').classes('text-sm')
                     render_owned()
-                    ui.notify('GPU assigned to this agent.', type='positive')
-                ui.button('Assign free GPU to this agent', on_click=lambda: protect(claim)).props('outline')
-                with ui.expansion('Prepare authorized GPU offering', icon='memory').classes('w-full'):
-                    offering_profile = ui.select(gpu['profiles'], label='GPU offering profile').classes('w-full')
-                    offering_cpus = ui.number('Offering vCPUs', value=1, min=1, precision=0)
-                    offering_memory = ui.number('Offering RAM MiB', value=1024, min=512, precision=0)
-                    offering_disk = ui.number('Offering root disk GiB', value=20, min=8, precision=0)
 
-                    async def offering():
-                        if not offering_profile.value:
-                            raise ValueError('Select a profile first')
-                        result = await service.gpu_admin(await actor(), 'offering', domain_id=agent['domain_id'],
-                                                         profile=offering_profile.value, cpus=int(offering_cpus.value),
-                                                         memory=int(offering_memory.value), root_disk=int(offering_disk.value))
-                        ui.notify('Authorized native GPU offering: ' + result['offering_id'], type='positive')
-                    ui.button('Prepare authorized GPU offering', on_click=lambda: protect(offering)).props('outline')
+                    async def claim():
+                        if not free_device.value:
+                            raise ValueError('Select a free GPU')
+                        await service.gpu_admin(await actor(), 'claim', domain_id=agent['domain_id'], uuid=free_device.value)
+                        gpu.update(await service.gpu_agent_settings(await actor(), agent['id']))
+                        free_device.set_options(gpu['free'], value=None)
+                        render_owned()
+                        ui.notify('GPU assigned to this agent.', type='positive')
+                    ui.button('Assign free GPU to this agent', on_click=lambda: protect(claim)).props('outline')
+                    with ui.expansion('Prepare authorized GPU offering', icon='memory').classes('w-full'):
+                        offering_profile = ui.select(gpu['profiles'], label='GPU offering profile').classes('w-full')
+                        offering_cpus = ui.number('Offering vCPUs', value=1, min=1, precision=0)
+                        offering_memory = ui.number('Offering RAM MiB', value=1024, min=512, precision=0)
+                        offering_disk = ui.number('Offering root disk GiB', value=20, min=8, precision=0)
 
-                async def save_gpu():
-                    new = {'profiles': gpu_profiles.value or [], 'max_allocations': int(gpu_max.value),
-                           **{flag: gpu_flags[flag].value for flag in FLAGS}}
-                    if new == policy:
+                        async def offering():
+                            if not offering_profile.value:
+                                raise ValueError('Select a profile first')
+                            result = await service.gpu_admin(await actor(), 'offering', domain_id=agent['domain_id'],
+                                                             profile=offering_profile.value, cpus=int(offering_cpus.value),
+                                                             memory=int(offering_memory.value), root_disk=int(offering_disk.value))
+                            ui.notify('Authorized native GPU offering: ' + result['offering_id'], type='positive')
+                        ui.button('Prepare authorized GPU offering', on_click=lambda: protect(offering)).props('outline')
+
+                    async def save_gpu():
+                        new = {'profiles': gpu_profiles.value or [], 'max_allocations': int(gpu_max.value),
+                               **{flag: gpu_flags[flag].value for flag in FLAGS}}
+                        if new == policy:
+                            return True
+                        plan = await service.gpu_policy_plan(await actor(), agent['id'], new)
+                        if plan['changes']:
+                            with ui.dialog() as confirm_dialog, ui.card().classes('w-full max-w-xl min-w-0'):
+                                ui.label('Widen ancestor GPU policies?').classes('text-lg font-semibold')
+                                for text in describe_plan(plan):
+                                    ui.label(text).classes('text-sm break-words')
+                                with ui.row():
+                                    ui.button('Widen and save', on_click=lambda: confirm_dialog.submit(True))
+                                    ui.button('Cancel', on_click=lambda: confirm_dialog.submit(False)).props('flat')
+                            confirmed = await confirm_dialog
+                            confirm_dialog.delete()
+                            if not confirmed:
+                                return False
+                        await service.gpu_apply_policy(await actor(), plan)
                         return True
-                    plan = await service.gpu_policy_plan(await actor(), agent['id'], new)
-                    if plan['changes']:
-                        with ui.dialog() as confirm_dialog, ui.card().classes('w-full max-w-xl min-w-0'):
-                            ui.label('Widen ancestor GPU policies?').classes('text-lg font-semibold')
-                            for text in describe_plan(plan):
-                                ui.label(text).classes('text-sm break-words')
-                            with ui.row():
-                                ui.button('Widen and save', on_click=lambda: confirm_dialog.submit(True))
-                                ui.button('Cancel', on_click=lambda: confirm_dialog.submit(False)).props('flat')
-                        confirmed = await confirm_dialog
-                        confirm_dialog.delete()
-                        if not confirmed:
-                            return False
-                    await service.gpu_apply_policy(await actor(), plan)
-                    return True
+                gpu_save = save_gpu
+
+            if gpu_loading:
+                ui.timer(0.01, lambda: protect(load_gpu), once=True)
 
             async def save():
                 options = {'enabled_providers': enabled_providers.value, 'enabled_secrets': enabled_secrets.value}
@@ -569,7 +587,9 @@ def setup_agent_dialogs(ctx):
                                compaction_model=(compaction_model.value or '').strip() if compaction_provider.value else '',
                                auto_compact_percent=int(auto_percent.value) if automatic.value else None,
                                context_window=int(window_override.value) if window_override.value is not None else None)
-                if gpu and not await save_gpu():
+                if gpu_loading:
+                    raise ValueError('GPU settings are still loading')
+                if gpu_save and not await gpu_save():
                     return
                 await service.update_agent(await actor(), agent['id'], provider.value,
                                            (model.value or '').strip(), instructions.value or '', thinking=thinking.value, **options)
