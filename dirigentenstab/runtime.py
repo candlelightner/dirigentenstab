@@ -965,7 +965,8 @@ class Runtime:
                               (conversation_id,)).fetchone()
         if latest and latest['checkpoint']:
             previous = self.service.store.open(latest['checkpoint'])
-            state['mutations'] = previous.get('mutations', {})
+            state['mutations'] = {key: item for key, item in previous.get('mutations', {}).items()
+                                  if item['status'] in {'running', 'uncertain'}}
             for item in state['mutations'].values():
                 item.setdefault('run_id', latest['id'])
         conn.execute('INSERT INTO chat_runs(id,conversation_id,status,agent_id,created,updated,events,checkpoint) '
