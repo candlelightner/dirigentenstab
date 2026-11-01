@@ -637,6 +637,7 @@ class Runtime:
                 return {'error': str(error), 'category': error.category,
                         'deployment_id': getattr(exc, 'operation_id', None)}
 
+        gpu_requests = bool(getattr(self.service.settings, 'gpu_helper_socket', '')) and (await self.service.escalation_access(record))['enabled']
         agent = Agent(
             model,
             instructions=(instructions + '\nTool rules. Reuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
@@ -648,6 +649,7 @@ class Runtime:
                           'Use save_skill to create or edit skills, share_skill for selected descendants, '
                           'and request_skill_global for human approval of the exact revision. '
                           'remove_skill queues removal of a skill you can read; removal always requires human approval. '
+                          + ('request_gpu_profiles asks the owner to add vGPU profiles to your policy. ' if gpu_requests else '') +
                           'For the native installation prefer its Dirigentenstab-small offering when available; '
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
@@ -768,6 +770,19 @@ class Runtime:
                     return {'request_id': row['id'], 'status': row['status']}
                 enqueue.__name__ = 'remove_skill'
                 return await invoke(enqueue, agent_id, skill_id, reason, call_id=ctx.tool_call_id)
+
+            if gpu_requests:
+                @agent.tool(sequential=True)
+                async def request_gpu_profiles(ctx: RunContext, profiles: list[str], reason: str,
+                                               max_allocations: int | None = None) -> dict:
+                    """Request human approval to add host vGPU profiles (names or ids) to your own GPU policy. You cannot change policy yourself."""
+                    async def enqueue(acting_agent, selected, explanation, maximum):
+                        row = await self.service.request_gpu_profiles(
+                            acting_agent, selected, explanation, maximum, conversation_id=conversation_id,
+                            run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+                        return {'request_id': row['id'], 'status': row['status']}
+                    enqueue.__name__ = 'request_gpu_profiles'
+                    return await invoke(enqueue, agent_id, profiles, reason, max_allocations, call_id=ctx.tool_call_id)
 
         @agent.tool_plain(sequential=True)
         async def create_subgroup(name: str, model: str | None = None, instructions: str | None = None,

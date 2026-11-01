@@ -1646,3 +1646,17 @@ async def test_skill_tools_lazy_text_recheck_reads_and_distinct_mutation_calls(s
     assert reads == 9
     removal = service.store.one('SELECT command,status FROM escalation_requests')
     assert removal == {'command': 'removeSkill', 'status': 'pending'}
+
+
+@pytest.mark.parametrize('escalation,socket,visible', [(1, '/gpu', True), (0, '/gpu', False), (1, '', False)])
+async def test_gpu_profile_request_tool_needs_escalation_and_a_gpu_controller(service, monkeypatch, escalation, socket, visible):
+    service.settings.gpu_helper_socket = socket
+    service.store.execute('UPDATE agents SET escalation_requests_enabled=? WHERE id=?', (escalation, 'parent'))
+    seen = []
+
+    async def model(messages, info):
+        seen.append(('request_gpu_profiles' in {tool.name for tool in info.function_tools}, 'request_gpu_profiles' in info.instructions))
+        yield 'Checked'
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'GPU tools')
+    assert seen == [(visible, visible)]

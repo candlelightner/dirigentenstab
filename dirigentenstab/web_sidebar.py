@@ -162,11 +162,9 @@ def build_sidebar(ctx):
                         if identity.get('type') == 1:
                             ctx.providers_button = ui.button('Model providers', icon='settings').props('flat no-caps align=left').classes('w-full')
                             ctx.platform_button = ui.button('Platform settings', icon='admin_panel_settings').props('flat no-caps align=left').classes('w-full')
-                            ctx.gpu_button = ui.button('GPU policies', icon='memory').props('flat no-caps align=left').classes('w-full')
                         else:
                             ctx.providers_button = None
                             ctx.platform_button = None
-                            ctx.gpu_button = None
                         ui.html('<form method="post" action="/auth/logout" class="w-full" onsubmit="window.socket?.disconnect()"><input type="hidden" name="csrf" value="'
                                 + html.escape(identity['csrf'], quote=True)
                                 + '"><button type="submit" class="w-full text-left px-3 py-2 rounded hover:bg-stone-100">Sign out</button></form>',
@@ -324,5 +322,3 @@ def setup_sidebar(ctx):
     if ctx.platform_button is not None:
         ctx.platform_button.on_click(lambda: protect(lambda: open_dialog(ctx.platform_dialog)))
 
-    if ctx.gpu_button is not None:
-        ctx.gpu_button.on_click(lambda: protect(lambda: open_dialog(ctx.gpu_dialog)))

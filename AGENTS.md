@@ -18,7 +18,7 @@ Guidelines and conventions for AI assistants working in this repository.
   5. Merge PR into `main` via GitHub MCP. Merging does not deploy.
   6. Deploy only a published release, never a bare merge:
      a. Merge a version-bump PR. `release.yaml` then publishes `ghcr.io/candlelightner/dirigentenstab:<version>` and the tag `v<version>`; wait for that workflow to succeed.
-     b. Pull `origin/main` in `/home/emil/dirigentenstab`.
+     b. Pull `origin/main` in `/home/emil/dirigentenstab`. If the release changed `dirigentenstab/gpu_control.py`, `dirigentenstab/gpu.py` or `scripts/gpu_helper.py` and the GPU helper is installed, restart it (`sudo systemctl restart dirigentenstab-gpu.service`) while no GPU operation is in progress (Platform settings → GPU operation recovery lists none pending).
      c. Back up `.env` under `.work/env-backup-<UTC timestamp>`.
      d. Pull the release image and set only `IMAGE` in `.env` to `ghcr.io/candlelightner/dirigentenstab:<version>`. Never deploy locally built or SHA-tagged images.
      e. Restart the `dirigentenstab` Docker Compose service preserving active env/secrets/`dirigentenstab_data`.

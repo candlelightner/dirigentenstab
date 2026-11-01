@@ -356,7 +356,7 @@ def main():
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master),
                         platform_status=str(args.state_dir / 'platform-status.json'),
-                        cloudstack_ui_url='https://cloudstack.tailnet.invalid/client')
+                        cloudstack_ui_url='https://cloudstack.tailnet.invalid/client', gpu_helper_socket='/fixture-gpu')
     service = FixtureService(store, settings)
     service.sftp_root = args.state_dir / 'vm-files'
     (service.sftp_root / 'docs').mkdir(parents=True)

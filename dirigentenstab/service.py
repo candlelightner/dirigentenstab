@@ -20,7 +20,8 @@ from .diagnostics import OperationError
 from .hierarchy import validate_child
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .auth import NATIVE_POLL_SECONDS
-from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call
+from .gpu import FLAGS, GPU_COMMANDS, GPU_CONTEXT, effective_policy, helper_call, policy_gain, validate_policy
+from .gpu_control import Controller
 from . import platform_status
 
 _UNSET = object()
@@ -332,7 +333,8 @@ class Service:
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file', 'configure_agent',
                           'list_skills', 'get_skill', 'save_skill', 'share_skill']
-                         + (['request_escalation', 'request_skill_global', 'remove_skill'] if (await self.escalation_access(agent))['enabled'] else []),
+                         + (['request_escalation', 'request_skill_global', 'remove_skill'] + (['request_gpu_profiles'] if getattr(self.settings, 'gpu_helper_socket', '') else [])
+                            if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
 
@@ -390,6 +392,118 @@ class Service:
         if identity.get('type') != 1:
             raise PermissionError('GPU policy administration requires a human platform administrator')
         return await helper_call(self.settings, action, session=identity['_session'], **payload)
+
+    async def _gpu_view(self, identity, agent_id):
+        agent = await self.authorize(identity, agent_id)
+        data = await self.gpu_admin(identity)
+        chain = Controller.chain(data['domains'], agent['domain_id'])
+        names = {row['domain_id']: row['name'] for row in self.store.all('SELECT domain_id,name FROM agents WHERE enabled=1')}
+        data['label'] = lambda domain: names.get(domain['id'], domain.get('path', domain['name']))
+        data['names'] = {p['id']: p['name'] for p in data['profiles']}
+        return agent, data, chain
+
+    @staticmethod
+    def _gpu_current(data, domain):
+        return data['policies'].get(domain['id']) or {
+            'profiles': [], 'max_allocations': -1 if int(domain['level']) == 0 else 0, **{flag: False for flag in FLAGS}}
+
+    async def gpu_agent_settings(self, identity, agent_id):
+        """Policy, parent allowance, owned pools and free devices for one agent's own domain."""
+        agent, data, chain = await self._gpu_view(identity, agent_id)
+        parent = None
+        if len(chain) > 1:
+            allowed = effective_policy(chain[:-1], data['policies'])
+            parent = {'name': data['label'](chain[-2]), 'max_allocations': allowed['max_allocations'],
+                      'profiles': sorted(data['names'].get(p, p) for p in allowed['profiles'])}
+        owners = {pool['uuid'] for pool in data['pools']}
+        return {'profiles': data['names'], 'policy': self._gpu_current(data, chain[-1]), 'parent': parent,
+                'owned': [pool for pool in data['pools'] if pool['domain_id'] == agent['domain_id']],
+                'free': {d['busaddress']: d.get('vgpuprofilename', '') + ' · ' + d['busaddress']
+                         for d in data['devices'] if d.get('state') == 'Free' and d['busaddress'] not in owners}}
+
+    async def gpu_policy_plan(self, identity, agent_id, policy):
+        """Ancestor policies (top-down) that must widen before `policy` can be saved for this agent's domain."""
+        _, data, chain = await self._gpu_view(identity, agent_id)
+        policies, names = data['policies'], data['names']
+        validate_policy(policy, names)
+        if (policy['max_allocations'] == -1) != (len(chain) == 1):
+            raise ValueError('ROOT has an unlimited quota (-1); managed domains need an explicit quota of 0 or more')
+        hypothetical, changes = dict(policies), []
+        for domain in chain[:-1]:
+            old = self._gpu_current(data, domain)
+            maximum = old['max_allocations']
+            new = {'profiles': old['profiles'] + [p for p in policy['profiles'] if p not in old['profiles']],
+                   'max_allocations': maximum if maximum < 0 or maximum >= policy['max_allocations'] else policy['max_allocations'],
+                   **{flag: old[flag] or policy[flag] for flag in FLAGS}}
+            gain = policy_gain(old, new, names)
+            if gain['profiles'] or gain['max'] or gain['flags']:
+                changes.append({'domain_id': domain['id'], 'name': data['label'](domain), 'policy': new, **gain})
+                hypothetical[domain['id']] = new
+        widened = {change['domain_id'] for change in changes}
+        activated, lineage = [], {d['id'] for d in chain}
+        for domain in data['domains']:
+            if domain['id'] not in policies or domain['id'] in lineage:
+                continue
+            try:
+                below = Controller.chain(data['domains'], domain['id'])
+            except PermissionError:
+                continue
+            if chain[-1]['id'] in {d['id'] for d in below} or not widened & {d['id'] for d in below[:-1]}:
+                continue
+            gain = policy_gain(effective_policy(below, policies), effective_policy(below, hypothetical), names)
+            if gain['profiles'] or gain['max'] or gain['flags']:
+                activated.append({'domain_id': domain['id'], 'name': data['label'](domain), **gain})
+        target = {'domain_id': chain[-1]['id'], 'name': data['label'](chain[-1]), 'policy': policy,
+                  **policy_gain(self._gpu_current(data, chain[-1]), policy, names)}
+        return {'changes': changes, 'activated': activated, 'target': target}
+
+    async def gpu_apply_policy(self, identity, plan):
+        applied = []
+        try:
+            for change in [*plan['changes'], plan['target']]:
+                await self.gpu_admin(identity, 'set_policy', domain_id=change['domain_id'], policy=change['policy'])
+                applied.append(change)
+        except Exception as exc:
+            raise RuntimeError('GPU policy change stopped after saving: ' + (', '.join(c['name'] for c in applied) or 'nothing')
+                               + f'. {exc}') from exc
+        return applied
+
+    async def _gpu_grant_params(self, run_id, profiles, maximum):
+        if not self.settings.gpu_helper_socket:
+            raise PermissionError('The GPU controller is not configured')
+        if (not isinstance(profiles, list) or not 1 <= len(profiles) <= 16 or not all(isinstance(p, str) for p in profiles)
+                or maximum is not None and (type(maximum) is not int or maximum < 0)):
+            raise ValueError('Name 1-16 host vGPU profiles and an optional nonnegative maximum')
+        host = {p['id']: p for p in await helper_call(self.settings, 'profiles', run_id=run_id)}
+        by_name = {p['name']: p for p in host.values()}
+        chosen = {}
+        for item in profiles:
+            profile = host.get(item) or by_name.get(item)
+            if not profile:
+                raise ValueError('Unknown host vGPU profile: ' + item[:80])
+            chosen[profile['id']] = {'id': profile['id'], 'name': profile['name']}
+        return {'profiles': [chosen[key] for key in sorted(chosen)], 'max_allocations': maximum}
+
+    async def request_gpu_profiles(self, agent_id, profiles, reason, max_allocations=None, **context):
+        params = await self._gpu_grant_params(context['run_id'], profiles, max_allocations)
+        description = 'Allow vGPU profiles: ' + ', '.join(p['name'] for p in params['profiles'])
+        if max_allocations is not None:
+            description += f' (max {max_allocations})'
+        return await self.request_escalation(agent_id, description, reason, 'grantGpuPolicy', params, **context)
+
+    async def gpu_grant_plan(self, identity, request_id):
+        """The widening plan that approving this request would apply right now."""
+        row = self.store.one("SELECT * FROM escalation_requests WHERE id=? AND command='grantGpuPolicy'", (request_id,))
+        if not row or row['human_id'] != identity['userid']:
+            raise PermissionError('Escalation request is unavailable to this owner')
+        params = self.store.open(row['params'])
+        policy = (await self.gpu_agent_settings(identity, row['agent_id']))['policy']
+        policy = {**policy, 'profiles': policy['profiles'] + [p['id'] for p in params['profiles'] if p['id'] not in policy['profiles']]}
+        if policy['max_allocations'] >= 0:  # an approved grant never leaves the agent at zero allocations
+            policy['max_allocations'] = max(policy['max_allocations'], params['max_allocations'] or 1)
+        if row['agent_id'] not in {APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT}:  # the controller requires it on the agent's own chain
+            policy['subgroup_requests'] = True
+        return await self.gpu_policy_plan(identity, row['agent_id'], policy)
 
     async def search_api(self, agent_id, query):
         agent = await self.agent(agent_id)
@@ -1093,6 +1207,11 @@ class Service:
                 raise PermissionError('Only skill editors may request global sharing')
             if params != {key: skill[key] for key in ('id', 'revision', 'name', 'description', 'text')}:
                 raise ValueError('Review the exact current skill revision')
+        elif command == 'grantGpuPolicy':
+            if (not isinstance(params, dict) or set(params) != {'profiles', 'max_allocations'} or not isinstance(params['profiles'], list)
+                    or not all(isinstance(p, dict) and isinstance(p.get('id'), str) for p in params['profiles'])
+                    or params != await self._gpu_grant_params(run_id, [p['id'] for p in params['profiles']], params['max_allocations'])):
+                raise ValueError('Review the exact host vGPU profiles')
         else:
             validate(None, params)
         if len(json.dumps(params)) > (400000 if command in {'shareSkillGlobally', 'removeSkill'} else 65536):
@@ -1154,6 +1273,25 @@ class Service:
         if row['status'] != 'pending':
             return self._escalation_request(row)
         command, params = row['command'], self.store.open(row['params'])
+        if command == 'grantGpuPolicy':
+            if not self.store.execute("UPDATE escalation_requests SET status=?,updated=? WHERE id=? AND status='pending'",
+                                      ('applying' if approve else 'deferred', time.time(), request_id)):
+                return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
+            status, result = 'deferred', None
+            if approve:
+                try:
+                    if not (await self.escalation_access(agent))['enabled']:
+                        raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
+                    result = {'applied': await self.gpu_apply_policy(current, await self.gpu_grant_plan(current, request_id))}
+                    status = 'approved'
+                except Exception as exc:
+                    status, result = 'failed', {'error': self.redact(str(exc))}
+                self.store.execute('UPDATE escalation_requests SET status=?,result=?,updated=? WHERE id=?',
+                                   (status, self.store.seal(self.redact(result)), time.time(), request_id))
+            else:
+                self.store.execute('UPDATE escalation_requests SET status=?,updated=? WHERE id=?', (status, time.time(), request_id))
+            self.store.audit(current['userid'], 'decide-escalation', request_id, status)
+            return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
         if command in {'shareSkillGlobally', 'removeSkill'}:
             if approve:
                 if not (await self.escalation_access(agent))['enabled']:

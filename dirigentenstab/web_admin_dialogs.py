@@ -7,6 +7,7 @@ from nicegui import ui
 
 from .runtime import provider_models, test_provider
 from .diagnostics import diagnose
+from .gpu import describe_plan
 
 
 def setup_admin_dialogs(ctx):
@@ -15,6 +16,7 @@ def setup_admin_dialogs(ctx):
     ctx.escalation_rows = []
     deciding_escalations = set()
     detail_request_id = None
+    detail_plan = []
 
     with ui.dialog() as escalation_dialog, ui.card().classes('w-full max-w-xl gap-4'):
         ui.label('Escalation requests').classes('text-xl font-semibold')
@@ -61,6 +63,8 @@ def setup_admin_dialogs(ctx):
                     ui.label('userdata is not valid base64 text; shown as sent').classes('text-xs font-semibold')
             ui.label(json.dumps(params, indent=2, ensure_ascii=False)).classes(
                 'w-full whitespace-pre-wrap break-all font-mono text-xs')
+            for text in detail_plan if row['status'] == 'pending' else []:
+                ui.label(text).classes('w-full whitespace-pre-wrap break-words text-sm')
             if row['status'] == 'pending':
                 with ui.row():
                     approve = ui.button('Approve', on_click=lambda: protect(
@@ -74,9 +78,14 @@ def setup_admin_dialogs(ctx):
                     'w-full whitespace-pre-wrap break-all text-xs')
 
     async def open_escalation_detail(request_id):
-        nonlocal detail_request_id
+        nonlocal detail_request_id, detail_plan
         await ctx.refresh_escalations(await actor())
-        detail_request_id = request_id
+        detail_request_id, detail_plan = request_id, []
+        if next((r['command'] for r in ctx.escalation_rows if r['id'] == request_id), None) == 'grantGpuPolicy':
+            try:
+                detail_plan = ['Approving applies, top-down:'] + describe_plan(await service.gpu_grant_plan(await actor(), request_id))
+            except Exception as exc:
+                detail_plan = [str(diagnose(exc, tool='gpu_grant_plan'))]
         render_escalation_detail()
         escalation_detail_dialog.open()
 
@@ -115,90 +124,6 @@ def setup_admin_dialogs(ctx):
         escalation_dialog.open()
     ctx.open_escalations = open_escalations
 
-    async def gpu_dialog():
-        current = await actor()
-        if current.get('type') != 1:
-            raise PermissionError('Human platform administrator required')
-        data = await service.gpu_admin(current)
-        domains = {d['id']: d for d in data['domains']}
-        profiles = {p['id']: p['name'] for p in data['profiles']}
-        with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl gap-3'):
-            ui.label('GPU policies and device ownership').classes('text-xl font-semibold')
-            ui.label('Missing policies deny GPU operations. Every ancestor restricts its descendants. '
-                     'Only devices owned by the group or its subgroups may change.').classes('text-sm')
-            domain = ui.select({k: d.get('path', d['name']) for k, d in domains.items()},
-                               label='GPU policy domain', with_input=True).classes('w-full')
-            allowed = ui.select(profiles, multiple=True, with_input=True, label='Allowed vGPU profiles').props('use-chips').classes('w-full')
-            maximum = ui.number('Maximum GPU allocations', value=0, min=-1, precision=0).classes('w-full')
-            release = ui.checkbox('Release GPU automatically when its VM stops')
-            reconfigure = ui.checkbox('Allow reconfiguration of owned unused GPU pools')
-            subgroup = ui.checkbox('Allow subgroup agents to request GPU capacity')
-            feedback = ui.label('').classes('text-sm whitespace-pre-wrap')
-
-            async def load():
-                if not domain.value:
-                    return
-                policy = data['policies'].get(domain.value, {})
-                allowed.set_value(policy.get('profiles', []))
-                maximum.set_value(policy.get('max_allocations', -1 if int(domains[domain.value].get('level', -1)) == 0 else 0))
-                release.set_value(policy.get('release_on_stop', False))
-                reconfigure.set_value(policy.get('reconfigure_unused', False))
-                subgroup.set_value(policy.get('subgroup_requests', False))
-                feedback.set_text('Native ROOT quota is unlimited (-1). Put real quota caps on managed child domains.'
-                                  if int(domains[domain.value].get('level', -1)) == 0 else '')
-
-            async def save():
-                current_actor = await actor()
-                if not domain.value:
-                    raise ValueError('Select a GPU policy domain')
-                policy = {'profiles': allowed.value or [], 'max_allocations': int(maximum.value),
-                          'release_on_stop': release.value, 'reconfigure_unused': reconfigure.value,
-                          'subgroup_requests': subgroup.value}
-                await service.gpu_admin(current_actor, 'set_policy', domain_id=domain.value, policy=policy)
-                data['policies'][domain.value] = policy
-                feedback.set_text('Policy saved; native CloudStack quota verified.')
-
-            domain.on_value_change(lambda: protect(load))
-            ui.button('Save GPU policy', on_click=lambda: protect(save))
-            with ui.expansion('Platform capacity preparation', icon='memory').classes('w-full'):
-                ui.table(columns=[{'name': field, 'label': label, 'field': field} for field, label in
-                         [('uuid', 'Owned device'), ('domain_id', 'Owner domain'), ('profile', 'Profile')]],
-                         rows=data['pools']).classes('w-full')
-                profile = ui.select(profiles, label='GPU offering profile').classes('w-full')
-                cpus = ui.number('Offering vCPUs', value=1, min=1, precision=0)
-                memory = ui.number('Offering RAM MiB', value=1024, min=512, precision=0)
-                disk = ui.number('Offering root disk GiB', value=20, min=8, precision=0)
-                async def offering():
-                    if not domain.value or not profile.value:
-                        raise ValueError('Select a domain and profile first')
-                    result = await service.gpu_admin(await actor(), 'offering', domain_id=domain.value, profile=profile.value,
-                                                     cpus=int(cpus.value), memory=int(memory.value), root_disk=int(disk.value))
-                    feedback.set_text('Authorized native GPU offering: ' + result['offering_id'])
-                ui.button('Prepare authorized GPU offering', on_click=lambda: protect(offering))
-                owned = {p['uuid'] for p in data['pools']}
-                devices = {d['busaddress']: d.get('vgpuprofilename', '') + ' · ' + d['busaddress']
-                           for d in data['devices'] if d.get('state') == 'Free' and d['busaddress'] not in owned}
-                device = ui.select(devices, label='Unclaimed free GPU device').classes('w-full')
-                async def claim():
-                    if not domain.value or not device.value:
-                        raise ValueError('Select an owner domain and free device')
-                    await service.gpu_admin(await actor(), 'claim', domain_id=domain.value, uuid=device.value)
-                    feedback.set_text('Free device pool owner assigned. Existing ownership cannot be overwritten.')
-                ui.button('Assign unclaimed pool to selected domain', on_click=lambda: protect(claim))
-            with ui.expansion('GPU operation recovery', icon='restore').classes('w-full'):
-                operations = {o['id']: o['id'] + ' · ' + o['phase'] for o in data['operations']}
-                operation = ui.select(operations, label='GPU operation reference').classes('w-full')
-                async def recover(action):
-                    if not operation.value:
-                        raise ValueError('Select a saved GPU operation')
-                    result = await service.gpu_admin(await actor(), action, operation_id=operation.value)
-                    feedback.set_text('GPU operation verified: ' + json.dumps(result)[:1024])
-                ui.button('Reconcile GPU operation', on_click=lambda: protect(lambda: recover('reconcile')))
-                ui.button('Resume saved pre-dispatch GPU plan', on_click=lambda: protect(lambda: recover('resume')))
-            ui.button('Close', on_click=dialog.close).props('flat')
-        dialog.open()
-    ctx.gpu_dialog = gpu_dialog
-
     async def platform_dialog():
         current = await actor()
         if current.get('type') != 1:
@@ -235,6 +160,23 @@ def setup_admin_dialogs(ctx):
                 ui.button('Set secret', on_click=lambda: protect(set_secret)).props('outline').mark('set-secret')
                 ui.button('Delete secret', on_click=lambda: protect(delete_secret), color='negative').props('flat').mark('delete-secret')
             ui.separator()
+            if service.settings.gpu_helper_socket:
+                with ui.expansion('GPU operation recovery', icon='restore').classes('w-full'):
+                    operation = ui.select([], label='GPU operation reference').classes('w-full')
+
+                    async def load_operations():
+                        data = await service.gpu_admin(await actor())
+                        operation.set_options({o['id']: o['id'] + ' · ' + o['phase'] for o in data['operations']})
+
+                    async def recover(action):
+                        if not operation.value:
+                            raise ValueError('Select a saved GPU operation')
+                        result = await service.gpu_admin(await actor(), action, operation_id=operation.value)
+                        ui.notify('GPU operation verified: ' + json.dumps(result)[:1024], type='positive')
+                    ui.button('Load GPU operations', on_click=lambda: protect(load_operations)).props('outline')
+                    ui.button('Reconcile GPU operation', on_click=lambda: protect(lambda: recover('reconcile'))).props('outline')
+                    ui.button('Resume saved pre-dispatch GPU plan', on_click=lambda: protect(lambda: recover('resume'))).props('outline')
+                ui.separator()
 
             async def save():
                 actor_identity = await actor()

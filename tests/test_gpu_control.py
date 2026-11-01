@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import shutil
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -251,10 +253,14 @@ async def gpu_socket(controller, tmp_path, monkeypatch):
         values = unpack(format, data)
         return (values[0], 0, values[2]) if format == '3i' else values
     monkeypatch.setattr(gpu.struct, 'unpack', root_peer)
-    path = str(tmp_path / 's')
-    async with await asyncio.start_unix_server(lambda r, w: connection(controller, r, w), path=path,
-                                               limit=65537):
-        yield SimpleNamespace(gpu_helper_socket=path)
+    directory = tempfile.mkdtemp(prefix='ds-gpu-', dir='/tmp')  # tmp_path can exceed the AF_UNIX path limit
+    path = directory + '/s'
+    try:
+        async with await asyncio.start_unix_server(lambda r, w: connection(controller, r, w), path=path,
+                                                   limit=65537):
+            yield SimpleNamespace(gpu_helper_socket=path)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.mark.parametrize('changed', [False, True])
@@ -643,3 +649,11 @@ async def test_gpu_preparation_recovery_keeps_original_identity_and_requires_cur
         with pytest.raises(PermissionError, match='active instruction'):
             await controller.dispatch(recovery, 10001)
         assert not controller.cloud.vms
+
+
+async def test_profiles_are_listed_only_to_an_active_agent_run(controller):
+    listed = await controller.dispatch({'action': 'profiles', 'run_id': 'run-child'}, 10001)
+    assert listed and set(listed[0]) == {'id', 'name'}
+    controller.service.store.execute("UPDATE chat_runs SET status='completed' WHERE id='run-child'")
+    with pytest.raises(PermissionError, match='active agent run'):
+        await controller.dispatch({'action': 'profiles', 'run_id': 'run-child'}, 10001)

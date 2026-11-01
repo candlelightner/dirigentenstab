@@ -13,6 +13,8 @@ GPU_COMMANDS = frozenset({'deployVirtualMachine', 'startVirtualMachine', 'stopVi
                          'rebootVirtualMachine', 'destroyVirtualMachine', 'recoverVirtualMachine',
                          'restoreVirtualMachine', 'scaleVirtualMachine', 'changeServiceForVirtualMachine'})
 FLAGS = ('release_on_stop', 'reconfigure_unused', 'subgroup_requests')
+FLAG_LABELS = {'release_on_stop': 'Release GPU when its VM stops', 'reconfigure_unused': 'May switch unused GPU sizes',
+               'subgroup_requests': 'GPU capacity requests'}
 
 
 def validate_policy(value, available):
@@ -46,6 +48,25 @@ def narrows(policy, parent):
     return (set(policy['profiles']) <= parent['profiles'] and
             all(not policy[flag] or parent[flag] for flag in FLAGS) and
             (parent['max_allocations'] < 0 or 0 <= policy['max_allocations'] <= parent['max_allocations']))
+
+
+def policy_gain(old, new, names):
+    """What `new` allows beyond `old`: profile names, a larger max (-1 = unlimited) and newly enabled flags."""
+    before, after = old['max_allocations'], new['max_allocations']
+    return {'profiles': sorted(names.get(p, p) for p in set(new['profiles']) - set(old['profiles'])),
+            'max': [before, after] if before != -1 and (after == -1 or after > before) else None,
+            'flags': [flag for flag in FLAGS if new[flag] and not old[flag]]}
+
+
+def describe_plan(plan):
+    """Plain-text lines for the ancestors a policy change widens and the policies that become more effective."""
+    def line(item):
+        parts = ['allow ' + ', '.join(item['profiles'])] if item['profiles'] else []
+        parts += [f"max {item['max'][0]} to {item['max'][1]}"] if item['max'] else []
+        parts += [f"enable \"{FLAG_LABELS[flag]}\"" for flag in item['flags']]
+        return f"{item['name']}: " + '; '.join(parts)
+    return ([line(item) for item in plan['changes']]
+            + ['Also becomes more effective for ' + line(item) for item in plan['activated']])
 
 
 async def helper_call(settings, action, **payload):

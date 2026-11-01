@@ -323,8 +323,8 @@ async def test_browser_disabled_cloudstack_human_loses_existing_socket_access(br
         page = await context.new_page()
         await login(page, url)
         (state / 'human-disabled').touch()
-        # The activity timer revalidates the socket session and redirects automatically.
-        await page.get_by_role('button', name='Sign in', exact=True).wait_for()
+        # The activity timer revalidates the socket session and redirects automatically; the native re-check runs every 30 s.
+        await page.get_by_role('button', name='Sign in', exact=True).wait_for(timeout=60000)
         response = await context.request.get(url + '/')
         assert response.url.endswith('/login')
         await browser.close()
@@ -559,42 +559,42 @@ async def test_owner_sets_and_deletes_write_only_secret_on_mobile(browser_app):
         await browser.close()
 
 
-async def test_gpu_policy_platform_ui_persists_and_loads_on_mobile(browser_app):
+async def test_configure_gpu_section_widens_ancestors_on_save_and_has_no_overflow(browser_app):
+    from dirigentenstab.store import Store
+
     url, state = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
         await login(page, url)
         await page.get_by_role('button', name='Settings', exact=True).click()
-        await page.get_by_role('button', name='GPU policies', exact=True).click()
-        await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
-        await page.get_by_role('option', name='ROOT', exact=True).click()
+        assert await page.get_by_role('button', name='GPU policies', exact=True).count() == 0
+        await page.keyboard.press('Escape')
+        await open_configuration(page)
+        await page.get_by_text('GPUs owned by this agent', exact=True).scroll_into_view_if_needed()
         await page.get_by_label('Allowed vGPU profiles', exact=True).fill('GRID P40-8Q')
         await page.get_by_role('option', name='GRID P40-8Q', exact=True).click()
         await page.keyboard.press('Escape')
-        await page.get_by_label('Maximum GPU allocations', exact=True).fill('-1')
-        await page.get_by_label('Maximum GPU allocations', exact=True).press('Tab')
-        await page.get_by_role('button', name='Save GPU policy', exact=True).click()
-        await page.get_by_text('Policy saved; native CloudStack quota verified.', exact=True).wait_for()
-        await page.get_by_role('button', name='Close', exact=True).click()
-        for _ in range(3):
-            await page.set_viewport_size({'width': 1440, 'height': 900})
-            await page.reload()
-            await page.wait_for_function('window.socket?.connected && window.did_handshake')
-            await page.set_viewport_size({'width': 390, 'height': 844})
-            await page.locator('.q-drawer--mobile').wait_for(state='attached')
-            await page.get_by_label('Search agents and domains', exact=True).wait_for(state='hidden')
-        await page.get_by_role('button', name='Open agent hierarchy', exact=True).click()
-        await page.get_by_role('button', name='Settings', exact=True).click()
-        await page.get_by_role('button', name='GPU policies', exact=True).click()
-        await page.get_by_label('GPU policy domain', exact=True).fill('ROOT')
-        await page.get_by_role('option', name='ROOT', exact=True).click()
-        await page.get_by_role('option', name='ROOT', exact=True).wait_for(state='hidden')
-        await page.get_by_text('GRID P40-8Q', exact=True).wait_for()
-        assert await page.get_by_label('Maximum GPU allocations', exact=True).input_value() == '-1'
-        assert await page.get_by_role('checkbox', name='Allow reconfiguration of owned unused GPU pools', exact=True).get_attribute('aria-checked') == 'false'
-        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
-        await page.screenshot(path=str(state / 'gpu-policy-mobile.png'), full_page=True)
+        await page.get_by_label('Max vGPUs (-1 = unlimited)', exact=True).fill('1')
+        await page.get_by_label('Max vGPUs (-1 = unlimited)', exact=True).press('Tab')
+        for width, height in [(1440, 900), (390, 844)]:
+            await page.set_viewport_size({'width': width, 'height': height})
+            assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+            assert await page.locator('.q-dialog .q-card').evaluate('el => el.scrollWidth <= el.clientWidth')
+        await page.screenshot(path=str(state / 'gpu-configure-mobile.png'), full_page=True)
+        await page.get_by_role('button', name='Save', exact=True).click()
+        confirm = page.get_by_text('Widen ancestor GPU policies?', exact=True)
+        await confirm.wait_for()
+        assert await page.get_by_text('Global Admin: allow GRID P40-8Q').count() == 1
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.screenshot(path=str(state / 'gpu-widen-confirm-mobile.png'), full_page=True)
+        await page.get_by_role('button', name='Widen and save', exact=True).click()
+        await confirm.wait_for(state='hidden')
+        store = Store(str(state / 'browser.db'), str(state / 'master'))
+        policies = json.loads(store.one("SELECT value FROM platform_settings WHERE name='fixture_gpu_policies'")['value'])
+        assert policies['main-domain']['max_allocations'] == 1
+        assert policies['main-domain']['profiles'] == ['nvidia-51']
+        assert policies['00000000-0000-0000-0000-000000000001']['profiles'] == ['nvidia-51']
         await browser.close()
 
 
