@@ -571,6 +571,8 @@ async def test_configure_gpu_section_widens_ancestors_on_save_and_has_no_overflo
         assert await page.get_by_role('button', name='GPU policies', exact=True).count() == 0
         await page.keyboard.press('Escape')
         await open_configuration(page)
+        await page.get_by_text('GPUs owned by this agent', exact=True).wait_for()
+        assert await page.get_by_text('Loading GPU settings…').count() == 0
         await page.get_by_text('GPUs owned by this agent', exact=True).scroll_into_view_if_needed()
         await page.get_by_label('Allowed vGPU profiles', exact=True).fill('GRID P40-8Q')
         await page.get_by_role('option', name='GRID P40-8Q', exact=True).click()
