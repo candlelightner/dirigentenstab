@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import shutil
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -251,10 +253,14 @@ async def gpu_socket(controller, tmp_path, monkeypatch):
         values = unpack(format, data)
         return (values[0], 0, values[2]) if format == '3i' else values
     monkeypatch.setattr(gpu.struct, 'unpack', root_peer)
-    path = str(tmp_path / 's')
-    async with await asyncio.start_unix_server(lambda r, w: connection(controller, r, w), path=path,
-                                               limit=65537):
-        yield SimpleNamespace(gpu_helper_socket=path)
+    directory = tempfile.mkdtemp(prefix='ds-gpu-', dir='/tmp')  # tmp_path can exceed the AF_UNIX path limit
+    path = directory + '/s'
+    try:
+        async with await asyncio.start_unix_server(lambda r, w: connection(controller, r, w), path=path,
+                                                   limit=65537):
+            yield SimpleNamespace(gpu_helper_socket=path)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.mark.parametrize('changed', [False, True])
