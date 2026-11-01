@@ -1077,6 +1077,57 @@ async def test_uncertain_action_is_reported_to_agent_without_blocking_inspection
     assert [item['status'] for item in state['mutations'].values()] == ['uncertain', 'complete']
 
 
+@pytest.mark.parametrize('tool,args', [
+    ('execute_api', {'command': 'deployVirtualMachine', 'params': {'name': 'one'}}),
+    ('create_subgroup', {'name': 'sub', 'model': 'm', 'instructions': 'i'}),
+])
+async def test_identical_creation_in_a_later_turn_is_executed_again(service, monkeypatch, tool, args):
+    created = []
+
+    async def create_subgroup(agent_id, name, model, instructions):
+        created.append(name)
+        return {'id': 'new-child'}
+
+    service.create_subgroup = create_subgroup
+    turn = []
+
+    async def model(messages, info):
+        if any(p.part_kind == 'tool-return' for p in messages[-1].parts):
+            yield 'done'
+        else:
+            yield {0: DeltaToolCall(name=tool, json_args=json.dumps(args), tool_call_id=f'call-{len(turn)}')}
+            turn.append(1)
+
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    first = await manager.chat({'userid': 'human'}, 'parent', None, 'Create it')
+    await manager.chat({'userid': 'human'}, 'parent', first['conversation_id'], 'Create it again')
+    assert len(service.executions) + len(created) == 2
+
+
+async def test_completed_mutations_do_not_grow_later_turn_instructions(service, monkeypatch):
+    sizes = []
+
+    async def execute(agent_id, command, params):
+        return {'virtualmachine': {'id': 'vm', 'note': 'x' * 2000}}
+
+    async def model(messages, info):
+        if any(p.part_kind == 'tool-return' for p in messages[-1].parts):
+            yield 'done'
+        else:
+            sizes.append(len(info.instructions))
+            yield {0: DeltaToolCall(name='execute_api', json_args=json.dumps({'command': 'deployVirtualMachine', 'params': {'name': 'one'}}),
+                                    tool_call_id=f'call-{len(sizes)}')}
+
+    service.execute = execute
+    monkeypatch.setattr(runtime, 'build_model', lambda *a: FunctionModel(stream_function=model))
+    manager = runtime.Runtime(service)
+    conversation = None
+    for turn in range(5):
+        conversation = (await manager.chat({'userid': 'human'}, 'parent', conversation, f'Turn {turn}'))['conversation_id']
+    assert len(sizes) == 5 and max(sizes) - min(sizes) < 200
+
+
 async def test_configuration_pauses_resumes_active_only_and_self_prompt_reloads(service, monkeypatch):
     import asyncio
 

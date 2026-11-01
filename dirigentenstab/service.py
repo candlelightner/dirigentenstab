@@ -763,7 +763,7 @@ class Service:
                 await self._bind_private_template(template)
             current = self.store.one('SELECT phase,template_id FROM template_creations WHERE id=?', (operation_id,))
             return {'operation_id': operation_id, **current, 'request': self.redact(self.store.open(template['params']))}
-        raise PermissionError('Managed operation is unavailable to this agent')
+        raise ValueError('No saved managed VM or template operation has this id; recover the deployment_id returned with the original error, not the Reference')
 
     async def execution_identity(self, agent_id, human_id):
         identity = {'_agent_id': agent_id, 'userid': human_id, 'type': 2}

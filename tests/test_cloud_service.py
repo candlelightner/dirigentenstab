@@ -3,6 +3,7 @@ import base64
 import collections
 import json
 import os
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -1743,6 +1744,59 @@ async def test_managed_deploy_rejects_a_name_already_used_in_the_account(store):
     with pytest.raises(ValueError, match='already exists'):
         await service._deploy_managed(await service.agent('parent'), cloud, {'serviceofferingid': OFFER, 'name': 'web-builder'})
     assert cloud.sent is None and store.all('SELECT * FROM vm_deployments') == []
+
+
+async def test_managed_deploy_name_is_reusable_after_rejection_and_by_other_agents(store):
+    add_parent(store)
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model) VALUES(?,?,?,?,?,?,?)',
+                  ('other', 'other', 'od', 'oa', 'ou', store.seal({}), 'm'))
+    service, cloud = _named_deploy_cloud(store)
+    raw, ids = cloud.raw, iter(['vm-1', 'vm-2'])
+
+    async def unique_vm(command, request):
+        result = await raw(command, request)
+        return {'virtualmachine': [{**result['virtualmachine'][0], 'id': next(ids)}]} if command == 'deployVirtualMachine' else result
+
+    cloud.raw = unique_vm
+    params = {'serviceofferingid': OFFER, 'name': 'web-builder'}
+    parent = await service.agent('parent')
+    store.execute("INSERT INTO vm_deployments VALUES('old','parent','web-builder',?,NULL,'rejected',1)", (store.seal({}),))
+    await service._deploy_managed(parent, cloud, params)
+    await service._deploy_managed(await service.agent('other'), cloud, params)
+    assert [r['name'] for r in store.all('SELECT name FROM vm_deployments')] == ['web-builder'] * 3
+
+
+def test_migration_025_drops_deployment_name_uniqueness_and_keeps_rows(tmp_path):
+    master = tmp_path / 'master'
+    master.write_bytes(Fernet.generate_key())
+    path = tmp_path / 'state.db'
+    store = Store(str(path), str(master))
+    store.execute('DROP TABLE vm_deployments')
+    store.execute('CREATE TABLE vm_deployments (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), '
+                  'name TEXT NOT NULL UNIQUE, params BLOB NOT NULL, vm_id TEXT, phase TEXT NOT NULL, updated REAL NOT NULL)')
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model) VALUES(?,?,?,?,?,?,?)',
+                  ('a', 'a', 'd', 'c', 'u', store.seal({}), 'm'))
+    store.execute("INSERT INTO vm_deployments VALUES('one','a','web',x'01','vm','complete',5)")
+    store.execute('PRAGMA user_version=24')
+    reopened = Store(str(path), str(master))
+    reopened.execute("INSERT INTO vm_deployments VALUES('two','a','web',x'02',NULL,'rejected',6)")
+    assert [(r['id'], r['vm_id'], r['phase'], r['updated']) for r in reopened.all('SELECT * FROM vm_deployments ORDER BY id')] == [
+        ('one', 'vm', 'complete', 5), ('two', None, 'rejected', 6)]
+    with pytest.raises(sqlite3.IntegrityError):
+        reopened.execute("INSERT INTO vm_deployments VALUES('three','missing','web',x'03',NULL,'rejected',7)")
+
+
+async def test_recover_operation_with_unknown_id_is_a_configuration_error_naming_deployment_id(store):
+    from dirigentenstab.diagnostics import diagnose
+    add_parent(store)
+    service = Service(store, SimpleNamespace(max_output=65536))
+    store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model) VALUES(?,?,?,?,?,?,?)',
+                  ('other', 'other', 'od', 'oa', 'ou', store.seal({}), 'm'))
+    store.execute("INSERT INTO vm_deployments VALUES('theirs','other','n',x'01',NULL,'rejected',1)")
+    with pytest.raises(ValueError) as caught:
+        await service.recover_operation('parent', 'theirs')
+    error = diagnose(caught.value, agent_id='parent', tool='recover_operation')
+    assert error.category == 'configuration' and 'deployment_id' in str(error) and 'Reference' in str(error)
 
 
 @pytest.mark.parametrize('listing_fails', [False, True])
