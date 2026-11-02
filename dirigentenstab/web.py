@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import os
+from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
@@ -25,12 +26,16 @@ __all__ = ['TerminalSession', 'XtermSSHSession', 'build_ui', 'conversation_activ
            'history_parts', 'main']
 
 
+SIGNET = Path(__file__).parent / 'static' / 'signet.svg'
+
+
 def build_ui(service, auth, runtime=None):
     runtime = runtime or Runtime(service)
     console_proxy = ConsoleProxy(service, auth)
     console_proxy.install(app)
     vm_files = VMFiles(service)
     vm_files.install(app)
+    app.add_static_file(local_file=SIGNET, url_path='/signet.svg')
 
     @app.get('/login', response_class=HTMLResponse)
     async def login_page(request: Request):
@@ -38,13 +43,14 @@ def build_ui(service, auth, runtime=None):
             if request.query_params.get('error') or request.query_params.get('failed') else ''
         return HTMLResponse('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in · Dirigentenstab</title>
+<link rel="icon" href="/signet.svg" type="image/svg+xml">
 <style>body{font:16px system-ui,sans-serif;background:#f5f5f4;color:#292524;margin:0;display:grid;
 min-height:100vh;place-items:center}main{background:white;border:1px solid #e7e5e4;border-radius:12px;
 padding:2rem;max-width:26rem;margin:1rem}h1{font-size:1.8rem;margin-top:0}form,label{display:flex;
 flex-direction:column;gap:.5rem}form{gap:1.2rem}input,button{font:inherit;padding:.8rem;border:1px solid
-#a8a29e;border-radius:6px}button{background:#31595c;color:white;cursor:pointer}small{display:block;
+#a8a29e;border-radius:6px}button{background:#324B3F;color:white;cursor:pointer}small{display:block;
 margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body><main>
-<h1>Dirigentenstab</h1><p>Sign in with your CloudStack account.</p>''' + error + '''
+<h1><img src="/signet.svg" alt="" style="height:1.2em;vertical-align:-.25em;margin-right:.4rem">Dirigentenstab</h1><p>Sign in with your CloudStack account.</p>''' + error + '''
 <form action="/auth/login" method="post">
 <label>Username<input name="username" autocomplete="username" required maxlength="255"></label>
 <label>Password<input name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
@@ -71,7 +77,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             ui.navigate.to('/login')
             return
 
-        ui.colors(primary='#31595c', secondary='#ae7644', accent='#31595c')
+        ui.colors(primary='#324B3F', secondary='#BB7D65', accent='#324B3F')
 
         async def actor(renew=True):
             try:
@@ -122,7 +128,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         with ui.header().classes('bg-white text-stone-800 border-b items-center px-5 py-3 gap-3'):
             ui.button(icon='account_tree', on_click=lambda: ctx.drawer.run_method('toggle')).props(
-                'outline round aria-label="Open agent hierarchy"').classes('text-teal-900').mark('hierarchy_toggle')
+                'outline round aria-label="Open agent hierarchy"').classes('text-primary').mark('hierarchy_toggle')
             with ui.button('Select an agent').props(
                     'flat no-caps icon-right=expand_more aria-label="Agent details" aria-haspopup="menu"').classes(
                         'agent-details-toggle flex-1 min-w-0').mark('agent_details_toggle') as ctx.agent_heading:
@@ -132,7 +138,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ctx.details = ui.column().classes('agent-details w-full gap-3').mark('agent_details')
             ctx.agent_heading.disable()
             if identity.get('type') == 1:
-                ctx.dashboard_link('dashboard-header text-teal-900')
+                ctx.dashboard_link('dashboard-header text-primary')
             ui.label(identity.get('username', 'CloudStack administrator')).classes('text-sm brand-user')
             ctx.escalation_button = ui.button(icon='approval', color=None, on_click=lambda: protect(ctx.open_escalations)).props(
                 'flat round aria-label="Escalation requests: 0 pending"').classes('escalation-requests').mark('escalation_requests')
@@ -177,7 +183,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .q-dialog__inner>.q-card{max-height:calc(var(--viewport-height,100dvh)*.85);overflow-y:auto}
             .q-drawer .q-scrollarea__content{width:100%!important;min-width:0!important}
             .q-tree__node-header{min-height:44px}
-            .q-tree__node-header.q-tree__node--selected{background:#e4ecec;font-weight:600}
+            .q-tree__node-header.q-tree__node--selected{background:#e4e8e6;font-weight:600}
             .q-tree__node-header-content{min-width:0;overflow:hidden;white-space:nowrap}
             .q-tree__node-header-content .q-tree__node-label{overflow:hidden;text-overflow:ellipsis}
             button,.q-btn{min-height:44px}
@@ -263,7 +269,7 @@ def main():
     if os.getenv('APP_TLS_CERT') or os.getenv('APP_TLS_KEY'):
         tls = {'ssl_certfile': os.environ['APP_TLS_CERT'], 'ssl_keyfile': os.environ['APP_TLS_KEY']}
     ui.run(host=os.getenv('APP_HOST', '0.0.0.0'), port=int(os.getenv('APP_PORT', '8088')),
-           title='Dirigentenstab', reload=False, show=False, show_welcome_message=False, **tls)
+           title='Dirigentenstab', favicon=SIGNET, reload=False, show=False, show_welcome_message=False, **tls)
 
 
 if __name__ == '__main__':

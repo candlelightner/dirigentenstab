@@ -229,6 +229,9 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
         login = await user.http_client.get('/login')
         assert login.status_code == 200
         assert 'action="/auth/login"' in login.text and '/_nicegui_ws' not in login.text
+        assert 'href="/signet.svg"' in login.text
+        signet = await user.http_client.get('/signet.svg')
+        assert signet.status_code == 200 and signet.headers['content-type'].startswith('image/svg+xml')
         user.http_client.cookies.set('ds_session', 'session')
         await user.open('/')
         await user.should_see('Select an agent')

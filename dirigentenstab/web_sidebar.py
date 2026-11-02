@@ -148,11 +148,11 @@ def build_sidebar(ctx):
                 ctx.tree.add_slot('default-header', '''<div class="row items-center no-wrap" style="min-width:0" :title="props.node.label">
                     <q-icon :name="props.node.icon" size="sm" class="q-mr-sm" />
                     <span class="ellipsis">{{ props.node.label }}</span>
-                    <q-badge v-if="props.node.attention" rounded color="teal-8" class="q-ml-sm" role="img"
+                    <q-badge v-if="props.node.attention" rounded color="secondary" class="q-ml-sm" role="img"
                     :aria-label="props.node.attention === 'blocked' ? 'Blocked or paused conversation' : 'Unread conversation output'" /></div>''')
             ctx.status = ui.label(str(data.get('status', 'CloudStack connected'))).classes('text-xs text-stone-600')
             if identity.get('type') == 1:
-                ctx.dashboard_link('dashboard-mobile w-full text-teal-900')
+                ctx.dashboard_link('dashboard-mobile w-full text-primary')
             with ui.button('Settings', icon='settings').props('outline aria-haspopup="menu"').classes('w-full').mark('settings_button'):
                 with ui.menu().classes('bg-white p-2 min-w-[200px]').mark('settings_menu') as ctx.settings_menu:
                     with ui.column().classes('gap-1 p-0 w-full'):
