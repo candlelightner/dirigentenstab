@@ -15,6 +15,9 @@ DOMAINS = [{'id': 'root', 'name': 'ROOT', 'path': 'ROOT', 'level': 0},
            {'id': 'sibling', 'name': 'Sibling', 'path': 'ROOT/Unmanaged/Main/Sibling', 'level': 3, 'parentdomainid': 'main'}]
 
 
+UUIDS = ['abcdef00-0000-0000-0000-00000000000%d' % i for i in (1, 2, 3)]
+
+
 def policy(profiles=(), maximum=0, **flags):
     return {'profiles': list(profiles), 'max_allocations': maximum,
             **{flag: flags.get(flag, False) for flag in ('release_on_stop', 'reconfigure_unused', 'subgroup_requests')}}
@@ -41,10 +44,14 @@ def environment(tmp_path, monkeypatch):
         calls.append((action, payload))
         if action == 'status':
             return {'domains': DOMAINS, 'profiles': PROFILES, 'policies': {k: dict(v) for k, v in policies.items()},
-                    'pools': [{'uuid': 'gpu-1', 'domain_id': 'child', 'profile': 'nvidia-51'}],
+                    'pools': [{'uuid': 'gpu-1', 'domain_id': 'child', 'profile': 'nvidia-51'},
+                              {'uuid': UUIDS[0], 'domain_id': 'main', 'profile': 'nvidia-51'},
+                              {'uuid': UUIDS[2], 'domain_id': 'child', 'profile': 'nvidia-51'}],
                     'devices': [{'busaddress': 'gpu-2', 'state': 'Free', 'vgpuprofilename': 'P40'}], 'operations': []}
         if action == 'profiles':
             return PROFILES
+        if action in {'release', 'claim'}:
+            return {action: payload['uuid']}
         policies[payload['domain_id']] = validate_policy(payload['policy'], ['nvidia-51', 'nvidia-53'])
         return {'saved': True}
 
@@ -194,3 +201,39 @@ async def test_grant_for_main_agent_does_not_add_capacity_requests(environment):
                                                run_id='main-run', call_id='main-call')
     plan = await e.service.gpu_grant_plan(e.owner, row['id'])
     assert plan['target']['policy'] == policy(['nvidia-51'], 1)
+
+
+async def devices(e, uuids, call_id='devices'):
+    return await e.service.request_gpu_devices('child', uuids, 'Need the whole GPU', conversation_id='conversation',
+                                               run_id='run', call_id=call_id)
+
+
+async def test_device_request_is_validated_and_canonical(environment):
+    e = environment
+    row = await devices(e, [UUIDS[1].upper(), UUIDS[0], UUIDS[0]])
+    assert row['status'] == 'pending' and row['command'] == 'assignGpuDevices' and row['params'] == {'uuids': UUIDS[:2]}
+    assert row['description'] == 'Assign GPU devices to this agent: ' + ', '.join(UUIDS[:2])
+    for bad in ([], ['not-a-uuid'], [123], UUIDS[0], [str(n) * 36 for n in range(17)]):
+        with pytest.raises((ValueError, AttributeError)):
+            await devices(e, bad, call_id='bad')
+    for forged in ({'uuids': [UUIDS[1], UUIDS[0]]}, {'uuids': [UUIDS[0].upper()]}, {'uuids': UUIDS[:1], 'x': 1}, {'uuids': [UUIDS[0]] * 2}):
+        with pytest.raises(ValueError, match='canonical'):
+            await e.service.request_escalation('child', 'Forged', 'Forged', 'assignGpuDevices', forged,
+                                               conversation_id='conversation', run_id='run', call_id='forged')
+    assert not [c for c in e.calls if c[0] in {'release', 'claim'}]
+
+
+async def test_device_approval_releases_foreign_owner_then_claims_for_the_agent_domain(environment):
+    e = environment
+    row = await devices(e, UUIDS)
+    decided = await e.service.decide_escalation(e.owner, row['id'], True)
+    assert decided['status'] == 'approved' and decided['result'] == {'assigned': UUIDS}
+    assert [(a, p['uuid']) for a, p in e.calls if a in {'release', 'claim'}] == [
+        ('release', UUIDS[0]), ('claim', UUIDS[0]), ('claim', UUIDS[1])]
+    assert all(p['domain_id'] == 'child' for a, p in e.calls if a == 'claim')
+
+
+async def test_device_dismissal_changes_nothing(environment):
+    e = environment
+    decided = await e.service.decide_escalation(e.owner, (await devices(e, UUIDS))['id'], False)
+    assert decided['status'] == 'deferred' and not [c for c in e.calls if c[0] in {'release', 'claim'}]

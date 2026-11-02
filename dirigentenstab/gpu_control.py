@@ -214,20 +214,34 @@ class Controller:
         self.service.store.audit(actor['userid'], 'gpu-policy', request['domain_id'])
         return {'saved': True}
 
-    async def claim(self, request):
-        actor = await self.human(request['session'])
-        self.chain(await self.domains(), request['domain_id'])
-        identifier = str(uuid.UUID(request['uuid']))
+    async def free_device(self, identifier):
         device = (await self.inventory()).get(identifier)
         host = self.host.devices().get(identifier)
         if (not device or not host or device.get('state') != 'Free' or device.get('virtualmachineid')
                 or identifier in await self.host.attachments()):
-            raise PermissionError('Only an actual free, unattached device can be assigned a pool owner')
+            raise PermissionError('Only an actual free, unattached device can change its pool owner')
+        return host
+
+    async def claim(self, request):
+        actor = await self.human(request['session'])
+        self.chain(await self.domains(), request['domain_id'])
+        identifier = str(uuid.UUID(request['uuid']))
+        host = await self.free_device(identifier)
         if identifier in self.journal.owners():
             raise PermissionError('Device already has an owner; implicit ownership reassignment is forbidden')
         self.journal.write('INSERT INTO pools VALUES(?,?,?)', (identifier, request['domain_id'], host['profile']))
         self.service.store.audit(actor['userid'], 'gpu-pool-owner', identifier)
         return {'claimed': identifier}
+
+    async def release(self, request):
+        actor = await self.human(request['session'])
+        identifier = str(uuid.UUID(request['uuid']))
+        if identifier not in self.journal.owners():
+            raise PermissionError('Device has no pool owner to release')
+        await self.free_device(identifier)
+        self.journal.write('DELETE FROM pools WHERE uuid=?', (identifier,))
+        self.service.store.audit(actor['userid'], 'gpu-pool-release', identifier)
+        return {'released': identifier}
 
     async def offering(self, request):
         actor = await self.human(request['session'])
@@ -289,7 +303,7 @@ class Controller:
     async def assert_free(self, identifier, permitted):
         owner = self.journal.owners().get(identifier)
         if not owner or owner['domain_id'] not in permitted:
-            raise PermissionError('GPU device is foreign or has unknown ownership; no device changes are permitted')
+            raise PermissionError(f'GPU device {identifier} is foreign or has unknown ownership; no device changes are permitted')
         device = (await self.inventory()).get(identifier)
         if not device or device.get('state') != 'Free' or device.get('virtualmachineid'):
             raise PermissionError('GPU device is allocated, reserved, or not verified free')
@@ -331,6 +345,10 @@ class Controller:
         if different:
             if not policy['reconfigure_unused']:
                 raise PermissionError('Unused GPU pool reconfiguration is not permitted by every ancestor policy')
+            foreign = [item for item in different if item not in owners or owners[item]['domain_id'] not in permitted]
+            if foreign:
+                raise PermissionError('GPU devices ' + ', '.join(foreign) + ' are foreign or have unknown ownership; no device changes are permitted. '
+                                      'The owner can release them or approve request_gpu_devices.')
             for item in different:
                 await self.assert_free(item, permitted)
                 owner = owners[item]['domain_id']
@@ -590,7 +608,7 @@ class Controller:
         if not isinstance(request, dict) or len(json.dumps(request)) > 65536:
             raise ValueError('Invalid GPU controller request')
         actions = {'status': {'session'}, 'profiles': {'run_id'}, 'set_policy': {'session', 'domain_id', 'policy'},
-                   'claim': {'session', 'domain_id', 'uuid'},
+                   'claim': {'session', 'domain_id', 'uuid'}, 'release': {'session', 'uuid'},
                    'offering': {'session', 'domain_id', 'profile', 'cpus', 'memory', 'root_disk'},
                    'execute': {'session', 'agent_id', 'command', 'params', 'context'}, 'reconcile': {'session', 'operation_id'},
                    'resume': {'session', 'operation_id'}, 'authorize': {'session', 'agent_id', 'command', 'params', 'context'},
@@ -612,6 +630,8 @@ class Controller:
                 return await self.set_policy(request)
             if action == 'claim':
                 return await self.claim(request)
+            if action == 'release':
+                return await self.release(request)
             if action == 'offering':
                 return await self.offering(request)
             if action in {'reconcile', 'resume'}:

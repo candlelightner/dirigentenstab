@@ -657,3 +657,47 @@ async def test_profiles_are_listed_only_to_an_active_agent_run(controller):
     controller.service.store.execute("UPDATE chat_runs SET status='completed' WHERE id='run-child'")
     with pytest.raises(PermissionError, match='active agent run'):
         await controller.dispatch({'action': 'profiles', 'run_id': 'run-child'}, 10001)
+
+
+async def parent_pools(controller, count=2):
+    ids = [f'00000000-0000-0000-0000-00000000020{i}' for i in range(count)]
+    for item in ids:
+        await controller.host.create(item, P8)
+        controller.journal.write('INSERT INTO pools VALUES(?,?,?)', (item, MAIN, P8))
+    await controller.cloud.raw('discoverGpuDevices')
+    return ids
+
+
+def pool_request(action, uuid):
+    return {'action': action, 'session': 'human-session', 'uuid': uuid, **({'domain_id': CHILD} if action == 'claim' else {})}
+
+
+async def test_parent_owned_pools_block_child_24q_until_owner_releases_and_claims(controller):
+    ids = await parent_pools(controller)
+    deploy = request('child-24q', agent='child', serviceofferingid='o24')
+    with pytest.raises(PermissionError) as refused:
+        await controller.dispatch(deploy, 10001)
+    assert all(item in str(refused.value) for item in ids) and 'request_gpu_devices' in str(refused.value)
+    assert not any(call[0] == 'remove' for call in controller.host.calls)
+    for item in ids:
+        assert await controller.dispatch(pool_request('release', item), 10001) == {'released': item}
+        assert item not in controller.journal.owners()
+        await controller.dispatch(pool_request('claim', item), 10001)
+    result = await controller.dispatch(request('child-24q-again', agent='child', serviceofferingid='o24'), 10001)
+    assert result['virtualmachine']['serviceofferingid'] == 'o24'
+    assert [d['profile'] for d in controller.host.items.values()] == [P24]
+
+
+async def test_release_is_refused_for_unowned_attached_or_not_free_devices(controller):
+    first, second = await parent_pools(controller)
+    with pytest.raises(PermissionError, match='no pool owner'):
+        await controller.dispatch(pool_request('release', '00000000-0000-0000-0000-000000000999'), 10001)
+    controller.host.attached.add(first)
+    controller.cloud.devices[second].update(state='Allocated', virtualmachineid='vm-x')
+    for item in (first, second):
+        with pytest.raises(PermissionError, match='free, unattached'):
+            await controller.dispatch(pool_request('release', item), 10001)
+    assert set(controller.journal.owners()) == {first, second}
+    controller.service.store.execute('DELETE FROM sessions')
+    with pytest.raises(PermissionError, match='human platform-administrator'):
+        await controller.dispatch(pool_request('release', first), 10001)

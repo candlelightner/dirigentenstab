@@ -334,7 +334,7 @@ class Service:
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file', 'configure_agent',
                           'list_skills', 'get_skill', 'save_skill', 'share_skill']
-                         + (['request_escalation', 'request_skill_global', 'remove_skill'] + (['request_gpu_profiles'] if getattr(self.settings, 'gpu_helper_socket', '') else [])
+                         + (['request_escalation', 'request_skill_global', 'remove_skill'] + (['request_gpu_profiles', 'request_gpu_devices'] if getattr(self.settings, 'gpu_helper_socket', '') else [])
                             if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
                 'boundaries': 'CloudStack account, domain and role permissions authorize every API request.'}
@@ -491,6 +491,24 @@ class Service:
         if max_allocations is not None:
             description += f' (max {max_allocations})'
         return await self.request_escalation(agent_id, description, reason, 'grantGpuPolicy', params, **context)
+
+    async def request_gpu_devices(self, agent_id, uuids, reason, **context):
+        if not self.settings.gpu_helper_socket:
+            raise PermissionError('The GPU controller is not configured')
+        if not isinstance(uuids, list) or not 1 <= len(uuids) <= 16 or not all(isinstance(u, str) for u in uuids):
+            raise ValueError('Name 1-16 host GPU device UUIDs')
+        params = {'uuids': sorted({str(uuid.UUID(u)) for u in uuids})}
+        return await self.request_escalation(agent_id, 'Assign GPU devices to this agent: ' + ', '.join(params['uuids']),
+                                             reason, 'assignGpuDevices', params, **context)
+
+    async def gpu_assign_devices(self, identity, agent, uuids):
+        owners = {p['uuid']: p['domain_id'] for p in (await self.gpu_admin(identity))['pools']}
+        for item in uuids:
+            if item in owners and owners[item] != agent['domain_id']:
+                await self.gpu_admin(identity, 'release', uuid=item)
+            if owners.get(item) != agent['domain_id']:
+                await self.gpu_admin(identity, 'claim', domain_id=agent['domain_id'], uuid=item)
+        return {'assigned': uuids}
 
     async def gpu_grant_plan(self, identity, request_id):
         """The widening plan that approving this request would apply right now."""
@@ -1213,6 +1231,11 @@ class Service:
                     or not all(isinstance(p, dict) and isinstance(p.get('id'), str) for p in params['profiles'])
                     or params != await self._gpu_grant_params(run_id, [p['id'] for p in params['profiles']], params['max_allocations'])):
                 raise ValueError('Review the exact host vGPU profiles')
+        elif command == 'assignGpuDevices':
+            ids = params.get('uuids') if isinstance(params, dict) and set(params) == {'uuids'} else None
+            if (not isinstance(ids, list) or not 1 <= len(ids) <= 16 or ids != sorted(set(ids))
+                    or not all(isinstance(u, str) and len(u) == 36 and str(uuid.UUID(u)) == u for u in ids)):
+                raise ValueError('Name 1-16 unique sorted canonical host GPU device UUIDs')
         else:
             validate(None, params)
         if len(json.dumps(params)) > (400000 if command in {'shareSkillGlobally', 'removeSkill'} else 65536):
@@ -1274,7 +1297,7 @@ class Service:
         if row['status'] != 'pending':
             return self._escalation_request(row)
         command, params = row['command'], self.store.open(row['params'])
-        if command == 'grantGpuPolicy':
+        if command in {'grantGpuPolicy', 'assignGpuDevices'}:
             if not self.store.execute("UPDATE escalation_requests SET status=?,updated=? WHERE id=? AND status='pending'",
                                       ('applying' if approve else 'deferred', time.time(), request_id)):
                 return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
@@ -1283,7 +1306,8 @@ class Service:
                 try:
                     if not (await self.escalation_access(agent))['enabled']:
                         raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
-                    result = {'applied': await self.gpu_apply_policy(current, await self.gpu_grant_plan(current, request_id))}
+                    result = (await self.gpu_assign_devices(current, agent, params['uuids']) if command == 'assignGpuDevices'
+                              else {'applied': await self.gpu_apply_policy(current, await self.gpu_grant_plan(current, request_id))})
                     status = 'approved'
                 except Exception as exc:
                     status, result = 'failed', {'error': self.redact(str(exc))}

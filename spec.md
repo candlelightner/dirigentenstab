@@ -343,7 +343,8 @@ human platform administrator's Configure dialog for an agent has a GPU section
 (shown only when the GPU controller is configured) that edits the policy of that
 agent's own domain, shows the parent's effective allowance by agent name, lists
 GPUs owned by the agent, assigns free unclaimed GPUs to it (an owned GPU is usable
-by the agent and its parents, not its subagents) and prepares authorized GPU
+by the agent and its parents, not its subagents), releases a free owned GPU back to
+unassigned (explicit release plus claim is the only way ownership moves) and prepares authorized GPU
 offerings. A policy that exceeds an ancestor is saved only after a confirmation that
 lists, per ancestor, exactly what widens (profiles, a maximum raised only as far as
 needed, flags) and which other descendants' explicit policies become more effective;
@@ -356,7 +357,10 @@ are enabled and the GPU controller is configured, `request_gpu_profiles` queues 
 own domain only: host profiles validated against the controller, optional higher
 maximum. The owner's decision view shows the widening plan approval would apply;
 approval recomputes it with the owner's current session and applies it top-down,
-dismissal changes nothing.
+dismissal changes nothing. `request_gpu_devices` likewise queues an `assignGpuDevices`
+request for the requesting agent's own domain (canonical device UUIDs, e.g. from a GPU
+ownership refusal); approval releases the listed free devices from their current owner
+and assigns them to the requester with the owner's current session.
 
 Retaining this feature does not automatically add a GPU-worker image factory,
 guest licensing service, or development-workload orchestration to V1.
