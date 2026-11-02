@@ -269,7 +269,7 @@ def main():
     if os.getenv('APP_TLS_CERT') or os.getenv('APP_TLS_KEY'):
         tls = {'ssl_certfile': os.environ['APP_TLS_CERT'], 'ssl_keyfile': os.environ['APP_TLS_KEY']}
     ui.run(host=os.getenv('APP_HOST', '0.0.0.0'), port=int(os.getenv('APP_PORT', '8088')),
-           title='Dirigentenstab', favicon=SIGNET, reload=False, show=False, show_welcome_message=False, **tls)
+           title='Dirigentenstab', favicon=SIGNET.read_text(), reload=False, show=False, show_welcome_message=False, **tls)
 
 
 if __name__ == '__main__':
