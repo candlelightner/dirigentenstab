@@ -601,9 +601,8 @@ async def test_thinking_controls_serialize_to_the_actual_model_request(service, 
         return httpx.Response(200, json=payload)
 
     provider = {'base_url': url, 'protocol': protocol, 'api_key': service.store.seal('provider-secret')}
-    original_provider = runtime.OpenAIProvider
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        monkeypatch.setattr(runtime.openai, 'DefaultAsyncHttpxClient', lambda **kwargs: client)
         agent = runtime.Agent(runtime.build_model(provider, model, service.store),
                               model_settings=thinking.model_settings(provider, model, level))
         assert (await agent.run('Hello')).output == 'Done'
@@ -743,11 +742,10 @@ async def test_deepseek_reasoning_content_survives_tool_continuation_persistence
             'model': 'deepseek-flash', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}],
             'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}})
 
-    original_provider = runtime.OpenAIProvider
     provider = {'base_url': 'https://api.deepseek.com/v1', 'protocol': 'chat',
                 'api_key': service.store.seal('provider-secret')}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        monkeypatch.setattr(runtime.openai, 'DefaultAsyncHttpxClient', lambda **kwargs: client)
         agent = runtime.Agent(runtime.build_model(provider, 'deepseek-flash', service.store),
                               model_settings=model_settings(provider, 'deepseek-flash', 'high'))
 
@@ -782,11 +780,10 @@ async def test_current_openai_responses_replay_encrypted_reasoning_and_assistant
                  'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Done', 'annotations': []}]}],
             'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}})
 
-    original_provider = runtime.OpenAIProvider
     provider = {'base_url': 'https://api.openai.com/v1', 'protocol': 'responses',
                 'api_key': service.store.seal('provider-secret')}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        monkeypatch.setattr(runtime, 'OpenAIProvider', lambda **kwargs: original_provider(http_client=client, **kwargs))
+        monkeypatch.setattr(runtime.openai, 'DefaultAsyncHttpxClient', lambda **kwargs: client)
         agent = runtime.Agent(runtime.build_model(provider, 'gpt-6.1-sol', service.store),
                               model_settings=model_settings(provider, 'gpt-6.1-sol', 'max'))
         first = await agent.run('First turn')

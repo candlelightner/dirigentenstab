@@ -211,6 +211,15 @@ Each of those is refused for a domain administrator and for every agent identity
 - Model providers and MCP connections are centrally managed, not separately
   recreated for every agent. Keep support for local models and the existing
   compatible provider protocols; do not require a commercial provider.
+- A provider may carry optional extra HTTP headers (root-admin only, under the
+  provider dialog's Advanced settings), stored encrypted and sent on inference
+  and model-catalogue requests to that provider only; redirects are never
+  followed. Values may use `{{conversation_id}}` (the persisted conversation
+  UUID; a fresh id for tests and discovery) and `{{app_version}}`. Names and
+  values are validated, and authentication/transport headers such as
+  `Authorization`, `Host`, `Cookie` and `Content-Length` are rejected. Saved
+  values are never shown again; a blank value keeps the saved one. This is
+  generic client identification, with no provider-specific behavior.
 - Per-agent configuration selects from the central catalog and enables or
   disables access. Parent agents cannot grant external-service access they do
   not themselves have.

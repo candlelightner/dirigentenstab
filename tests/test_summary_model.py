@@ -88,7 +88,12 @@ async def test_runtime_summarizes_title_on_first_message(service, monkeypatch):
         assert 'Custom summary prompt' in str(info.instructions)
         yield 'Summarized Conversation Title'
 
-    monkeypatch.setattr(runtime_module, 'build_model', lambda *args: FunctionModel(stream_function=fake_summary_model))
+    scopes = []
+
+    def build(provider, model_id, store, conversation_id=None):
+        scopes.append(conversation_id)
+        return FunctionModel(stream_function=fake_summary_model)
+    monkeypatch.setattr(runtime_module, 'build_model', build)
 
     runtime = Runtime(service)
     result = await runtime.submit(admin, 'agent', None, 'Long user request that needs a good short title')
@@ -102,6 +107,7 @@ async def test_runtime_summarizes_title_on_first_message(service, monkeypatch):
         await asyncio.sleep(0.05)
 
     assert row['title'] == 'Summarized Conversation Title'
+    assert scopes[-1] == conv_id  # title requests are scoped to their conversation
 
     # Second message on existing conversation does not re-summarize title
     async def failing_summary_model(messages, info):

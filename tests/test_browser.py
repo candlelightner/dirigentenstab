@@ -1966,3 +1966,49 @@ async def test_sidebar_domain_toggle_and_add_agent_entry_point(browser_app, widt
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         assert await dialog.evaluate('el => el.scrollWidth <= el.clientWidth')
         await browser.close()
+
+
+async def test_browser_provider_headers_persist_stay_masked_and_can_be_removed(browser_app):
+    from dirigentenstab.store import Store
+
+    url, state = browser_app
+    store = Store(str(state / 'browser.db'), str(state / 'master'))
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+
+        async def open_provider():
+            await open_sidebar(page)
+            await page.get_by_role('button', name='Settings', exact=True).click()
+            await page.get_by_role('button', name='Model providers', exact=True).click()
+            await page.get_by_label('Provider', exact=True).click()
+            await page.get_by_role('option', name='Local fixture', exact=True).click()
+            await page.get_by_text('Advanced settings', exact=True).click()
+
+        await open_provider()
+        await page.get_by_role('button', name='Add header', exact=True).click()
+        await page.get_by_label('Header name', exact=True).fill('x-session')
+        await page.get_by_label('Header value', exact=True).fill('{{conversation_id}}')
+        await page.get_by_role('button', name='Save', exact=True).first.click()
+        await page.get_by_text('Provider saved.', exact=False).wait_for()
+        assert store.open(store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers']) == {
+            'x-session': '{{conversation_id}}'}
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await open_provider()
+        assert await page.get_by_label('Header name', exact=True).input_value() == 'x-session'
+        value = page.get_by_label('Header value', exact=True)
+        assert await value.input_value() == '' and await value.get_attribute('placeholder') == 'unchanged'
+        await page.get_by_role('button', name='Save', exact=True).first.click()  # blank keeps the saved value
+        await page.get_by_text('Provider saved.', exact=False).wait_for()
+        assert store.open(store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers']) == {
+            'x-session': '{{conversation_id}}'}
+        await page.get_by_role('button', name='Remove header', exact=True).click()
+        await page.get_by_role('button', name='Save', exact=True).first.click()
+        for _ in range(50):
+            if store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers'] is None:
+                break
+            await page.wait_for_timeout(100)
+        assert store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers'] is None
+        await browser.close()
