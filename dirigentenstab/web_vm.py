@@ -106,7 +106,7 @@ def build_vm_view(ctx):
 
 
 def setup_vm(ctx):
-    actor, agents, client, console_proxy, protect, service, state, vm_files = ctx.actor, ctx.agents, ctx.client, ctx.console_proxy, ctx.protect, ctx.service, ctx.state, ctx.vm_files
+    actor, client, console_proxy, protect, service, state, vm_files = ctx.actor, ctx.client, ctx.console_proxy, ctx.protect, ctx.service, ctx.state, ctx.vm_files
 
     active_session = None
     ssh_request = 0
@@ -212,9 +212,12 @@ def setup_vm(ctx):
     ctx.term.on_resize(handle_term_resize)
     ctx.terminal_mode.on_value_change(lambda e: protect(lambda: switch_terminal_mode(e.value)))
 
+    def find_vm(vm_id):
+        return next((v for v in state.get('data', {}).get('vms', []) if v['id'] == vm_id), {})
+
     def vm_name(vm_id):
-        vm_info = next((v for v in state.get('data', {}).get('vms', []) if v['id'] == vm_id), None)
-        return vm_info.get('name') if vm_info else vm_id
+        vm = find_vm(vm_id)
+        return vm.get('displayname') or vm.get('name') or vm_id
 
     console_request = 0
 
@@ -231,7 +234,20 @@ def setup_vm(ctx):
         state['current_vm'] = vm_id
         ctx.set_console_src()
         ctx.agent_heading.set_text(f"VM: {name}")
-        ctx.agent_heading.disable()
+        ctx.agent_heading.enable()
+        ctx.details_menu.close()
+        ctx.details.clear()
+        vm = find_vm(vm_id)
+        owner = next((a for a in state['data'].get('agents', []) if a['id'] == vm.get('owner_agent')), None)
+        with ctx.details:
+            with ui.row().classes('w-full min-w-0 items-center gap-3'):
+                ui.label(name).classes('text-xl font-semibold break-words')
+                ui.space()
+                ui.button(icon='close', on_click=ctx.details_menu.close).props('flat round aria-label="Close VM details"')
+            for key, value in (('Display name', vm.get('displayname')), ('Name', vm.get('name')), ('VM ID', vm_id),
+                               ('Owner agent', owner and agent_label(owner))):
+                if value:
+                    ui.label(f'{key}: {value}').classes('text-sm text-stone-600 break-words')
         ctx.conversation_controls.set_visibility(False)
         ctx.conversation_card.set_visibility(False)
         ctx.terminal_pane.set_visibility(True)
@@ -443,8 +459,5 @@ def setup_vm(ctx):
         ctx.conversation_card.set_visibility(True)
         ctx.sync_url()
         if state.get('agent'):
-            agent = agents.get(state['agent'])
-            if agent:
-                ctx.agent_heading.set_text(agent_label(agent))
-                ctx.agent_heading.enable()
+            await ctx.show_agent(state['agent'])
     ctx.close_terminal_view = close_terminal_view

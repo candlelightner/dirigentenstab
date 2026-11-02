@@ -1149,6 +1149,47 @@ async def test_unknown_main_pane_query_ids_fall_back_to_default_agent():
             await user.should_not_see('Console')
 
 
+async def test_vm_heading_uses_display_name_and_details_list_name_and_id():
+    identity = {'userid': 'owner', 'username': 'owner', 'domainid': 'domain', 'type': 2, 'csrf': 'csrf'}
+    agent = {'id': 'agent', 'name': 'Research', 'domain_id': 'domain', 'account_id': 'account', 'is_main': True}
+    vm = {'id': 'vm-uuid-1', 'name': 'ds-vm-1111', 'displayname': 'build box', 'owner_agent': 'agent'}
+
+    class Auth:
+        async def identity(self, token, renew=True):
+            return identity
+
+    class Service(AgentCapabilities):
+        async def hierarchy(self, current):
+            return {'domains': [{'id': 'domain', 'name': 'Research'}], 'agents': [agent], 'vms': [vm], 'skills': []}
+
+        async def authorize(self, current, agent_id):
+            return agent
+
+        async def providers(self, current):
+            return []
+
+    class Runtime:
+        queued = set()
+        async def conversations(self, current, agent_id):
+            return []
+
+    async with user_simulation() as user:
+        build_ui(Service(), Auth(), Runtime())
+        user.http_client.cookies.set('ds_session', 'session')
+        await user.open('/')
+        heading = next(iter(user.find('agent_details_toggle').elements))
+        user.find('hierarchy').trigger('update:selected', 'vm:vm-uuid-1')
+        await asyncio.sleep(0.3)
+        assert heading.text == 'VM: build box' and heading.enabled
+        details = next(iter(user.find('agent_details').elements))
+        texts = {e.text for e in details.descendants() if isinstance(e, ui.label)}
+        assert {'Name: ds-vm-1111', 'VM ID: vm-uuid-1', 'Display name: build box'} <= texts
+        user.find('hierarchy').trigger('update:selected', 'agent:agent')
+        await asyncio.sleep(0.3)
+        assert heading.text == 'Main Agent'
+        assert 'Domain administrator' in {e.text for e in details.descendants() if isinstance(e, ui.badge)}
+
+
 async def test_outage_on_page_load_shows_retry_state_not_login():
     from dirigentenstab.cloud import CloudError
 
