@@ -1928,7 +1928,9 @@ async def test_browser_unread_and_blocked_markers_in_selector_and_sidebar(browse
         await page.get_by_text('Infrastructure checked. The research VM is running.', exact=True).wait_for()
         await page.get_by_role('button', name='New conversation', exact=True).click()
         selector = page.get_by_label('Conversation', exact=True)
-        badge = page.locator('.q-tree [role=img]:visible')
+        # The ancestor badge is visible even when its Research Admin child is collapsed.
+        badge = page.locator('.q-tree__node-header').filter(
+            has=page.get_by_text('Main Agent', exact=True)).locator('[role=img]:visible')
         markers = page.get_by_role('option', name=conversation_name(title)).locator('[role=img]')
 
         async def open_selector():

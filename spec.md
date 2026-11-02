@@ -165,6 +165,12 @@ account or registration system; roles come solely from CloudStack.
   never-dispatched `prepared` row is older than 30 minutes with no matching VM.
   It only reads CloudStack and never creates, deletes or redeploys anything; an
   agent is never left blocked by such a row waiting for a human.
+- Before refusing a new GPU operation, the controller reconciles saved GPU deployment
+  receipts whose exact managed deployment is already rejected, retaining VM-absence
+  and pending-job checks. Other unresolved receipts remain blockers; a blocked request
+  is rejected before dispatch and identifies the existing receipt, without inventing
+  a receipt for the new call. Agent GPU recovery honors explicit deployment abandonment
+  through the same managed-deployment safety checks.
 - If the outcome remains uncertain, the agent decides whether to investigate
   further, continue where possible, or pause and ask the owner. Do not impose a
   universal manual-review gate merely because an operation was interrupted.

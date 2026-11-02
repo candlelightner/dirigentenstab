@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -111,7 +112,8 @@ class Native:
         if command == 'listServiceOfferings':
             return {'serviceoffering': [o for o in self.offers.values() if o['id'] == params.get('id')]}
         if command == 'listVirtualMachines':
-            return {'virtualmachine': [copy.deepcopy(v) for v in self.vms.values() if v['id'] == params.get('id')]}
+            return {'virtualmachine': [copy.deepcopy(v) for v in self.vms.values()
+                                      if v['id'] == params.get('id') or params.get('name') and v.get('name') == params['name']]}
         if command == 'listAccounts':
             return {'account': [{'id': d + '-account', 'name': d + '-owner', 'domainid': d}
                                  for d in (MAIN, CHILD, OTHER) if d + '-account' == params.get('id')]}
@@ -121,7 +123,7 @@ class Native:
         raise AssertionError(command)
 
     async def catalogue(self):
-        params = [{'name': k, 'type': 'string'} for k in ('id', 'serviceofferingid', 'templateid', 'zoneid')]
+        params = [{'name': k, 'type': 'string'} for k in ('id', 'serviceofferingid', 'templateid', 'zoneid', 'name')]
         return {name: {'params': params} for name in ('deployVirtualMachine', 'startVirtualMachine',
                 'stopVirtualMachine', 'changeServiceForVirtualMachine')}
 
@@ -317,7 +319,7 @@ async def test_uncertain_gpu_dispatch_stays_blocked_across_socket(controller, gp
         await helper_call(gpu_socket, payload.pop('action'), **payload)
     assert error.value.reconciliation
     assert controller.journal.rows('SELECT phase FROM operations')[0]['phase'] == 'reconciliation'
-    with pytest.raises(RuntimeError, match='Another GPU operation requires reconciliation'):
+    with pytest.raises(PermissionError, match='Another GPU operation requires reconciliation'):
         await controller.dispatch(request('do-not-repeat'), 10001)
     assert calls == ['deployVirtualMachine']
 
@@ -701,3 +703,76 @@ async def test_release_is_refused_for_unowned_attached_or_not_free_devices(contr
     controller.service.store.execute('DELETE FROM sessions')
     with pytest.raises(PermissionError, match='human platform-administrator'):
         await controller.dispatch(pool_request('release', first), 10001)
+
+
+async def test_abandoned_failed_gpu_deployment_reconciles_before_corrected_dispatch(controller, gpu_socket, monkeypatch):
+    from types import MethodType
+    from dirigentenstab.gpu import helper_call
+    from dirigentenstab.service import Service
+
+    original = controller.service.execute
+    saved = request('failed-async-deployment', name='failed-gpu')
+    identifier = operation_id(saved['context'])
+
+    async def failed(aid, command, params, **options):
+        controller.service.store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?,?,?)',
+            (identifier, aid, params['name'], controller.service.store.seal(
+                {'request': params, 'result': {'jobid': 'finished-job'}}), None, 'failed', 1))
+        raise CloudError('No destination found', operation_id=identifier)
+
+    monkeypatch.setattr(controller.service, 'execute', failed)
+    with pytest.raises(OperationError):
+        await helper_call(gpu_socket, saved['action'], **{k: v for k, v in saved.items() if k != 'action'})
+    assert controller.journal.rows('SELECT phase FROM operations') == [{'phase': 'reconciliation'}]
+    for name in ('recover_operation', '_close_deployment', '_owned_matches'):
+        monkeypatch.setattr(controller.service, name, MethodType(getattr(Service, name), controller.service), raising=False)
+    raw = controller.cloud.raw
+
+    async def finished_job(command, params=None):
+        if command == 'queryAsyncJobResult':
+            assert params == {'jobid': 'finished-job'}
+            return {'jobstatus': 2}
+        return await raw(command, params)
+
+    monkeypatch.setattr(controller.cloud, 'raw', finished_job)
+    assert (await controller.service.recover_operation(APP_ROOT_AGENT, identifier, abandon=True))['phase'] == 'rejected'
+    before = list(controller.host.calls)
+    monkeypatch.setattr(controller.service, 'execute', original)
+    corrected = request('corrected-after-abandon')
+    result = await helper_call(gpu_socket, corrected['action'], **{k: v for k, v in corrected.items() if k != 'action'})
+    assert result['virtualmachine']['state'] == 'Running'
+    assert controller.journal.rows('SELECT phase FROM operations WHERE id=?', (identifier,)) == [{'phase': 'failed'}]
+    assert len(controller.cloud.vms) == 1 and controller.host.calls == before
+
+
+@pytest.mark.parametrize('blocker', ['pending-job', 'live-vm', 'inspection-error', 'wrong-agent', 'unresolved', 'missing', 'preparing'])
+async def test_gpu_guard_keeps_unproven_receipts_and_rejects_new_call_without_a_receipt(controller, gpu_socket,
+                                                                                     monkeypatch, blocker):
+    from dirigentenstab.gpu import helper_call
+
+    saved = request('existing-blocker', name='old-gpu')
+    identifier = operation_id(saved['context'])
+    controller.journal.write('INSERT INTO operations(id,fingerprint,request,phase,updated) VALUES(?,?,?,?,?)',
+        (identifier, 'saved', json.dumps(saved), 'preparing' if blocker == 'preparing' else 'reconciliation', 1))
+    if blocker not in {'missing', 'preparing'}:
+        controller.service.store.execute('INSERT INTO vm_deployments VALUES(?,?,?,?,?,?,?)',
+            (identifier, 'other' if blocker == 'wrong-agent' else APP_ROOT_AGENT, 'old-gpu',
+             controller.service.store.seal(saved['params']), None,
+             'failed' if blocker == 'unresolved' else 'rejected', 1))
+    if blocker == 'pending-job':
+        controller.cloud.pending = True
+    if blocker == 'live-vm':
+        controller.cloud.vms['live'] = {'id': 'live', 'name': 'old-gpu', 'state': 'Running'}
+    if blocker == 'inspection-error':
+        raw = controller.cloud.raw
+        async def unavailable(command, params=None):
+            if command == 'listVirtualMachines':
+                raise RuntimeError('Inspection unavailable')
+            return await raw(command, params)
+        monkeypatch.setattr(controller.cloud, 'raw', unavailable)
+    payload = request('blocked-new-call')
+    with pytest.raises(PermissionError, match=identifier):
+        await helper_call(gpu_socket, payload['action'], **{k: v for k, v in payload.items() if k != 'action'})
+    assert controller.journal.rows('SELECT id,phase FROM operations') == [
+        {'id': identifier, 'phase': 'preparing' if blocker == 'preparing' else 'reconciliation'}]
+    assert not controller.host.calls
