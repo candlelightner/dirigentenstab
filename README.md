@@ -1,3 +1,5 @@
+<p align="center"><img src="dirigentenstab/static/signet.svg" width="96" alt="Dirigentenstab signet"></p>
+
 # Dirigentenstab
 
 A small, self-hosted hierarchical AI agent manager backed by **Apache CloudStack 4.23.0.0**. MIT licensed. One Python/NiceGUI application, Pydantic AI, SQLite, encrypted credentials, CloudMonkey, and AsyncSSH.
