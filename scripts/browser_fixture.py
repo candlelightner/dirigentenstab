@@ -37,6 +37,7 @@ AGENT_ID = 'research'
 PRIVATE_VALUES = ('fixture-runtime-api-DO-NOT-EXPOSE', 'fixture-runtime-secret-DO-NOT-EXPOSE',
                   'fixture-provision-api-DO-NOT-EXPOSE', 'fixture-provision-secret-DO-NOT-EXPOSE',
                   'fixture-provider-key-DO-NOT-EXPOSE', 'fixture-VM-password-DO-NOT-EXPOSE')
+GPU_POOL = '00000000-0000-0000-0000-0000000000a1'
 DOMAINS = [{'id': ROOT_DOMAIN, 'name': 'ROOT', 'path': 'ROOT', 'level': 0},
            {'id': 'main-domain', 'name': 'Agents--ds-00000000000000000000', 'path': 'ROOT/Agents',
             'parentdomainid': ROOT_DOMAIN, 'level': 1},
@@ -232,10 +233,15 @@ class FixtureService(Service):
             self.store.execute("INSERT INTO platform_settings VALUES('fixture_gpu_policies',?) "
                                'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (json.dumps(policies),))
             return {'saved': True}
+        released = self.store.one("SELECT 1 FROM platform_settings WHERE name='fixture_gpu_released'")
+        if action == 'release':
+            self.store.execute("INSERT OR IGNORE INTO platform_settings VALUES('fixture_gpu_released','1')")
+            return {'released': payload['uuid']}
         if action != 'status':
             raise PermissionError('Fixture GPU operation unavailable')
-        return {'domains': DOMAINS, 'profiles': profiles, 'policies': policies,
-                'pools': [], 'devices': [], 'operations': []}
+        return {'domains': DOMAINS, 'profiles': profiles, 'policies': policies, 'operations': [],
+                'pools': [] if released else [{'uuid': GPU_POOL, 'domain_id': 'main-domain', 'profile': 'nvidia-51'}],
+                'devices': [{'busaddress': GPU_POOL, 'state': 'Free', 'vgpuprofilename': 'GRID P40-8Q'}]}
 
 
 async def fake_model(messages, info):

@@ -515,9 +515,18 @@ def setup_agent_dialogs(ctx):
                         owned_list.clear()
                         with owned_list:
                             for pool in gpu['owned']:
-                                ui.label(f"{gpu['profiles'].get(pool['profile'], pool['profile'])} · {pool['uuid']}").classes('text-sm break-all')
+                                with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                                    ui.label(f"{gpu['profiles'].get(pool['profile'], pool['profile'])} · {pool['uuid']}").classes('text-sm break-all grow')
+                                    ui.button('Release', on_click=lambda _, uuid=pool['uuid']: protect(lambda: release(uuid))).props('flat dense no-caps')
                             if not gpu['owned']:
                                 ui.label('None').classes('text-sm')
+
+                    async def release(uuid):
+                        await service.gpu_admin(await actor(), 'release', uuid=uuid)
+                        gpu.update(await service.gpu_agent_settings(await actor(), agent['id']))
+                        free_device.set_options(gpu['free'], value=None)
+                        render_owned()
+                        ui.notify('GPU released; it is now free and unassigned.', type='positive')
                     render_owned()
 
                     async def claim():

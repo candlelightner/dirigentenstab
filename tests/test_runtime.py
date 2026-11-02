@@ -1652,8 +1652,10 @@ async def test_gpu_profile_request_tool_needs_escalation_and_a_gpu_controller(se
     seen = []
 
     async def model(messages, info):
-        seen.append(('request_gpu_profiles' in {tool.name for tool in info.function_tools}, 'request_gpu_profiles' in info.instructions))
+        names = {tool.name for tool in info.function_tools}
+        seen.append((('request_gpu_profiles' in names, 'request_gpu_profiles' in info.instructions),
+                     ('request_gpu_devices' in names, 'request_gpu_devices' in info.instructions)))
         yield 'Checked'
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'GPU tools')
-    assert seen == [(visible, visible)]
+    assert seen == [((visible, visible), (visible, visible))]

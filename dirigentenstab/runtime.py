@@ -666,7 +666,7 @@ class Runtime:
                           'Use save_skill to create or edit skills, share_skill for selected descendants, '
                           'and request_skill_global for human approval of the exact revision. '
                           'remove_skill queues removal of a skill you can read; removal always requires human approval. '
-                          + ('request_gpu_profiles asks the owner to add vGPU profiles to your policy. ' if gpu_requests else '') +
+                          + ('request_gpu_profiles asks the owner to add vGPU profiles to your policy; request_gpu_devices asks it to assign free GPU devices to your domain. ' if gpu_requests else '') +
                           'For the native installation prefer its Dirigentenstab-small offering when available; '
                           'default shared-storage Small/Medium offerings cannot deploy on local-only primary storage. '
                           'API requests use this account’s native CloudStack permissions. For cloud-init-compatible templates, '
@@ -800,6 +800,17 @@ class Runtime:
                         return {'request_id': row['id'], 'status': row['status']}
                     enqueue.__name__ = 'request_gpu_profiles'
                     return await invoke(enqueue, agent_id, profiles, reason, max_allocations, call_id=ctx.tool_call_id)
+
+                @agent.tool(sequential=True)
+                async def request_gpu_devices(ctx: RunContext, uuids: list[str], reason: str) -> dict:
+                    """Request human approval to assign specific free host GPU devices (UUIDs from a GPU ownership refusal) to your own domain. You cannot change ownership yourself."""
+                    async def enqueue(acting_agent, selected, explanation):
+                        row = await self.service.request_gpu_devices(
+                            acting_agent, selected, explanation, conversation_id=conversation_id,
+                            run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+                        return {'request_id': row['id'], 'status': row['status']}
+                    enqueue.__name__ = 'request_gpu_devices'
+                    return await invoke(enqueue, agent_id, uuids, reason, call_id=ctx.tool_call_id)
 
         @agent.tool_plain(sequential=True)
         async def create_subgroup(name: str, model: str | None = None, instructions: str | None = None,

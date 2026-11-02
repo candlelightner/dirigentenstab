@@ -600,6 +600,22 @@ async def test_configure_gpu_section_widens_ancestors_on_save_and_has_no_overflo
         await browser.close()
 
 
+async def test_configure_gpu_section_releases_a_free_owned_gpu(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        await open_configuration(page)
+        await page.get_by_text('GPUs owned by this agent', exact=True).wait_for()
+        await page.get_by_text('00000000-0000-0000-0000-0000000000a1').first.wait_for()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await page.get_by_role('button', name='Release', exact=True).click()
+        await page.get_by_text('GPU released; it is now free and unassigned.').wait_for()
+        assert await page.get_by_role('button', name='Release', exact=True).count() == 0
+        await browser.close()
+
+
 async def test_browser_agent_system_prompt_and_mcp_settings_persist(browser_app):
     from dirigentenstab.limits import APP_ROOT_AGENT
     from dirigentenstab.store import Store
