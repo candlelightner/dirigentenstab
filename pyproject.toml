@@ -29,7 +29,7 @@ dirigentenstab = "dirigentenstab.web:main"
 include = ["dirigentenstab*"]
 
 [tool.setuptools.package-data]
-dirigentenstab = ["migrations/*.sql"]
+dirigentenstab = ["migrations/*.sql", "static/*.svg"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

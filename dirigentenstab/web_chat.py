@@ -152,7 +152,7 @@ def build_chat_view(ctx):
         # A marked title starts with its glyph and a space; the option slot renders the glyph as a labelled marker.
         glyphs = repr(dict(MARKERS.values()))  # a JS object literal in single quotes, safe inside attributes
         ctx.history_select.add_slot('option', '''<q-item v-bind="props.itemProps"><q-item-section side v-if="%s[props.opt.label[0]]">
-            <span role="img" class="text-teal-8" :aria-label="%s[props.opt.label[0]]">{{ props.opt.label[0] }}</span></q-item-section>
+            <span role="img" class="text-primary" :aria-label="%s[props.opt.label[0]]">{{ props.opt.label[0] }}</span></q-item-section>
             <q-item-section><q-item-label class="ellipsis">{{ %s[props.opt.label[0]] ? props.opt.label.slice(2) : props.opt.label }}
             </q-item-label></q-item-section></q-item>''' % (glyphs, glyphs, glyphs))
         ctx.new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')

@@ -179,7 +179,7 @@ class SessionGuard:
             return await self.app(scope, receive, send)
         request = Request({**scope, 'type': 'http'})
         path = scope['path']
-        public = path in {'/login', '/auth/login', '/healthz'}
+        public = path in {'/login', '/auth/login', '/healthz', '/signet.svg'}
         headers = Headers(scope=scope)
         unsafe = scope['type'] == 'websocket' or scope.get('method') not in {'GET', 'HEAD', 'OPTIONS'}
         if unsafe and headers.get('origin') != self.origin:
