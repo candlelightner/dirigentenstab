@@ -1446,7 +1446,7 @@ async def test_sidebar_hierarchy_selector_and_vm_terminal_pane(browser_app, widt
         # Disconnect invalidates a pending endpoint, including a request for the same VM.
         (state / 'console-delay').touch()
         await terminal_pane.get_by_role('button', name='Reconnect', exact=True).click()
-        await terminal_pane.get_by_text('Opening console: research-vm…', exact=True).wait_for()
+        await terminal_pane.get_by_text('Opening console: Research Worker…', exact=True).wait_for()
         await terminal_pane.get_by_role('button', name='Disconnect', exact=True).click()
         await terminal_pane.get_by_text('Console closed', exact=True).wait_for()
         await playwright.expect(frame).to_have_attribute('src', 'about:blank')
