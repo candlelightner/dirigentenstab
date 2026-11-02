@@ -336,7 +336,7 @@ def main():
         api_port = fake_api(args.state_dir)
         conn.execute('UPDATE providers SET base_url=? WHERE id=?', (f'http://127.0.0.1:{api_port}/v1', 'fixture'))
         for identifier, endpoint in [('unsupported', 'unsupported'), ('empty', 'empty'), ('unauthorized', 'unauthorized')]:
-            conn.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+            conn.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
                           (identifier, identifier.title(), 'chat', f'http://127.0.0.1:{api_port}/{endpoint}',
                            store.seal(''), ''))
         for identifier, domain, name in [(APP_ROOT_AGENT, 'main-domain', 'Agents'),

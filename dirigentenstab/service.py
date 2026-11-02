@@ -15,6 +15,7 @@ from urllib.parse import quote, quote_plus, urlparse
 import httpx
 
 from .cloud import Cloud, CloudError, NAME, error_detail, redact, validate, wait_for_job
+from .headers import validate_headers
 from .settings import endpoint, dashboard_endpoint
 from .diagnostics import OperationError
 from .hierarchy import validate_child
@@ -1552,7 +1553,8 @@ class Service:
             raise ValueError('Provider missing')
         return row
 
-    async def save_provider(self, identity, name, protocol, base_url, key, default_model='', provider_id=None):
+    async def save_provider(self, identity, name, protocol, base_url, key, default_model='', provider_id=None,
+                            headers=_UNSET):
         if identity.get('_agent_id') or identity['type'] != 1:
             raise PermissionError('Provider configuration requires platform administrator')
         if protocol not in {'chat', 'responses'} or not name.strip() or len(name) > 100:
@@ -1560,13 +1562,20 @@ class Service:
         provider_id = provider_id or str(uuid.uuid4())
         base_url = endpoint(base_url)
         self._remember(key)
-        existing = self.store.one('SELECT api_key FROM providers WHERE id=?', (provider_id,))
+        existing = self.store.one('SELECT api_key,extra_headers FROM providers WHERE id=?', (provider_id,))
         encrypted = existing['api_key'] if existing and not key else self.store.seal(key)
+        extra = existing['extra_headers'] if existing else None
+        if headers is not _UNSET:
+            saved = self.store.open(extra) if extra else {}
+            # A blank value keeps the saved secret for that header; the editor never receives it back.
+            merged = validate_headers({name: value.strip() or saved.get(name, '') if isinstance(value, str) else value
+                                       for name, value in (headers or {}).items()})
+            extra = self.store.seal(merged) if merged else None
         async with self.configuration_change([row['id'] for row in self.store.all('SELECT id FROM agents')]):
-            self.store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?) '
+            self.store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model,extra_headers) VALUES(?,?,?,?,?,?,?) '
                                'ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,'
-                               'base_url=excluded.base_url,api_key=excluded.api_key,default_model=excluded.default_model',
-                               (provider_id, name.strip(), protocol, base_url, encrypted, default_model))
+                               'base_url=excluded.base_url,api_key=excluded.api_key,default_model=excluded.default_model,extra_headers=excluded.extra_headers',
+                               (provider_id, name.strip(), protocol, base_url, encrypted, default_model, extra))
         self.store.audit(identity['userid'], 'configure-provider', provider_id)
         return provider_id
 

@@ -10,6 +10,7 @@ import uuid
 from contextvars import ContextVar
 
 import httpx
+import openai
 from pydantic_ai import Agent, RunContext, capture_run_messages
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import (
@@ -32,6 +33,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .guest import Guest
+from .headers import expand_headers
 from .diagnostics import diagnose
 from .platform_status import summary as platform_summary
 from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_operation_id
@@ -81,16 +83,30 @@ def load_history(value, *, close_pending=True):
     return messages
 
 
-def build_model(provider, model_id, store):
+def provider_headers(provider, store, conversation_id=None):
+    """Configured extra headers with templates expanded for this request scope."""
+    saved = provider.get('extra_headers')
+    return expand_headers(store.open(saved) if saved else {}, conversation_id)
+
+
+def build_model(provider, model_id, store, conversation_id=None):
     if not model_id or len(model_id) > 256:
         raise ValueError('Configure a model identifier before starting a conversation')
-    client = OpenAIProvider(base_url=provider['base_url'], api_key=store.open(provider['api_key']) or 'unused')
+    # Never follow redirects: custom headers must not reach another origin.
+    headers = provider_headers(provider, store, conversation_id)
+    sdk = openai.AsyncOpenAI(base_url=provider['base_url'], api_key=store.open(provider['api_key']) or 'unused',
+                             default_headers=headers,
+                             http_client=openai.DefaultAsyncHttpxClient(follow_redirects=False))
+    client = OpenAIProvider(openai_client=sdk)
     model_class = OpenAIResponsesModel if provider['protocol'] == 'responses' else OpenAIChatModel
-    return model_class(model_id, provider=client, profile=thinking.model_profile(provider, model_id))
+    # Pydantic AI sets its own per-request User-Agent, which would beat a default header.
+    ua = next((value for name, value in headers.items() if name.lower() == 'user-agent'), None)
+    return model_class(model_id, provider=client, profile=thinking.model_profile(provider, model_id),
+                       settings={'extra_headers': {'User-Agent': ua}} if ua else None)
 
 
-async def provider_catalogue(provider, store):
-    headers = {}
+async def provider_catalogue(provider, store, conversation_id=None):
+    headers = provider_headers(provider, store, conversation_id)
     if key := store.open(provider['api_key']):
         headers['Authorization'] = 'Bearer ' + key
     async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False) as client:
@@ -108,8 +124,8 @@ async def provider_catalogue(provider, store):
             if isinstance(item, dict) and isinstance(item.get('id'), str) and len(item['id']) <= 256]
 
 
-async def provider_models(provider, store):
-    return [item['id'] for item in await provider_catalogue(provider, store)]
+async def provider_models(provider, store, conversation_id=None):
+    return [item['id'] for item in await provider_catalogue(provider, store, conversation_id)]
 
 
 discover_models = provider_models
@@ -118,8 +134,9 @@ discover_models = provider_models
 async def test_provider(provider, model_id, store):
     result = {'reachable': False, 'authenticated': False, 'model_available': None,
               'tool_calling': False, 'error': None}
+    scope = str(uuid.uuid4())  # one ephemeral session for the whole diagnostic
     try:
-        models = await provider_models(provider, store)
+        models = await provider_models(provider, store, scope)
         result.update(reachable=True, authenticated=True, model_available=model_id in models)
     except httpx.HTTPStatusError as exc:
         result['reachable'] = True
@@ -130,7 +147,7 @@ async def test_provider(provider, model_id, store):
     nonce = secrets.token_hex(16)
     called = False
     try:
-        agent = Agent(build_model(provider, model_id, store), retries=0)
+        agent = Agent(build_model(provider, model_id, store, scope), retries=0)
 
         @agent.tool_plain
         def probe(value: str) -> str:
@@ -247,7 +264,7 @@ class Runtime:
         provider = self.service.store.one('SELECT * FROM providers WHERE id=?', (provider_id,))
         if not provider:
             raise PermissionError('Provider is unavailable')
-        key = (provider_id, provider['base_url'], provider['api_key'], provider['protocol'])
+        key = (provider_id, provider['base_url'], provider['api_key'], provider['protocol'], provider['extra_headers'])
         cached = self.model_cache.get(key)
         if cached and time.monotonic() - cached[0] < 60:
             return provider, cached[1]
@@ -536,7 +553,7 @@ class Runtime:
             if level not in capabilities['options']:
                 raise ValueError('Selected thinking level is unavailable for this model; refresh its thinking settings')
         model_settings = {'max_tokens': 8192, 'timeout': 60, **thinking.model_settings(provider, model_id, level)}
-        model = build_model(provider, model_id, self.service.store)
+        model = build_model(provider, model_id, self.service.store, conversation_id)
         if record.get('auto_compact_percent') is not None or record.get('context_window') is not None:
             limits = await self.context_limits(identity, record['provider_id'], model_id, record.get('context_window'))
             model_settings['max_tokens'] = limits['response_reserve']
@@ -550,7 +567,7 @@ class Runtime:
                 summary_id = ((record.get('compaction_model') or summary_provider['default_model'])
                               if record.get('compaction_provider_id') else model_id)
                 summary_model = (model if summary_provider['id'] == provider['id'] and summary_id == model_id else
-                                 build_model(summary_provider, summary_id, self.service.store))
+                                 build_model(summary_provider, summary_id, self.service.store, conversation_id))
 
             async def context_event(event):
                 state = budget.get('state')
@@ -1008,7 +1025,7 @@ class Runtime:
         try:
             from .service import DEFAULT_SUMMARY_PROMPT
             instructions = settings.get('prompt') or DEFAULT_SUMMARY_PROMPT
-            model = build_model(provider, model_id, self.service.store)
+            model = build_model(provider, model_id, self.service.store, conversation_id)
             agent = Agent(model, retries=0,
                           model_settings={'max_tokens': 120, 'timeout': 30},
                           instructions=instructions)

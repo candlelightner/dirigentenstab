@@ -86,9 +86,10 @@ def test_compaction_migration_retains_original_encrypted_history_and_keys(servic
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=13')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 25
+    assert reopened.one('PRAGMA user_version')['user_version'] == 26
     assert reopened.one('SELECT messages FROM conversations')['messages'] == history
     assert reopened.one('SELECT credentials FROM agents')['credentials'] == original
     assert reopened.one('SELECT auto_compact_percent FROM agents')['auto_compact_percent'] is None
@@ -170,7 +171,10 @@ async def test_runtime_uses_selected_compactor_and_keeps_full_archive_across_tur
         assert not info.function_tools
         return ModelResponse(parts=[TextPart('The original task completed earlier work; retain resource R-123.')])
 
-    def build(provider, model_id, _store):
+    scopes = []
+
+    def build(provider, model_id, _store, conversation_id=None):
+        scopes.append((provider['id'], conversation_id))
         if provider['id'] == 'summary':
             assert model_id == 'cheap-summary'
             return FunctionModel(summarize)
@@ -186,6 +190,7 @@ async def test_runtime_uses_selected_compactor_and_keeps_full_archive_across_tur
     identity = {'userid': 'owner', 'type': 2}
     result = await manager.chat(identity, 'agent', 'conversation', 'Continue the task exactly.', emit)
     assert result['output'] == 'Main response' and len(summaries) == 1
+    assert {('main', 'conversation'), ('summary', 'conversation')} <= set(scopes)  # alternate summary provider too
     assert 'important facts important facts' not in str(observed[0])
     assert 'Continue the task exactly.' in str(observed[0])
     saved = store.open(store.one("SELECT messages FROM conversations WHERE id='conversation'")['messages'])

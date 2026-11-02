@@ -32,7 +32,7 @@ def store(tmp_path):
 
 
 def add_parent(store):
-    store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+    store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
                   ('provider', 'Local', 'chat', 'http://inference/v1', store.seal('provider-secret'), 'default'))
     credentials = {'id': 'old-key', 'apikey': 'parent-api', 'secretkey': 'parent-secret'}
     store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,provider_id,'
@@ -412,7 +412,7 @@ async def test_retry_keeps_inherited_provider_and_model_together_when_parent_con
     cloud = ProvisioningCloud('createDomain')
     with pytest.raises(CloudError):
         await provisioning_service(store, cloud).create_subgroup('parent', 'Research')
-    store.execute('INSERT INTO providers VALUES(?,?,?,?,?,?)',
+    store.execute('INSERT INTO providers(id,name,protocol,base_url,api_key,default_model) VALUES(?,?,?,?,?,?)',
                   ('new-provider', 'New local', 'chat', 'http://other/v1', store.seal('new-key'), 'new-model'))
     store.execute('UPDATE agents SET provider_id=?,model=? WHERE id=?', ('new-provider', 'new-model', 'parent'))
     child = await provisioning_service(store, cloud).create_subgroup('parent', 'Research')
@@ -603,6 +603,7 @@ def test_single_key_migration_preserves_encrypted_legacy_pair_and_interrupted_jo
     store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
     store.execute('DROP TABLE secrets')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=11')
     journal = store.seal({'runtime': original, 'provisioning': {'id': 'pending', 'apikey': 'pending-api', 'secretkey': 'pending-secret'}})
     store.execute('INSERT INTO credential_rotations VALUES(?,?,?,?,?,?)', ('parent', 'pending', journal, journal, 'validating', 1))
@@ -1624,6 +1625,7 @@ def test_migration_replaces_only_exact_old_default_instructions(tmp_path):
     store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
     store.execute('DROP TABLE secrets')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=21')
     old_admin = ('Manage CloudStack globally using your own native root administrator identity. '
                  'Only the human owner assigns work.')
@@ -1777,6 +1779,7 @@ def test_migration_025_drops_deployment_name_uniqueness_and_keeps_rows(tmp_path)
     store.execute('INSERT INTO agents(id,name,domain_id,account_id,user_id,credentials,model) VALUES(?,?,?,?,?,?,?)',
                   ('a', 'a', 'd', 'c', 'u', store.seal({}), 'm'))
     store.execute("INSERT INTO vm_deployments VALUES('one','a','web',x'01','vm','complete',5)")
+    store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=24')
     reopened = Store(str(path), str(master))
     reopened.execute("INSERT INTO vm_deployments VALUES('two','a','web',x'02',NULL,'rejected',6)")

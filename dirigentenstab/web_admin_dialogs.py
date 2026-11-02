@@ -213,6 +213,24 @@ def setup_admin_dialogs(ctx):
             base_url = ui.input('Base URL (including /v1)').classes('w-full')
             key = ui.input('API key (blank keeps existing)', password=True, password_toggle_button=True).classes('w-full')
             model = ui.input('Default model / test model').classes('w-full')
+            header_rows = []
+            with ui.expansion('Advanced settings').classes('w-full'):
+                ui.label('Additional HTTP headers').classes('font-semibold')
+                ui.label('Values may use {{conversation_id}} and {{app_version}}. Saved values stay hidden; '
+                         'leave a value blank to keep it.').classes('text-sm text-stone-600')
+                header_box = ui.column().classes('w-full gap-1')
+
+                def add_header(header_name='', saved=False):
+                    with header_box:
+                        with ui.row().classes('w-full items-center no-wrap gap-2') as row:
+                            header_name = ui.input('Header name', value=header_name).classes('flex-1')
+                            header_value = ui.input('Header value', password=True, password_toggle_button=True,
+                                                    placeholder='unchanged' if saved else '').classes('flex-1')
+                            ui.button(icon='delete', on_click=lambda: (header_rows.remove((header_name, header_value)),
+                                                                       row.delete())).props('flat round aria-label="Remove header"')
+                    header_rows.append((header_name, header_value))
+
+                ui.button('Add header', icon='add', on_click=lambda: add_header()).props('flat')
             test_status = ui.label('').classes('whitespace-pre-wrap text-sm')
             model_options = ui.select([], label='Discovered models',
                                       on_change=lambda e: model.set_value(e.value or '')).classes('w-full')
@@ -227,12 +245,22 @@ def setup_admin_dialogs(ctx):
                 key.set_value('')
                 test_status.set_text('')
                 model_options.set_options([])
+                header_box.clear()
+                header_rows.clear()
+                saved = (await service.get_provider(await actor(), event.value))['extra_headers'] if event.value else None
+                for header in (service.store.open(saved) if saved else {}):
+                    add_header(header, saved=True)
 
             async def save():
                 provider_id = await service.save_provider(await actor(), name.value.strip(), protocol.value,
                                                           base_url.value.strip(), key.value,
-                                                          model.value.strip(), existing.value or None)
+                                                          model.value.strip(), existing.value or None,
+                                                          {n.value.strip(): v.value for n, v in header_rows
+                                                           if n.value.strip() or v.value})
                 key.set_value('')
+                for _, header_value in header_rows:
+                    header_value.set_value('')
+                    header_value.props('placeholder=unchanged')
                 updated = await service.providers(await actor())
                 providers.clear()
                 providers.update({p['id']: p for p in updated})
