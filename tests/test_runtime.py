@@ -1659,3 +1659,86 @@ async def test_gpu_profile_request_tool_needs_escalation_and_a_gpu_controller(se
     monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
     await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'GPU tools')
     assert seen == [((visible, visible), (visible, visible))]
+
+
+@pytest.mark.parametrize(('inspect_first', 'recover_first'), [(False, False), (True, False), (True, True)])
+async def test_gpu_abandon_reaches_managed_recovery_before_helper_with_or_without_inspection(service, monkeypatch,
+                                                                                          inspect_first, recover_first):
+    from dirigentenstab.gpu import GPU_CONTEXT, operation_id
+    from dirigentenstab.cloud import CloudError
+
+    service.settings.gpu_helper_socket = '/fixture-only'
+    context, recovery = {}, []
+
+    async def execute(*args, **kwargs):
+        context.update({k: GPU_CONTEXT.get()[k] for k in ('run_id', 'call_id')})
+        raise CloudError('Failed GPU deployment', operation_id=operation_id(context))
+
+    async def recover_operation(agent_id, saved_operation, abandon=False):
+        assert agent_id == 'parent' and saved_operation == operation_id(context) and abandon is True
+        recovery.append('managed-abandon')
+        if recover_first:
+            raise ValueError('Only an unresolved managed VM deployment can be abandoned')
+        return {'phase': 'rejected'}
+
+    async def helper(settings, action, **payload):
+        assert payload['operation_id'] == operation_id(context)
+        recovery.append(action)
+        assert action != 'recover' or recover_first or recovery[-2] == 'managed-abandon'
+        return {'phase': 'reconciliation' if action == 'result' else 'failed', 'command': 'deployVirtualMachine',
+                'params': {'templateid': 'gpu'}, 'result': {'rejected': True}}
+
+    async def model(messages, info):
+        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+        if count == 0:
+            name, args = 'execute_api', {'command': 'deployVirtualMachine', 'params': {'templateid': 'gpu'}, 'managed': True}
+        elif count == 1 and inspect_first:
+            name, args = 'execution_state', {}
+        elif count == 1 + inspect_first:
+            name, args = 'recover_operation', {'operation_id': operation_id(context), 'abandon': not recover_first}
+        elif count == 2 + inspect_first and recover_first:
+            name, args = 'recover_operation', {'operation_id': operation_id(context), 'abandon': True}
+        else:
+            if recover_first:
+                assert 'Only an unresolved' in messages[-1].parts[0].content['error']
+            yield 'Abandoned failed GPU deployment'
+            return
+        yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=f'gpu-{count}')}
+
+    service.execute, service.recover_operation = execute, recover_operation
+    monkeypatch.setattr(runtime, 'helper_call', helper)
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Abandon failed GPU attempt')
+    assert result['status'] == 'completed'
+    assert recovery == (['result', 'recover', 'managed-abandon'] if recover_first else
+                        ['result', 'managed-abandon', 'recover'] if inspect_first else ['managed-abandon'])
+
+
+async def test_gpu_predispatch_block_is_rejected_without_inspecting_a_phantom_receipt(service, monkeypatch):
+    service.settings.gpu_helper_socket = '/fixture-only'
+
+    async def execute(*args, **kwargs):
+        raise PermissionError('Another GPU operation requires reconciliation before further GPU changes: real-blocker')
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail('A rejected call has no GPU receipt to inspect')
+
+    async def model(messages, info):
+        count = sum(p.part_kind == 'tool-return' for m in messages for p in m.parts)
+        if count == 0:
+            name, args = 'execute_api', {'command': 'deployVirtualMachine', 'params': {}, 'managed': True}
+        elif count == 1:
+            assert 'real-blocker' in messages[-1].parts[0].content['error']
+            name, args = 'execution_state', {}
+        else:
+            action = next(iter(messages[-1].parts[0].content['actions'].values()))
+            assert action['status'] == 'rejected' and 'gpu_operation_id' not in action
+            yield 'Recover the actual blocker'
+            return
+        yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=f'blocked-{count}')}
+
+    service.execute = execute
+    monkeypatch.setattr(runtime, 'helper_call', forbidden)
+    monkeypatch.setattr(runtime, 'build_model', lambda *args: FunctionModel(stream_function=model))
+    result = await runtime.Runtime(service).chat({'userid': 'human'}, 'parent', None, 'Prepare a GPU VM')
+    assert result['status'] == 'completed'

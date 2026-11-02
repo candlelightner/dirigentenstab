@@ -552,9 +552,20 @@ class Controller:
             if op['phase'] in {'dispatching', 'reconciliation'}:
                 return await self.reconcile(op)
         else:
-            unresolved = self.journal.rows("SELECT id FROM operations WHERE phase IN ('preparing','dispatching','reconciliation')")
+            pending = "SELECT * FROM operations WHERE phase IN ('preparing','dispatching','reconciliation')"
+            for op in self.journal.rows(pending):
+                saved = json.loads(op['request'])
+                if (saved['command'] == 'deployVirtualMachine' and self.service.store.one(
+                        "SELECT 1 FROM vm_deployments WHERE id=? AND agent_id=? AND phase='rejected'",
+                        (op['id'], saved['agent_id']))):
+                    try:
+                        await self.reconcile(op)
+                    except Exception:
+                        pass  # Failed inspection leaves this receipt blocking new dispatches.
+            unresolved = self.journal.rows(pending)
             if unresolved:
-                raise RuntimeError('Another GPU operation requires reconciliation before further GPU changes')
+                raise PermissionError('Another GPU operation requires reconciliation before further GPU changes: '
+                                      + ', '.join(op['id'] for op in unresolved))
             self.journal.write('INSERT INTO operations(id,fingerprint,request,phase,result,updated) VALUES(?,?,?,?,NULL,?)',
                                (identifier, fingerprint, json.dumps(request), 'preparing', time.time()))
         previous_local = getattr(self.service, 'gpu_local', False)

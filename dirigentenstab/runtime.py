@@ -887,11 +887,13 @@ class Runtime:
             matching VM is live, never deletes infrastructure and never redeploys."""
             for item in budget.get('state', {}).get('mutations', {}).values():
                 if item.get('gpu_operation_id') == operation_id:
-                    async def recover_gpu(acting_agent, run_id, saved_operation):
+                    async def recover_gpu(acting_agent, run_id, saved_operation, abandon):
+                        if abandon:
+                            await self.service.recover_operation(acting_agent, saved_operation, abandon=True)
                         return await helper_call(self.service.settings, 'recover', session=None,
                                                  run_id=run_id, operation_id=saved_operation,
                                                  active_run_id=budget['operation_id'])
-                    return await invoke(recover_gpu, agent_id, item['run_id'], operation_id)
+                    return await invoke(recover_gpu, agent_id, item['run_id'], operation_id, abandon)
             return await invoke(self.service.recover_operation, agent_id, operation_id, abandon)
 
         @agent.tool_plain(sequential=True)
