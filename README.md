@@ -6,6 +6,16 @@ A small, self-hosted hierarchical AI agent manager backed by **Apache CloudStack
 
 CloudStack owns domains, permissions, quotas, KVM, storage, templates, consoles, snapshots and backups. Dirigentenstab owns independent conversations, autonomous background work and model configuration. Only the owner assigns tasks; the hierarchy defines administrative scope. It does not replace CloudStack's infrastructure management.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/workspace.png" width="720" alt="Workspace with the agent hierarchy and a conversation">
+</p>
+<p align="center">
+  <img src="docs/screenshots/login.png" width="420" alt="Sign-in page">
+  <img src="docs/screenshots/mobile.png" width="200" alt="Conversation on a phone">
+</p>
+
 ## Install
 
 Ubuntu Server 24.04 LTS with hardware KVM, at least 8 GiB available memory and 50 GiB free disk is required for native installation. Review the preflight output before installation on an existing server.
