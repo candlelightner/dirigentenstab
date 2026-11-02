@@ -622,3 +622,5 @@ def setup_chat(ctx):
     ctx.history_select.on_value_change(lambda e: protect(lambda: choose_history(e)))
     ctx.new_button.on_click(lambda: protect(new_conversation))
     ctx.send_button.on_click(lambda: protect(send))
+    for combo in ('ctrl', 'meta'):
+        ctx.prompt.on(f'keydown.{combo}.enter.prevent', lambda: protect(send))
