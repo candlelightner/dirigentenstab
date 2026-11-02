@@ -149,6 +149,8 @@ account or registration system; roles come solely from CloudStack.
 - A new message in an active conversation interrupts that conversation's current
   execution, preserves its progress, and becomes its next instruction. This
   must not interrupt any other conversation.
+  Ctrl+Enter (Cmd+Enter on macOS) in the message field sends, like Send; plain
+  Enter inserts a newline.
 - Keep an explicit Stop control. It stops only the current conversation and
   preserves completed work. It does not stop the agent's other conversations.
 - An already-submitted remote operation may finish after interruption. Preserve

@@ -255,6 +255,25 @@ async def test_browser_secure_login_direct_chat_history_provider_and_logout(brow
         await browser.close()
 
 
+async def test_browser_ctrl_enter_sends_message_and_enter_adds_newline(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await (await browser.new_context(ignore_https_errors=True)).new_page()
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        message = page.get_by_label('Message', exact=True)
+        await message.fill('Inspect the research VM')
+        await message.press('Enter')
+        assert await message.input_value() == 'Inspect the research VM\n'
+        output = page.get_by_text('Infrastructure checked. The research VM is running.', exact=True)
+        assert await output.count() == 0
+        await message.press('Control+Enter')
+        await output.wait_for()
+        assert await message.input_value() == ''
+        await browser.close()
+
+
 async def test_browser_remembers_last_open_conversation_per_agent(browser_app):
     url, state = browser_app
     async with playwright.async_playwright() as p:
