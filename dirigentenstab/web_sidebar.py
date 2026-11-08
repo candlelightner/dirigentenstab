@@ -21,11 +21,11 @@ def hierarchy_nodes(data, mode='Agents', show_aliases=False, show_all_domains=Fa
     global_agents = [a for a in data.get('agents', []) if a.get('is_global')]
     agents = {a['domain_id']: a for a in data.get('agents', []) if not a.get('is_global')}
     resources_by_agent = {}
-    if 'VMs' in selected:
-        for vm in data.get('vms', []):
-            if vm.get('owner_agent'):
-                resources_by_agent.setdefault(vm['owner_agent'], []).append({
-                    'id': 'vm:' + vm['id'], 'label': vm_label(vm), 'icon': 'dns', 'children': []})
+    for vm in data.get('vms', []):
+        kind = 'Workspaces' if vm.get('workspace') else 'VMs'
+        if kind in selected and vm.get('owner_agent'):
+            resources_by_agent.setdefault(vm['owner_agent'], []).append({
+                'id': 'vm:' + vm['id'], 'label': vm_label(vm), 'icon': 'terminal' if vm.get('workspace') else 'dns', 'children': []})
     if 'Skills' in selected:
         for skill in data.get('skills', []):
             resources_by_agent.setdefault(skill['creator_agent_id'], []).append({
@@ -126,7 +126,7 @@ def build_sidebar(ctx):
             f'if (innerWidth < 900) runMethod({ctx.drawer.id}, "hide", [])')
         with ui.column().classes('h-full w-full no-wrap p-3 gap-3'):
             with ui.row().classes('w-full items-center no-wrap'):
-                ctx.sidebar_select = ui.select(['Agents', 'VMs', 'Skills'], multiple=True, value=['Agents']).props(
+                ctx.sidebar_select = ui.select(['Agents', 'VMs', 'Workspaces', 'Skills'], multiple=True, value=['Agents']).props(
                     'dense options-dense').classes('sidebar-view-select text-base font-semibold min-w-[140px] max-w-[180px]').mark('sidebar_view_select')
                 ctx.sidebar_select.disable()
                 ui.space()
@@ -135,7 +135,7 @@ def build_sidebar(ctx):
             ctx.alias_switch = ui.switch('Show aliases', value=False).props('dense').classes(
                 'sidebar-show-aliases text-xs text-stone-600').mark('sidebar_show_aliases')
             ctx.alias_switch.disable()
-            ctx.alias_switch.set_visibility('VMs' in (ctx.sidebar_select.value or []))
+            ctx.alias_switch.set_visibility(bool({'VMs', 'Workspaces'} & set(ctx.sidebar_select.value or [])))
             ctx.domains_switch = ui.switch('Show all domains', value=False).props('dense').classes(
                 'sidebar-show-domains text-xs text-stone-600').mark('sidebar_show_domains')
             ctx.domains_switch.disable()
@@ -175,7 +175,7 @@ def setup_sidebar(ctx):
     actor, agents, identity, protect, service, state = ctx.actor, ctx.agents, ctx.identity, ctx.protect, ctx.service, ctx.state
 
     def update_sidebar_view():
-        has_vms = 'VMs' in (ctx.sidebar_select.value or [])
+        has_vms = bool({'VMs', 'Workspaces'} & set(ctx.sidebar_select.value or []))
         ctx.alias_switch.set_visibility(has_vms)
         ctx.new_skill_button.set_visibility('Skills' in (ctx.sidebar_select.value or []))
         ui.run_javascript(f'try {{ localStorage.setItem({sidebar_key}, '
@@ -199,7 +199,7 @@ def setup_sidebar(ctx):
             updated, mode=ctx.sidebar_select.value, show_aliases=ctx.alias_switch.value,
             show_all_domains=ctx.domains_switch.value
         )
-        if set(ctx.sidebar_select.value or []) & {'VMs', 'Skills'}:
+        if set(ctx.sidebar_select.value or []) & {'VMs', 'Workspaces', 'Skills'}:
             ctx.tree.expand()
         ctx.tree.update()
         ctx.status.set_text(str(updated.get('status', 'CloudStack connected')))
@@ -284,7 +284,7 @@ def setup_sidebar(ctx):
 
     def select_sidebar_view(e):
         nonlocal last_view
-        val = [x for x in (e.value or []) if x in {'Agents', 'VMs', 'Skills'}]
+        val = [x for x in (e.value or []) if x in {'Agents', 'VMs', 'Workspaces', 'Skills'}]
         if not val:
             ctx.sidebar_select.set_value(last_view)
             return
@@ -301,7 +301,7 @@ def setup_sidebar(ctx):
             saved = json.loads(await ui.run_javascript(
                 f'try {{ return localStorage.getItem({sidebar_key}) }} catch (_) {{ return null }}') or '{}')
             raw_view = saved.get('view')
-            view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs', 'Skills'}]
+            view = ([x for x in raw_view if isinstance(x, str) and x in {'Agents', 'VMs', 'Workspaces', 'Skills'}]
                     if isinstance(raw_view, list) else [])
             ctx.alias_switch.set_value(saved.get('aliases') is True)
             ctx.domains_switch.set_value(saved.get('all_domains') is True)

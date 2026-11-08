@@ -321,6 +321,9 @@ current compaction settings.
 - Managed VMs keep the agent-chosen `name` (unique within the account; native CloudStack
   validates it) and fall back to a generated `ds-vm-` name. The sidebar lists only VMs
   CloudStack still returns; stored access rows for destroyed VMs are kept, not deleted.
+- The sidebar view selector separates `VMs` from `Workspaces`: a VM is a workspace when
+  CloudStack tags it `dirigentenstab-workspace` (any value) or its hypervisor is `External`.
+  Workspaces appear only under `Workspaces`, with a terminal icon, and open the same VM view.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.

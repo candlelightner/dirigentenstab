@@ -94,6 +94,11 @@ def first(response, key):
     return value
 
 
+def is_workspace(cs_vm):
+    """A CloudStack VM is an agent workspace when tagged `dirigentenstab-workspace` or run by the External hypervisor."""
+    return cs_vm.get('hypervisor') == 'External' or any(t.get('key') == 'dirigentenstab-workspace' for t in cs_vm.get('tags') or [])
+
+
 class Service:
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
@@ -211,17 +216,19 @@ class Service:
         )
         cs_names = {}
         cs_displays = {}
+        cs_workspaces = set()
         listed = False
         try:
             cs_vms = (await self.human_call(identity, 'listVirtualMachines', {'listall': 'true'})).get('virtualmachine', [])
             cs_names = {vm['id']: vm.get('name') or vm.get('displayname') for vm in cs_vms if 'id' in vm}
             cs_displays = {vm['id']: vm['displayname'] for vm in cs_vms if 'id' in vm and vm.get('displayname')}
+            cs_workspaces = {vm['id'] for vm in cs_vms if 'id' in vm and is_workspace(vm)}
             listed = True
         except Exception:
             pass
         vms = [{'id': row['id'], 'owner_agent': row['owner_agent'],
                 'name': cs_names.get(row['id']) or row['name'],
-                'displayname': cs_displays.get(row['id'])}
+                'displayname': cs_displays.get(row['id']), 'workspace': row['id'] in cs_workspaces}
                for row in managed_vms if row['owner_agent'] in visible_agents and (not listed or row['id'] in cs_names)]
         return {'domains': domains, 'agents': agents, 'pending_provisioning': pending,
                 'users': [{k: user.get(k) for k in ('id', 'username', 'domainid', 'account', 'state', 'accounttype')}
