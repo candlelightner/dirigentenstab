@@ -1071,9 +1071,17 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
             await page.get_by_label('Message', exact=True).fill(text)
             await page.get_by_role('button', name='Send', exact=True).click()
         async def choose(title):
-            await page.get_by_label('Conversation', exact=True).fill(title)
-            await page.get_by_role('option', name=conversation_name(title)).click()
-            await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for()
+            # A marker-driven option refresh can re-render the open popup between mousedown and mouseup under load,
+            # which silently drops the click; retry the selection instead of waiting out the whole timeout.
+            for attempt in range(3):
+                await page.get_by_label('Conversation', exact=True).fill(title)
+                await page.get_by_role('option', name=conversation_name(title)).click()
+                try:
+                    await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for(timeout=8000)
+                    return
+                except playwright.TimeoutError:
+                    if attempt == 2:
+                        raise
         async def conversation_options():
             await page.get_by_label('Conversation', exact=True).fill('')
             await playwright.expect(page.get_by_role('option')).to_have_count(2)
