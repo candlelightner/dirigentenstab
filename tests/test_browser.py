@@ -2093,6 +2093,10 @@ async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revo
         assert (await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)).status == 401
         await page.get_by_role('button', name='Cancel', exact=True).click()
         await page.get_by_label('Conversation', exact=True).fill('MCP')
+        await page.get_by_role('option', name=conversation_name('MCP · laptop')).wait_for(timeout=20000)
+        await page.reload()
+        await playwright.expect(page.get_by_label('Message', exact=True)).to_be_enabled()  # MCP logs are not the default
+        await page.get_by_label('Conversation', exact=True).fill('MCP')
         option = page.get_by_role('option', name=conversation_name('MCP · laptop'))
         await option.wait_for(timeout=20000)  # appears on the next conversation poll
         await option.click()

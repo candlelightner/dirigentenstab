@@ -207,3 +207,21 @@ async def test_already_truncated_tool_result_is_shrunk_not_wrapped_again(e):
     body = json.loads(text)
     assert len(text) <= 4096 and body['truncated'] is True and isinstance(body['preview'], str)
     assert 'truncated' not in body['preview']
+
+
+async def test_mcp_hosts_placeholder_resolves_the_origin_hostname_and_is_empty_otherwise(e, monkeypatch):
+    calls = []
+
+    def resolve(host, port, family, kind):
+        calls.append(family)
+        if family == mcp_export.socket.AF_INET:
+            raise OSError('no ipv4')
+        return [(0, 0, 0, '', ('100.102.176.125', 0))]
+    monkeypatch.setattr(mcp_export.socket, 'getaddrinfo', resolve)
+    assert await e.service.expand_secrets('child', 'H={{mcp_hosts}}') == 'H=100.102.176.125 hub.example'
+    assert len(calls) == 2  # IPv4 preferred, then any family
+    monkeypatch.setattr(mcp_export.socket, 'getaddrinfo', lambda *a: (_ for _ in ()).throw(OSError('NXDOMAIN')))
+    assert await e.service.expand_secrets('child', '[{{mcp_hosts}}]') == '[]'
+    e.service.settings.origin = 'https://100.64.0.1:3001'
+    monkeypatch.setattr(mcp_export.socket, 'getaddrinfo', resolve)
+    assert await e.service.expand_secrets('child', '[{{mcp_hosts}}]') == '[]'
