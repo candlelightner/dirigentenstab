@@ -220,6 +220,9 @@ def test_migration_preserves_existing_agents(environment):
     e.store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     e.store.execute('DROP TABLE escalation_requests')
     e.store.execute('DROP TABLE conversation_seen')
+    e.store.execute('DROP INDEX conversations_mcp_key_agent')
+    e.store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    e.store.execute('DROP TABLE mcp_export_keys')
     e.store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     e.store.execute('PRAGMA user_version=10')
     store = Store(str(e.store.path), str(e.key))
@@ -227,7 +230,7 @@ def test_migration_preserves_existing_agents(environment):
     assert {row['agent_id'] for row in store.all('SELECT agent_id FROM legacy_agent_credentials')} == original.keys()
     assert all(row['credentials'] == old_provisioning for row in store.all('SELECT credentials FROM legacy_agent_credentials'))
     assert store.all('SELECT * FROM mcp_servers') == []
-    assert store.one('PRAGMA user_version')['user_version'] == 26
+    assert store.one('PRAGMA user_version')['user_version'] == 27
     assert all(row['owner_ssh_key_enabled'] == 1 for row in store.all('SELECT * FROM agents'))
 
 

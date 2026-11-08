@@ -170,7 +170,7 @@ async def test_imported_history_is_read_only_and_never_automatically_sent_to_a_m
         ModelResponse(parts=[TextPart('Historical tool output, not a current tool invocation')]),
     ]))
     encrypted = service.store.seal(original)
-    service.store.execute('INSERT INTO conversations VALUES(?,?,?,?,?,?,1)',
+    service.store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages,imported) VALUES(?,?,?,?,?,?,1)',
                           ('legacy', 'parent', 'human', 'Imported history', 1, encrypted))
 
     async def model(messages, info):

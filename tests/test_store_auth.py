@@ -25,7 +25,7 @@ def test_migrations_resume_and_encrypted_records_reject_tampering(store):
     with pytest.raises(InvalidToken):
         store.open(value[:20] + b'broken' + value[25:])
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 26
+    assert reopened.one('PRAGMA user_version')['user_version'] == 27
     assert reopened.one("SELECT name FROM sqlite_master WHERE name='credential_rotations'")
 
 
@@ -49,6 +49,9 @@ def test_permission_column_migration_preserves_agent_keys_and_owned_conversation
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('DROP INDEX conversations_mcp_key_agent')
+    store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    store.execute('DROP TABLE mcp_export_keys')
     store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=9')
     runtime = store.seal({'id': 'runtime-key-id', 'apikey': 'runtime'})
@@ -96,6 +99,9 @@ def test_single_credentials_migration_preserves_agent_settings_and_mcp_assignmen
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('DROP INDEX conversations_mcp_key_agent')
+    store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    store.execute('DROP TABLE mcp_export_keys')
     store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=11')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
@@ -129,6 +135,9 @@ def test_thinking_migration_preserves_credentials_and_conversations_with_model_d
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('DROP INDEX conversations_mcp_key_agent')
+    store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    store.execute('DROP TABLE mcp_export_keys')
     store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=12')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
@@ -307,6 +316,9 @@ def test_escalation_migration_preserves_single_queue_ciphertext_decisions_and_hi
     store.execute('ALTER TABLE agents DROP COLUMN enabled_secrets')
     store.execute('DROP TABLE secrets')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('DROP INDEX conversations_mcp_key_agent')
+    store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    store.execute('DROP TABLE mcp_export_keys')
     store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=17')
     credentials, params = store.seal({'apikey': 'legacy-key'}), store.seal({'name': 'Legacy', 'domainid': 'owned'})

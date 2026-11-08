@@ -2049,3 +2049,34 @@ async def test_browser_provider_headers_persist_stay_masked_and_can_be_removed(b
             await page.wait_for_timeout(100)
         assert store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers'] is None
         await browser.close()
+
+
+async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revocable(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        await open_configuration(page)
+        await page.get_by_text('MCP export', exact=True).click()
+        await page.get_by_label('Key label', exact=True).fill('laptop')
+        await page.get_by_role('button', name='Create key', exact=True).click()
+        snippet = page.locator('.nicegui-code').nth(1)
+        await snippet.wait_for()
+        assert 'claude mcp add --transport http dirigentenstab ' in await snippet.inner_text()
+        token = (await page.locator('.nicegui-code').first.inner_text()).split()[0]
+        assert token.startswith('dsk_') and token in await snippet.inner_text()
+        await page.get_by_label('Harness', exact=True).click()
+        await page.get_by_role('option', name='Codex (~/.codex/config.toml)').click()
+        assert '[mcp_servers.dirigentenstab]' in await snippet.inner_text()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
+        body = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}
+        listed = await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)
+        assert listed.status == 200 and 'execute_api' in await listed.text()
+        await page.get_by_role('button', name='Close', exact=True).click()
+        await page.get_by_text('laptop · created').wait_for()
+        await page.get_by_role('button', name='Revoke', exact=True).click()
+        await page.get_by_text('laptop · created').wait_for(state='detached')
+        assert (await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)).status == 401
+        await browser.close()

@@ -8,6 +8,7 @@ from nicegui import ui
 from .runtime import provider_models, test_provider
 from .diagnostics import diagnose
 from .gpu import describe_plan
+from .web_mcp_export import keys_panel
 
 
 def setup_admin_dialogs(ctx):
@@ -160,6 +161,7 @@ def setup_admin_dialogs(ctx):
                 ui.button('Set secret', on_click=lambda: protect(set_secret)).props('outline').mark('set-secret')
                 ui.button('Delete secret', on_click=lambda: protect(delete_secret), color='negative').props('flat').mark('delete-secret')
             ui.separator()
+            keys_panel(ctx)
             if service.settings.gpu_helper_socket:
                 with ui.expansion('GPU operation recovery', icon='restore').classes('w-full'):
                     operation = ui.select([], label='GPU operation reference').classes('w-full')

@@ -116,7 +116,7 @@ class Guest:
             # The script travels over stdin, so expanded secrets never appear in a process list on either side.
             exports = ''
             for key, value in env.items():
-                exports += f'export {key}={shlex.quote(await self.service.expand_secrets(agent_id, value))}\n'
+                exports += f'export {key}={shlex.quote(await self.service.expand_secrets(agent_id, value, vm_id))}\n'
             _stdin = exports + command
             command = 'sh -c \'eval "$(cat)"\''
         output = {'stdout': bytearray(), 'stderr': bytearray()}
@@ -170,7 +170,7 @@ class Guest:
         if (not isinstance(path, str) or not isinstance(content, str) or not 1 <= len(path) <= 1024 or '\0' in path
                 or not path.startswith(('/', '~/')) or len(content) > MAX_FILE):
             raise ValueError('Path must be absolute or start with ~/ and content must fit the transfer limit')
-        content = await self.service.expand_secrets(agent_id, content)
+        content = await self.service.expand_secrets(agent_id, content, vm_id)
         script = ('umask 077; p=$1; case $p in "~/"*) p=$HOME/${p#"~/"};; esac; '
                   'mkdir -p "$(dirname "$p")" && cat > "$p" && chmod 600 "$p"')
         result = await self.run_vm_command(agent_id, vm_id, f'sh -c {shlex.quote(script)} sh {shlex.quote(path)}', _stdin=content)

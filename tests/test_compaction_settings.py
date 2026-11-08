@@ -86,10 +86,13 @@ def test_compaction_migration_retains_original_encrypted_history_and_keys(servic
     store.execute('ALTER TABLE agents DROP COLUMN escalation_requests_enabled')
     store.execute('DROP TABLE escalation_requests')
     store.execute('DROP TABLE conversation_seen')
+    store.execute('DROP INDEX conversations_mcp_key_agent')
+    store.execute('ALTER TABLE conversations DROP COLUMN mcp_key_id')
+    store.execute('DROP TABLE mcp_export_keys')
     store.execute('ALTER TABLE providers DROP COLUMN extra_headers')
     store.execute('PRAGMA user_version=13')
     reopened = Store(str(store.path), str(store.path.parent / 'master'))
-    assert reopened.one('PRAGMA user_version')['user_version'] == 26
+    assert reopened.one('PRAGMA user_version')['user_version'] == 27
     assert reopened.one('SELECT messages FROM conversations')['messages'] == history
     assert reopened.one('SELECT credentials FROM agents')['credentials'] == original
     assert reopened.one('SELECT auto_compact_percent FROM agents')['auto_compact_percent'] is None

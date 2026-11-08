@@ -40,7 +40,7 @@ def guest(tmp_path):
         def redact(self, result):
             return result
 
-        async def expand_secrets(self, agent_id, text):
+        async def expand_secrets(self, agent_id, text, vm_id=None):
             if '{{secret:' not in text:
                 return text
             if '{{secret:GH_TOKEN}}' not in text:
