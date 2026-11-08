@@ -2074,9 +2074,10 @@ async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revo
         assert 'claude mcp add --transport http dirigentenstab ' in await snippet.inner_text()
         token = (await page.locator('.nicegui-code').first.inner_text()).split()[0]
         assert token.startswith('dsk_') and token in await snippet.inner_text()
+        await page.locator('.q-dialog__inner--animating').wait_for(state='detached')  # not while the dialog still opens
         await page.get_by_label('Harness', exact=True).click()
         await page.get_by_role('option', name='Codex (~/.codex/config.toml)').click()
-        assert '[mcp_servers.dirigentenstab]' in await snippet.inner_text()
+        await playwright.expect(snippet).to_contain_text('[mcp_servers.dirigentenstab]')
         assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
         body = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}
