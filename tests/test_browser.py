@@ -2082,9 +2082,21 @@ async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revo
         body = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}
         listed = await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)
         assert listed.status == 200 and 'execute_api' in await listed.text()
+        recorded = await page.request.post(url + '/mcp', headers=headers, ignore_https_errors=True, data={
+            'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'platform_status', 'arguments': {}}})
+        assert recorded.status == 200
         await page.get_by_role('button', name='Close', exact=True).click()
         await page.get_by_text('laptop · created').wait_for()
         await page.get_by_role('button', name='Revoke', exact=True).click()
         await page.get_by_text('laptop · created').wait_for(state='detached')
         assert (await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)).status == 401
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        await page.get_by_label('Conversation', exact=True).fill('MCP')
+        option = page.get_by_role('option', name=conversation_name('MCP · laptop'))
+        await option.wait_for(timeout=20000)  # appears on the next conversation poll
+        await option.click()
+        message = page.get_by_label('Message', exact=True)
+        await playwright.expect(message).to_be_disabled()
+        await playwright.expect(message).to_have_attribute('placeholder', 'Read-only log of MCP calls')
+        await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_disabled()
         await browser.close()

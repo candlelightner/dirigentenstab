@@ -243,6 +243,13 @@ class Exports:
             store.execute('UPDATE chat_runs SET status=?,updated=? WHERE id=?', (status, time.time(), operation_id))
         text = json.dumps(service.redact(result), ensure_ascii=False, default=str)
         if len(text) > service.settings.max_output:
-            text = json.dumps({'truncated': True, 'preview': text[:service.settings.max_output]})
+            if isinstance(result, dict) and result.get('truncated') and isinstance(result.get('preview'), str):
+                # Already bounded by the tool layer: shrink its preview rather than wrapping it again.
+                preview = result['preview']
+                while len(text) > service.settings.max_output and preview:
+                    preview = preview[:len(preview) // 2]
+                    text = json.dumps(service.redact({**result, 'preview': preview}), ensure_ascii=False, default=str)
+            if len(text) > service.settings.max_output:
+                text = json.dumps({'truncated': True, 'preview': text[:service.settings.max_output]})
         return types.CallToolResult(content=[types.TextContent(type='text', text=text)],
                                     isError=isinstance(result, dict) and bool(result.get('error')))

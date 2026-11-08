@@ -337,6 +337,7 @@ class Runtime:
 
     def _restore(self, conversation):
         return {name: conversation[name] for name in ('id', 'agent_id', 'title', 'imported')} | {
+            'mcp': bool(conversation['mcp_key_id']),
             'messages': self.service.redact(self.service.store.open(conversation['messages'])),
             'runs': [{k: row[k] for k in ('id', 'status', 'tool', 'category')} | {
                 'budget': self._progress(self.service.store.open(row['checkpoint'])) if row['checkpoint'] else None,
@@ -945,6 +946,8 @@ class Runtime:
             conversation = await self.restore(identity, conversation_id)
             if conversation['agent_id'] != agent_id:
                 raise PermissionError('Conversation belongs to a different agent')
+            if conversation['mcp']:
+                raise PermissionError('MCP conversations are read-only logs of external tool calls')
             if conversation['imported']:
                 conversation_id = None
         conversation_id = conversation_id or str(uuid.uuid4())

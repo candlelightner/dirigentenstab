@@ -185,3 +185,25 @@ async def test_mcp_key_placeholder_is_per_agent_vm_reused_redacted_and_regenerat
     restarted = Service(e.store, e.service.settings)
     assert restarted.redact(token) == '[redacted]'
     assert Guest  # run_vm_command and write_vm_secret_file pass vm_id to expand_secrets
+
+
+async def test_mcp_conversation_is_a_read_only_log_and_rejects_sends(e):
+    token = await mcp_export.create_key(e.service, OWNER, 'child', 'laptop')
+    await call(e, token, 'search_api', {'query': 'x'})
+    conversation_id = e.store.one('SELECT id FROM conversations')['id']
+    assert (await e.runtime.restore({'userid': 'owner', 'type': 1}, conversation_id))['mcp'] is True
+    with pytest.raises(PermissionError, match='read-only'):
+        await e.runtime.submit({'userid': 'owner', 'type': 1}, 'child', conversation_id, 'hello')
+    assert e.store.one('SELECT COUNT(*) AS n FROM chat_runs')['n'] == 1
+
+
+async def test_already_truncated_tool_result_is_shrunk_not_wrapped_again(e):
+    token = await mcp_export.create_key(e.service, OWNER, 'child', 'laptop')
+
+    async def search_api(agent_id, query):
+        return {'truncated': True, 'preview': 'x"' * 4000}
+    e.service.search_api = search_api
+    text = (await call(e, token, 'search_api', {'query': 'x'}))['content'][0]['text']
+    body = json.loads(text)
+    assert len(text) <= 4096 and body['truncated'] is True and isinstance(body['preview'], str)
+    assert 'truncated' not in body['preview']
