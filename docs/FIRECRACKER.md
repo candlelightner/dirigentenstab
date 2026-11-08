@@ -1,6 +1,19 @@
 # Firecracker microVMs as a CloudStack extension
 
-Status: spike. Host side works (boot, cloud-init, persistence, tap on the guest bridge). End-to-end through
+## Status: parked
+
+Parked 2026-11-08; the KVM slim-VM path ships instead. All CloudStack registrations and the systemd units were removed;
+only `/opt/dirigentenstab/firecracker` artifacts stay on the host (they speed up a retry).
+
+Blockers (details under Limits): (1) CloudStack 4.23 cannot deploy External templates as registered (needs a CloudStack DB
+edit or a release that fixes it, an owner decision); (2) the Basic-zone security-group iptables drop traffic to unregistered
+taps (needs `security_group.py default_network_rules` per tap on start, or equivalent rules). Unverified risk: the real
+`deployVirtualMachine` payload was never observed, so NIC/userdata/SSH-key (`vmData`) handling is assumed.
+
+Retry: rerun `install.sh`, register an External template once blocker 1 is resolved, add the per-tap `security_group.py`
+calls, capture one real payload, then run the staging end-to-end checks.
+
+Spike result: host side works (boot, cloud-init, persistence, tap on the guest bridge). End-to-end through
 `deployVirtualMachine` is blocked by two CloudStack 4.23 issues, see Limits.
 
 ## How it works
