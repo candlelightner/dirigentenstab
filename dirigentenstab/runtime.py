@@ -690,7 +690,7 @@ class Runtime:
                           'Use managed=True on createTemplate for private-template recovery. '
                           'Use managed=False for unchanged native API parameters, including custom userdata/public templates. '
                           'Use run_vm_command for enrolled guest execution. '
-                          'To let a harness in a VM use your tools, put {{mcp_key}} (token) and {{mcp_url}} in run_vm_command env or write_vm_secret_file content; you never see the token. '
+                          'To let a harness in a VM use your tools, put {{mcp_key}} (token), {{mcp_url}} and {{mcp_hosts}} (an /etc/hosts line for the hub name, when guest DNS cannot resolve it) in run_vm_command env or write_vm_secret_file content; you never see the token. '
                           'After a placement or start failure (No destination found, insufficient capacity, host errors) call platform_status before retrying; if a host is not Up, wait or report instead of retrying. '
                           'After interruption or a lost response, inspect actual infrastructure state before retrying uncertain actions. '
                           'Saved uncertain actions do not prove failure. Investigate, continue safe work where possible, '

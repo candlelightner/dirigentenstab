@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+import ipaddress
 import re
 import secrets
+import socket
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from mcp import types
 from mcp.server.lowlevel import Server
@@ -31,6 +34,22 @@ class Unauthorized(Exception):
 
 def export_url(service):
     return service.settings.origin + '/mcp'
+
+
+def export_hosts(service):
+    """An /etc/hosts line for the hub's name, for guests whose DNS cannot resolve it; empty for IP literals or failures."""
+    host = urlsplit(service.settings.origin).hostname or ''
+    try:
+        ipaddress.ip_address(host)
+        return ''
+    except ValueError:
+        pass
+    for family in (socket.AF_INET, socket.AF_UNSPEC):
+        try:
+            return f'{socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)[0][4][0]} {host}'
+        except OSError:
+            continue
+    return ''
 
 
 def _digest(secret):

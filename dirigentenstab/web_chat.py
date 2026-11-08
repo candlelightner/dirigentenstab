@@ -366,7 +366,10 @@ def setup_chat(ctx):
                                        (f'last_conversation:{identity["userid"]}:{agent_id}',))
         conversation_id = remembered['value'] if remembered else None
         if (not remembered or conversation_id) and conversation_id not in ctx.history_select.options:
-            conversation_id = next(iter(ctx.history_select.options), None)
+            # Prefer the latest conversation a human can continue; MCP logs stay selectable but are not the default.
+            logs = {row['id'] for row in service.store.all(
+                'SELECT id FROM conversations WHERE agent_id=? AND mcp_key_id IS NOT NULL', (agent_id,))}
+            conversation_id = next((key for key in ctx.history_select.options if key not in logs), None)
         if conversation_id:
             generation = history_generation
             restored = await runtime.restore(current, conversation_id)

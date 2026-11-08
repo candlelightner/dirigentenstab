@@ -27,7 +27,7 @@ from . import platform_status
 
 _UNSET = object()
 SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
-MCP_PLACEHOLDER = re.compile(r'\{\{mcp_(key|url)\}\}')
+MCP_PLACEHOLDER = re.compile(r'\{\{mcp_(key|url|hosts)\}\}')
 SECRET_PLACEHOLDER = re.compile(r'\{\{secret:([A-Za-z_][A-Za-z0-9_]{0,63})\}\}')
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
@@ -969,7 +969,7 @@ class Service:
         self.store.audit(identity['userid'], 'delete-secret', name)
 
     async def expand_secrets(self, agent_id, text, vm_id=None):
-        """Replace {{secret:NAME}} with granted values and {{mcp_key}}/{{mcp_url}} with this agent's MCP export access
+        """Replace {{secret:NAME}} with granted values and {{mcp_key}}/{{mcp_url}}/{{mcp_hosts}} with this agent's MCP export access
         for the VM at execution time; unknown or ungranted names fail closed."""
         names = set(SECRET_PLACEHOLDER.findall(text))
         mcp = set(MCP_PLACEHOLDER.findall(text))
@@ -985,9 +985,10 @@ class Service:
                 values[name] = self.store.open(row['value'])
         text = SECRET_PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
         if mcp:
-            from .mcp_export import export_url, vm_key
-            token = vm_key(self, agent_id, vm_id) if 'key' in mcp else ''
-            text = MCP_PLACEHOLDER.sub(lambda m: token if m.group(1) == 'key' else export_url(self), text)
+            from .mcp_export import export_hosts, export_url, vm_key
+            values = {'key': vm_key(self, agent_id, vm_id) if 'key' in mcp else '', 'url': export_url(self),
+                      'hosts': await asyncio.to_thread(export_hosts, self) if 'hosts' in mcp else ''}
+            text = MCP_PLACEHOLDER.sub(lambda m: values[m.group(1)], text)
         return text
 
     async def providers(self, identity):

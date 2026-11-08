@@ -266,11 +266,11 @@ Each of those is refused for a domain administrator and for every agent identity
   CloudStack identity and the durable mutation path (saved execution state,
   redaction, bounded output, uncertain outcomes), and is recorded as a run in a
   per-key, per-agent conversation "MCP · label" in that agent's conversation
-  selector. That conversation is read-only history: it never starts an LLM turn
+  selector. That conversation is read-only history (never the default one opened for an agent): it never starts an LLM turn
   and is never resumed after restart. Escalation, skill and GPU requests made
   over MCP enter the normal owner queue and decision notes appear in that
   conversation; no model turn delivers them, so the harness reads the decision
-  through `execution_state`. `{{mcp_key}}` (and `{{mcp_url}}`, non-secret) work in
+  through `execution_state`. `{{mcp_key}}` (and the non-secret `{{mcp_url}}` and `{{mcp_hosts}}`, an `/etc/hosts` line `<address> <hostname>` the hub resolves at expansion time for guests whose DNS cannot resolve its name; empty for an IP-literal origin or an unresolvable name) work in
   the two named-secret sinks: `{{mcp_key}}` expands to a per-agent key labelled
   `vm:<vm_id>`, minted on first use, sealed so it can be re-expanded, scrubbed
   like secrets and revocable in the UI (the next use mints a new one). The agent
