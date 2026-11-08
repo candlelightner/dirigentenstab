@@ -1071,9 +1071,17 @@ async def test_browser_independent_conversations_interrupt_and_logout(browser_ap
             await page.get_by_label('Message', exact=True).fill(text)
             await page.get_by_role('button', name='Send', exact=True).click()
         async def choose(title):
-            await page.get_by_label('Conversation', exact=True).fill(title)
-            await page.get_by_role('option', name=conversation_name(title)).click()
-            await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for()
+            # A marker-driven option refresh can re-render the open popup between mousedown and mouseup under load,
+            # which silently drops the click; retry the selection instead of waiting out the whole timeout.
+            for attempt in range(3):
+                await page.get_by_label('Conversation', exact=True).fill(title)
+                await page.get_by_role('option', name=conversation_name(title)).click()
+                try:
+                    await page.locator(f'.conversation[data-operation-id="{run(title)["id"]}"]').wait_for(timeout=8000)
+                    return
+                except playwright.TimeoutError:
+                    if attempt == 2:
+                        raise
         async def conversation_options():
             await page.get_by_label('Conversation', exact=True).fill('')
             await playwright.expect(page.get_by_role('option')).to_have_count(2)
@@ -2048,4 +2056,47 @@ async def test_browser_provider_headers_persist_stay_masked_and_can_be_removed(b
                 break
             await page.wait_for_timeout(100)
         assert store.one("SELECT extra_headers FROM providers WHERE id='fixture'")['extra_headers'] is None
+        await browser.close()
+
+
+async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revocable(browser_app):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 390, 'height': 844})
+        await login(page, url)
+        await open_configuration(page)
+        await page.get_by_text('MCP export', exact=True).click()
+        await page.get_by_label('Key label', exact=True).fill('laptop')
+        await page.get_by_role('button', name='Create key', exact=True).click()
+        snippet = page.locator('.nicegui-code').nth(1)
+        await snippet.wait_for()
+        assert 'claude mcp add --transport http dirigentenstab ' in await snippet.inner_text()
+        token = (await page.locator('.nicegui-code').first.inner_text()).split()[0]
+        assert token.startswith('dsk_') and token in await snippet.inner_text()
+        await page.get_by_label('Harness', exact=True).click()
+        await page.get_by_role('option', name='Codex (~/.codex/config.toml)').click()
+        assert '[mcp_servers.dirigentenstab]' in await snippet.inner_text()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream'}
+        body = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}
+        listed = await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)
+        assert listed.status == 200 and 'execute_api' in await listed.text()
+        recorded = await page.request.post(url + '/mcp', headers=headers, ignore_https_errors=True, data={
+            'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'platform_status', 'arguments': {}}})
+        assert recorded.status == 200
+        await page.get_by_role('button', name='Close', exact=True).click()
+        await page.get_by_text('laptop · created').wait_for()
+        await page.get_by_role('button', name='Revoke', exact=True).click()
+        await page.get_by_text('laptop · created').wait_for(state='detached')
+        assert (await page.request.post(url + '/mcp', headers=headers, data=body, ignore_https_errors=True)).status == 401
+        await page.get_by_role('button', name='Cancel', exact=True).click()
+        await page.get_by_label('Conversation', exact=True).fill('MCP')
+        option = page.get_by_role('option', name=conversation_name('MCP · laptop'))
+        await option.wait_for(timeout=20000)  # appears on the next conversation poll
+        await option.click()
+        message = page.get_by_label('Message', exact=True)
+        await playwright.expect(message).to_be_disabled()
+        await playwright.expect(message).to_have_attribute('placeholder', 'Read-only log of MCP calls')
+        await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_disabled()
         await browser.close()

@@ -203,10 +203,13 @@ def setup_chat(ctx):
 
     def sync_composer():
         has_text = bool((ctx.prompt.value or '').strip())
-        show_stop = bool(state['busy']) and not has_text
+        readonly = bool(state.get('readonly'))
+        show_stop = bool(state['busy']) and not has_text and not readonly
         ctx.stop_button.set_visibility(show_stop)
         ctx.send_button.set_visibility(not show_stop)
-        ctx.send_button.set_enabled(has_text and not state['submitting'])
+        ctx.send_button.set_enabled(has_text and not state['submitting'] and not readonly)
+        ctx.prompt.set_enabled(not readonly)
+        ctx.prompt.props(f'placeholder="{"Read-only log of MCP calls" if readonly else "Give this agent a task"}"')
 
     ctx.prompt.on_value_change(lambda _: sync_composer())
     sync_composer()
@@ -414,6 +417,7 @@ def setup_chat(ctx):
             remember_conversation(restored['id'])
         state['conversation'] = restored['id']
         state['imported'] = bool(restored.get('imported'))
+        state['readonly'] = bool(restored.get('mcp'))
         state['active_operation'] = None
         state['busy'] = False
         state['indicator'] = 'Thinking…'
@@ -539,7 +543,7 @@ def setup_chat(ctx):
         state['drafts'][(state['agent'], state['conversation'])] = ctx.prompt.value or ''
         ctx.prompt.set_value(state['drafts'].get((state['agent'], None), '') if state['conversation'] else '')
         state.update(conversation=None, active_operation=None, busy=False, imported=False,
-                     activity_token=None)
+                     readonly=False, activity_token=None)
         sync_composer()
         reset_run_details()
         ctx.sync_run_details()

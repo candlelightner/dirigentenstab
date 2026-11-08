@@ -5,6 +5,7 @@ from .diagnostics import diagnose
 from .gpu import FLAG_LABELS, FLAGS, describe_plan
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from .web_sidebar import agent_label
+from .web_mcp_export import keys_panel
 
 
 def setup_agent_dialogs(ctx):
@@ -628,6 +629,7 @@ def setup_agent_dialogs(ctx):
                 ctx.details.clear()
                 await ctx.refresh()
 
+            keys_panel(ctx, agent['id'])
             ui.separator()
             ui.label('CloudStack credential access').classes('font-semibold')
             ui.label('Rotation replaces the API key pair. Revocation disables this agent.').classes(

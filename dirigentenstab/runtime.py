@@ -28,6 +28,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage, UsageLimits
@@ -336,6 +337,7 @@ class Runtime:
 
     def _restore(self, conversation):
         return {name: conversation[name] for name in ('id', 'agent_id', 'title', 'imported')} | {
+            'mcp': bool(conversation['mcp_key_id']),
             'messages': self.service.redact(self.service.store.open(conversation['messages'])),
             'runs': [{k: row[k] for k in ('id', 'status', 'tool', 'category')} | {
                 'budget': self._progress(self.service.store.open(row['checkpoint'])) if row['checkpoint'] else None,
@@ -537,8 +539,8 @@ class Runtime:
                          (service.store.seal(state), operation_id))
         service.store.audit(identity['userid'], 'reconcile-execution', operation_id)
 
-    async def _agent(self, identity, agent_id, budget, emit, *, conversation_id=None):
-        record = await self.service.authorize(identity, agent_id)
+    async def _model(self, identity, record, budget, emit, conversation_id):
+        agent_id = record['id']
         allowed = await self.service.providers(identity)
         provider = (self.service.store.one('SELECT * FROM providers WHERE id=?', (record['provider_id'],))
                     if any(row['id'] == record['provider_id'] for row in allowed) else None)
@@ -582,15 +584,26 @@ class Runtime:
                                     summary_model=summary_model, context_window=limits['context_window'],
                                     threshold_percent=record.get('auto_compact_percent'),
                                     response_reserve=limits['response_reserve'], on_event=context_event)
+        return model, model_settings, context, instructions
+
+    async def _agent(self, identity, agent_id, budget, emit, *, conversation_id=None, export=False):
+        """Build the per-run agent. export=True builds only its built-in tools for the MCP export (no model)."""
+        record = await self.service.authorize(identity, agent_id)
+        if export:
+            model, model_settings, context, instructions = TestModel(), {}, None, ''
+        else:
+            model, model_settings, context, instructions = await self._model(identity, record, budget, emit, conversation_id)
+
         async def check_dispatch(messages):
             if budget.get('operation_id') in self.config_changed:
                 self.config_changed.discard(budget['operation_id'])
                 raise ConfigurationChanged()
             await self._gate(agent_id).wait()
             await self.service.authorize(identity, agent_id)
-            allowed = await self.service.providers(identity)
-            if not any(row['id'] == record['provider_id'] for row in allowed):
-                raise PermissionError('Provider is unavailable')
+            if not export:
+                allowed = await self.service.providers(identity)
+                if not any(row['id'] == record['provider_id'] for row in allowed):
+                    raise PermissionError('Provider is unavailable')
             return messages
 
         async def invoke(operation, *args, call_id=None, **kwargs):
@@ -657,7 +670,7 @@ class Runtime:
         gpu_requests = bool(getattr(self.service.settings, 'gpu_helper_socket', '')) and (await self.service.escalation_access(record))['enabled']
         agent = Agent(
             model,
-            instructions=(instructions + '\nTool rules. Reuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
+            instructions=None if export else (instructions + '\nTool rules. Reuse completed tool results and discovered API metadata. Do not repeat completed mutations. '
                           'List-valued CloudMonkey parameters must be comma-separated strings, never JSON arrays. '
                           'Prefer exact available_api_names instead of repeated searches for known commands. '
                           'Discovery is informational: an absent API name does not prove a permission denial. '
@@ -677,6 +690,7 @@ class Runtime:
                           'Use managed=True on createTemplate for private-template recovery. '
                           'Use managed=False for unchanged native API parameters, including custom userdata/public templates. '
                           'Use run_vm_command for enrolled guest execution. '
+                          'To let a harness in a VM use your tools, put {{mcp_key}} (token) and {{mcp_url}} in run_vm_command env or write_vm_secret_file content; you never see the token. '
                           'After a placement or start failure (No destination found, insufficient capacity, host errors) call platform_status before retrying; if a host is not Up, wait or report instead of retrying. '
                           'After interruption or a lost response, inspect actual infrastructure state before retrying uncertain actions. '
                           'Saved uncertain actions do not prove failure. Investigate, continue safe work where possible, '
@@ -692,8 +706,8 @@ class Runtime:
                           + '\nSaved execution state: ' + json.dumps(budget.get('state', {}).get('mutations', {}))
                           + '\nExecution recovery: ' + json.dumps(budget.get('state', {}).get('recovery'))),
             retries=1, model_settings=model_settings, capabilities=[ProcessHistory(check_dispatch)],
-            toolsets=[RemoteTools(self.service, identity, agent_id, binding, invoke)
-                      for binding in await MCP(self.service).bindings(identity, agent_id)],
+            toolsets=[] if export else [RemoteTools(self.service, identity, agent_id, binding, invoke)
+                                        for binding in await MCP(self.service).bindings(identity, agent_id)],
         )
 
         @agent.tool_plain
@@ -869,7 +883,13 @@ class Runtime:
                                                                agent_id=agent_id, tool='execution_state'))}
             if state:
                 budget['save']()
-            return self.service.redact({'actions': state.get('mutations', {}), 'tool_activity': budget.get('events', [])})
+            result = {'actions': state.get('mutations', {}), 'tool_activity': budget.get('events', [])}
+            if export:  # No model turn delivers decisions to an external harness; it reads them here.
+                result['escalation_requests'] = [
+                    {key: row[key] for key in ('id', 'command', 'description', 'status', 'result', 'created', 'updated')}
+                    for row in (self.service._escalation_request(r) for r in self.service.store.all(
+                        'SELECT * FROM escalation_requests WHERE agent_id=? ORDER BY created DESC LIMIT 20', (agent_id,)))]
+            return self.service.redact(result)
 
         @agent.tool_plain(sequential=True)
         async def platform_status() -> dict:
@@ -908,12 +928,13 @@ class Runtime:
             """
             return await invoke(self.service.configure_agent, agent_id, target_agent_id, settings)
 
-        @agent.tool_plain(sequential=True)
-        async def pause_work(reason: str) -> str:
-            """Pause this conversation when blocked and explain what the owner must supply."""
-            budget['state'].update(reason='agent_paused', pause_reason=self.service.redact(reason), resumable=True)
-            budget['save']()
-            raise AgentPaused()
+        if not export:
+            @agent.tool_plain(sequential=True)
+            async def pause_work(reason: str) -> str:
+                """Pause this conversation when blocked and explain what the owner must supply."""
+                budget['state'].update(reason='agent_paused', pause_reason=self.service.redact(reason), resumable=True)
+                budget['save']()
+                raise AgentPaused()
 
         return agent
 
@@ -925,6 +946,8 @@ class Runtime:
             conversation = await self.restore(identity, conversation_id)
             if conversation['agent_id'] != agent_id:
                 raise PermissionError('Conversation belongs to a different agent')
+            if conversation['mcp']:
+                raise PermissionError('MCP conversations are read-only logs of external tool calls')
             if conversation['imported']:
                 conversation_id = None
         conversation_id = conversation_id or str(uuid.uuid4())
@@ -958,7 +981,8 @@ class Runtime:
     async def deliver_escalation_decisions(self):
         """Deliver each accepted command outcome once the originating conversation is idle."""
         for request in self.service.store.all(
-                "SELECT * FROM escalation_requests WHERE status IN ('approved','failed','uncertain') AND delivery_run_id IS NULL"):
+                "SELECT * FROM escalation_requests WHERE status IN ('approved','failed','uncertain') AND delivery_run_id IS NULL "
+                "AND conversation_id NOT IN (SELECT id FROM conversations WHERE mcp_key_id IS NOT NULL)"):
             conversation_id = request['conversation_id']
             async with self.locks.setdefault(conversation_id, asyncio.Lock()):
                 if conversation_id in self.running:
@@ -1059,6 +1083,24 @@ class Runtime:
         accepted = await self.submit(identity, agent_id, conversation_id, prompt, on_event)
         return await asyncio.shield(self.active[accepted['operation_id']])
 
+    def _call_event(self, name, call_id, arguments):
+        args = self.service.redact(arguments)
+        target = next((str(args[k])[:80] for k in ('command', 'name', 'vm_id', 'agent_id') if args.get(k)), '')
+        return {'type': 'tool_call', 'name': name, 'call_id': call_id, 'target': target, 'content': args}
+
+    def _result_event(self, name, call_id, target, result, duration, retry=False):
+        content = self.service.redact(result)
+        count = len(content) if isinstance(content, list) else next(
+            (len(v) for v in content.values() if isinstance(v, list)), None) if isinstance(content, dict) else None
+        summary = (f'{count} results' if count is not None else
+                   'Operation failed' if isinstance(content, dict) and bool(content.get('error')) else 'Finished')
+        return {'type': 'tool_result', 'name': name, 'call_id': call_id, 'target': target, 'summary': summary,
+                'duration': round(duration, 2),
+                'failed': retry or isinstance(content, dict) and bool(content.get('error')),
+                'content': str(content)[:16384] if not isinstance(content, dict)
+                else content if len(json.dumps(content, default=str)) <= 16384
+                else {'summary': str(content)[:16384], 'truncated': True}}
+
     async def _execute(self, run, on_event=None):
         operation_id, agent_id, conversation_id = run['id'], run['agent_id'], run['conversation_id']
         context_token = CURRENT_RUN.set(operation_id)
@@ -1127,27 +1169,14 @@ class Runtime:
                 elif isinstance(event, FunctionToolCallEvent):
                     partial_text = ''
                     started[event.part.tool_call_id] = time.monotonic()
-                    args = self.service.redact(event.part.args_as_dict())
-                    targets[event.part.tool_call_id] = next((str(args[k])[:80] for k in
-                                                            ('command', 'name', 'vm_id', 'agent_id') if args.get(k)), '')
-                    await emit({'type': 'tool_call', 'name': event.part.tool_name,
-                                'call_id': event.part.tool_call_id, 'target': targets[event.part.tool_call_id],
-                                'content': args})
+                    call = self._call_event(event.part.tool_name, event.part.tool_call_id, event.part.args_as_dict())
+                    targets[event.part.tool_call_id] = call['target']
+                    await emit(call)
                 elif isinstance(event, FunctionToolResultEvent) and event.part is not None:
-                    content = self.service.redact(event.part.content)
-                    count = len(content) if isinstance(content, list) else next(
-                        (len(v) for v in content.values() if isinstance(v, list)), None) if isinstance(content, dict) else None
-                    summary = (f'{count} results' if count is not None else
-                               'Operation failed' if isinstance(content, dict) and bool(content.get('error')) else 'Finished')
-                    await emit({'type': 'tool_result', 'name': event.part.tool_name,
-                                'call_id': event.part.tool_call_id, 'target': targets.get(event.part.tool_call_id, ''),
-                                'summary': summary,
-                                'duration': round(time.monotonic() - started.get(event.part.tool_call_id,
-                                                                               time.monotonic()), 2),
-                                'failed': event.part.part_kind == 'retry-prompt' or isinstance(content, dict) and bool(content.get('error')),
-                                'content': str(content)[:16384] if not isinstance(content, dict)
-                                else content if len(json.dumps(content, default=str)) <= 16384
-                                else {'summary': str(content)[:16384], 'truncated': True}})
+                    await emit(self._result_event(
+                        event.part.tool_name, event.part.tool_call_id, targets.get(event.part.tool_call_id, ''),
+                        event.part.content, time.monotonic() - started.get(event.part.tool_call_id, time.monotonic()),
+                        retry=event.part.part_kind == 'retry-prompt'))
 
         budget['save'] = checkpoint
         status = 'failed'

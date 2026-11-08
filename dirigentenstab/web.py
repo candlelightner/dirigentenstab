@@ -11,6 +11,7 @@ from .auth import transient
 from .cloud import CloudError
 from .console import ConsoleProxy
 from .diagnostics import diagnose
+from .mcp_export import Exports
 from .files import VMFiles, use_spool_dir
 from .platform_status import banner
 from .runtime import Runtime
@@ -35,6 +36,7 @@ def build_ui(service, auth, runtime=None):
     console_proxy.install(app)
     vm_files = VMFiles(service)
     vm_files.install(app)
+    Exports(service, runtime).install(app)
     app.add_static_file(local_file=SIGNET, url_path='/signet.svg')
 
     @app.get('/login', response_class=HTMLResponse)

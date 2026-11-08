@@ -27,6 +27,7 @@ from . import platform_status
 
 _UNSET = object()
 SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
+MCP_PLACEHOLDER = re.compile(r'\{\{mcp_(key|url)\}\}')
 SECRET_PLACEHOLDER = re.compile(r'\{\{secret:([A-Za-z_][A-Za-z0-9_]{0,63})\}\}')
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
@@ -126,6 +127,8 @@ class Service:
                 self._remember('Bearer ' + token)
         for row in store.all('SELECT value FROM secrets'):
             self._remember_secret(store.open(row['value']))
+        for row in store.all('SELECT sealed FROM mcp_export_keys WHERE sealed IS NOT NULL'):
+            self._remember_secret(store.open(row['sealed']))
 
     def _remember_secret(self, value):
         """Scrub a named secret and its base64 and URL-encoded forms from everything shown to models."""
@@ -965,19 +968,27 @@ class Service:
                                (json.dumps([n for n in json.loads(row['enabled_secrets']) if n != name]), row['id']))
         self.store.audit(identity['userid'], 'delete-secret', name)
 
-    async def expand_secrets(self, agent_id, text):
-        """Replace {{secret:NAME}} with granted values at execution time; unknown or ungranted names fail closed."""
+    async def expand_secrets(self, agent_id, text, vm_id=None):
+        """Replace {{secret:NAME}} with granted values and {{mcp_key}}/{{mcp_url}} with this agent's MCP export access
+        for the VM at execution time; unknown or ungranted names fail closed."""
         names = set(SECRET_PLACEHOLDER.findall(text))
-        if not names:
+        mcp = set(MCP_PLACEHOLDER.findall(text))
+        if not names and not mcp:
             return text
-        granted = await self.effective_secrets(await self.agent(agent_id))
         values = {}
-        for name in names:
-            row = self.store.one('SELECT value FROM secrets WHERE name=?', (name,)) if name in granted else None
-            if not row:
-                raise PermissionError(f'Secret {name} is unknown or not granted to this agent')
-            values[name] = self.store.open(row['value'])
-        return SECRET_PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+        if names:
+            granted = await self.effective_secrets(await self.agent(agent_id))
+            for name in names:
+                row = self.store.one('SELECT value FROM secrets WHERE name=?', (name,)) if name in granted else None
+                if not row:
+                    raise PermissionError(f'Secret {name} is unknown or not granted to this agent')
+                values[name] = self.store.open(row['value'])
+        text = SECRET_PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+        if mcp:
+            from .mcp_export import export_url, vm_key
+            token = vm_key(self, agent_id, vm_id) if 'key' in mcp else ''
+            text = MCP_PLACEHOLDER.sub(lambda m: token if m.group(1) == 'key' else export_url(self), text)
+        return text
 
     async def providers(self, identity):
         if identity['type'] not in {1, 2}:

@@ -179,6 +179,8 @@ class SessionGuard:
             return await self.app(scope, receive, send)
         request = Request({**scope, 'type': 'http'})
         path = scope['path']
+        if scope['type'] == 'http' and (path == '/mcp' or path.startswith('/mcp/')):
+            return await self.app(scope, receive, send)  # Bearer-only MCP export: no cookies, no browser Origin
         public = path in {'/login', '/auth/login', '/healthz', '/signet.svg'}
         headers = Headers(scope=scope)
         unsafe = scope['type'] == 'websocket' or scope.get('method') not in {'GET', 'HEAD', 'OPTIONS'}

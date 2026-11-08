@@ -250,6 +250,31 @@ Each of those is refused for a domain administrator and for every agent identity
   URL-encoded forms. This guards against accidental leaks, not hostile agents:
   an agent with a shell on the VM can read the value. Rotation UI, external
   vaults, per-secret ACLs and audit dashboards are out of scope.
+- MCP export lets the human owner use a hub agent's own built-in tools from
+  external harnesses (Claude Code, Codex, Gemini CLI, opencode) through one
+  Streamable HTTP endpoint, `{PUBLIC_ORIGIN}/mcp`. It exposes the same tools, with
+  the same enablement, as the agent's hub runs, except `pause_work` and imported
+  remote MCP tools, and no "chat with the agent" tool. Keys only bind an
+  identity; no new permission system exists. The endpoint bypasses browser
+  sessions and cookies and accepts only `Authorization: Bearer dsk_...`; unknown
+  or revoked keys get 401 and revocation is immediate. A per-agent key (created
+  in **Configure → MCP export** by a human who may operate that agent) acts as
+  that agent, or at `/mcp/<agent_id>` as one of its descendants; a global key
+  (Platform settings, root administrator) acts as Global Admin, or at
+  `/mcp/<agent_id>` as any agent. Tokens are shown once; only a SHA-256 hash is
+  stored. Agents cannot list or create keys. Each call uses the agent's own
+  CloudStack identity and the durable mutation path (saved execution state,
+  redaction, bounded output, uncertain outcomes), and is recorded as a run in a
+  per-key, per-agent conversation "MCP · label" in that agent's conversation
+  selector. That conversation is read-only history: it never starts an LLM turn
+  and is never resumed after restart. Escalation, skill and GPU requests made
+  over MCP enter the normal owner queue and decision notes appear in that
+  conversation; no model turn delivers them, so the harness reads the decision
+  through `execution_state`. `{{mcp_key}}` (and `{{mcp_url}}`, non-secret) work in
+  the two named-secret sinks: `{{mcp_key}}` expands to a per-agent key labelled
+  `vm:<vm_id>`, minted on first use, sealed so it can be re-expanded, scrubbed
+  like secrets and revocable in the UI (the next use mints a new one). The agent
+  never sees the token, and the key grants only that agent's own tools.
 - These small inherited provider/MCP rules belong to the hub because CloudStack
   does not manage external model and tool access. They are not a second system
   for infrastructure permissions.
