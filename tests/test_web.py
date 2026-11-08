@@ -1255,3 +1255,25 @@ def test_sidebar_without_any_agent_shows_nothing_until_toggled():
     data = {**_foreign_domains_data(), 'agents': []}
     assert hierarchy_nodes(data) == []
     assert hierarchy_nodes(data, show_all_domains=True)
+
+
+def test_workspaces_listed_separately_from_vms():
+    data = {
+        'domains': [{'id': 'd', 'name': 'D', 'level': 0}],
+        'agents': [{'id': 'a', 'domain_id': 'd', 'name': 'a'}],
+        'vms': [{'id': 'vm', 'name': 'plain', 'owner_agent': 'a'},
+                {'id': 'ws', 'name': 'box', 'displayname': 'Box', 'owner_agent': 'a', 'workspace': True}],
+    }
+    def kids(mode, **kw):
+        return [(c['id'], c['label'], c['icon']) for c in hierarchy_nodes(data, mode=mode, **kw)[0]['children']]
+    assert kids(['VMs']) == [('vm:vm', 'plain', 'dns')]
+    assert kids(['Workspaces'], show_aliases=True) == [('vm:ws', 'Box', 'terminal')]
+    assert kids(['VMs', 'Workspaces']) == [('vm:vm', 'plain', 'dns'), ('vm:ws', 'box', 'terminal')]
+    assert kids(['Agents']) == []
+
+
+def test_is_workspace_rule():
+    from dirigentenstab.service import is_workspace
+    assert is_workspace({'tags': [{'key': 'dirigentenstab-workspace', 'value': 'codex'}]})
+    assert is_workspace({'hypervisor': 'External'})
+    assert not is_workspace({'hypervisor': 'KVM', 'tags': [{'key': 'other', 'value': 'x'}]})
