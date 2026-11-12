@@ -13,6 +13,7 @@ import httpx
 import openai
 from pydantic_ai import Agent, RunContext, capture_run_messages
 from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -1070,6 +1071,8 @@ class Runtime:
                 try:
                     async with agent.run_stream(prompt, usage_limits=UsageLimits(request_limit=1, tool_calls_limit=0)) as result:
                         raw_output = await result.get_output()
+                except (ModelHTTPError, TimeoutError):
+                    raise
                 except Exception:
                     run_result = await agent.run(prompt, usage_limits=UsageLimits(request_limit=1, tool_calls_limit=0))
                     raw_output = run_result.output
