@@ -174,3 +174,27 @@ async def test_install_skill_is_idempotent_and_updates_outdated_text(svc):
     assert len(svc.store.all('SELECT id FROM skills')) == 1
     with pytest.raises(PermissionError):
         await svc.install_agent_shell_skill({'userid': 'x', 'type': 2})
+
+
+async def test_ensure_treats_concurrent_creation_as_success(svc):
+    agent = await svc.agent(AGENT)
+
+    class Racing(FakeConn):
+        async def run(self, command, input=None, check=True):
+            out = await super().run(command, input, check)
+            if 'docker run' in command:
+                out.returncode, out.stderr = 125, 'name already in use'
+                self.existing = 'true key1'
+            return out
+
+    conn = Racing()
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    with pytest.raises(RuntimeError, match='Could not create'):
+        class Wrong(Racing):
+            async def run(self, command, input=None, check=True):
+                out = await FakeConn.run(self, command, input, check)
+                if 'docker run' in command:
+                    out.returncode, out.stderr = 125, 'boom'
+                    self.existing = 'true otherkey'
+                return out
+        await svc.ensure_agent_shell(Wrong(), agent, 'key1', 'u', 't')

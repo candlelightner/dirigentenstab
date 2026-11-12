@@ -9,6 +9,7 @@ import re
 import shlex
 import time
 import uuid
+from types import SimpleNamespace
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from urllib.parse import quote, quote_plus, urlparse
@@ -1636,7 +1637,8 @@ class Service:
             if (await docker(kind, 'inspect', ref)).returncode:
                 raise RuntimeError('Agent shell host is not set up: run the agent-shell-host skill')
         name, env_file = 'ws-' + agent['id'], f"{SHELL_ENV_DIR}/{agent['id']}.env"
-        found = await docker('inspect', '-f', '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}}', name)
+        inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}}'
+        found = await docker('inspect', '-f', inspect_format, name)
         state = found.stdout.split() if not found.returncode else None
         if state and state[1:] == [key_id]:  # a revoked or replaced key falls through to recreation
             if state[0] != 'true' and (started := await docker('start', name)).returncode:
@@ -1652,6 +1654,13 @@ class Service:
             'run', '-d', '--name', name, '--hostname', slug, '--restart', 'unless-stopped', '--network', SHELL_NETWORK,
             '--label', 'dirigentenstab.key=' + key_id, '--env-file', env_file, '-v', f"ws-home-{agent['id']}:/home/dev",
             *(['--add-host', f'{host}:{address}'] if host else []), SHELL_IMAGE)
+        if created.returncode and not written.returncode:  # a concurrent open may have created it first
+            again = await docker('inspect', '-f', inspect_format, name)
+            state = again.stdout.split() if not again.returncode else None
+            if state and state[1:] == [key_id]:
+                created = SimpleNamespace(returncode=0, stderr='')
+                if state[0] != 'true':
+                    created = await docker('start', name)
         if created.returncode:
             raise RuntimeError('Could not create the agent shell: ' + (created.stderr or '').strip()[:200])
 
