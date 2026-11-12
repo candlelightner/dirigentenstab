@@ -261,7 +261,8 @@ Each of those is refused for a domain administrator and for every agent identity
   in **Configure → MCP export** by a human who may operate that agent) acts as
   that agent, or at `/mcp/<agent_id>` as one of its descendants; a global key
   (Platform settings, root administrator) acts as Global Admin, or at
-  `/mcp/<agent_id>` as any agent. Tokens are shown once; only a SHA-256 hash is
+  `/mcp/<agent_id>` as any agent. Agent-shell containers use a sealed per-agent `shell` key
+  (see Agent shells). Tokens are shown once; only a SHA-256 hash is
   stored. Agents cannot list or create keys. Each call uses the agent's own
   CloudStack identity and the durable mutation path (saved execution state,
   redaction, bounded output, uncertain outcomes), and is recorded as a run in a
@@ -349,6 +350,29 @@ current compaction settings.
 - The sidebar view selector separates `VMs` from `Workspaces`: a VM is a workspace when
   CloudStack tags it `dirigentenstab-workspace` (any value) or its hypervisor is `External`.
   Workspaces appear only under `Workspaces`, with a terminal icon, and open the same VM view.
+- Agent shells give every agent a per-agent terminal, switched with a **Chat | Terminal** toggle in
+  the agent view (`?agent=<id>&view=terminal` restores it). The toggle appears only when an
+  agent shell host resolves. The host is a managed VM whose `vm_access.owner_agent` is Global
+  Admin or the root Main Agent (a lower agent must not be able to redirect other agents' keys
+  into a VM it controls). It is designated by **Platform settings → Agent shell host**
+  (root administrator), or, when that is Off, by CloudStack tagging exactly one such VM
+  `dirigentenstab-agent-shell-host` (any value); several qualifying tagged VMs are an error until the
+  setting picks one. Eligibility and ownership are re-checked on every open. When no host
+  resolves, Platform settings offers **Set up with <Main Agent>**: with the owner's click the
+  hub saves or updates the shipped `agent-shell-host` skill on the root Main Agent and starts a new
+  conversation asking it to prepare the host (Docker, image, isolated network, firewall, tag).
+  Opening the terminal needs only the normal right to operate the agent: the hub connects with the
+  host's managed key and runs fixed `sudo -n docker` commands (never a host shell for the human):
+  it ensures container `ws-<agent id>` from image `dirigentenstab-shell:latest` on the
+  `dirigentenstab-shells` network (no docker socket, host mounts, privileges or capabilities;
+  home on volume `ws-home-<agent id>`), and execs `bash -l` as user `dev`. The container's
+  environment file (root-only, written over SSH stdin) carries a per-agent export key labelled `shell`
+  (minted on first use, revocable like other keys; after revocation the next open mints a new key
+  and recreates the container) and the MCP URL, which a login script registers with Claude Code,
+  Codex and opencode by variable reference. Missing image or network is reported, never created.
+  Harness logins are per agent (shared logins are future work). On touch or narrow screens a key
+  bar (Esc, Tab, latching Ctrl and Alt, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
+  are applied by the server to the next typed character.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.

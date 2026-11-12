@@ -1,0 +1,1 @@
+../../dirigentenstab/skills/agent-shell-host.md

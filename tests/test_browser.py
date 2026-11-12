@@ -2116,3 +2116,83 @@ async def test_browser_agent_mcp_export_key_is_shown_once_with_snippets_and_revo
         await playwright.expect(page.get_by_role('button', name='Send', exact=True)).to_be_disabled()
         await browser.close()
 
+
+
+async def open_platform_settings(page):
+    await open_sidebar(page)
+    await page.get_by_role('button', name='Settings', exact=True).click()
+    await page.get_by_role('button', name='Platform settings', exact=True).click()
+
+
+async def choose_shell_host(page):
+    await open_platform_settings(page)
+    await page.get_by_label('Agent shell host', exact=True).click()
+    await page.get_by_role('option', name='agent-shell-host', exact=True).click()
+    await page.get_by_role('button', name='Save', exact=True).click()
+    await page.get_by_role('dialog').wait_for(state='hidden')
+    close = page.get_by_role('button', name='Close agent hierarchy', exact=True)
+    if await close.is_visible():
+        await close.click()
+
+
+async def test_agent_shell_setup_button_only_without_host_and_starts_conversation(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await playwright.expect(page.get_by_label('Agent view', exact=True)).to_be_hidden()
+        await open_platform_settings(page)
+        button = page.get_by_role('button', name='Set up with Main Agent', exact=True)
+        await button.click()
+        await page.get_by_text(re.compile(r'set up the agent shell host .* agent-shell-host skill')).first.wait_for()
+        await page.get_by_role('button', name='Agent details', exact=True).get_by_text('Main Agent', exact=True).wait_for()
+        await choose_shell_host(page)
+        await open_platform_settings(page)
+        await playwright.expect(button).to_be_hidden()
+        await browser.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_agent_shell_toggle_switches_chat_and_terminal_with_key_bar(browser_app, width, height):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        await login(page, url)
+        view = page.get_by_label('Agent view', exact=True)
+        await playwright.expect(view).to_be_hidden()
+        await choose_shell_host(page)
+        await view.wait_for()
+        heading = page.get_by_role('button', name='Agent details', exact=True)
+        await view.get_by_text('Terminal', exact=True).click()
+        pane = page.locator('.terminal-pane')
+        await pane.wait_for()
+        await playwright.expect(page.locator('.conversation')).to_be_hidden()
+        await playwright.expect(heading).to_be_visible()
+        await playwright.expect(pane.get_by_role('button', name='Connection type')).to_have_count(0)
+        await pane.get_by_text('Connected: Main Agent', exact=True).wait_for()
+        await page.locator('.terminal-container .xterm-rows').get_by_text('agent-shell-ready').wait_for()
+        assert 'view=terminal' in page.url
+        key_bar = pane.locator('.key-bar')
+        ctrl = pane.get_by_role('button', name='Control', exact=True)
+        if width < 900:
+            await playwright.expect(key_bar).to_be_visible()
+            await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'false')
+            await ctrl.click()
+            await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'true')
+            await ctrl.click()
+            await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'false')
+            for name in ('Escape', 'Tab', 'Alt', 'Left arrow', 'Up arrow', 'Down arrow', 'Right arrow', 'Pipe', 'Tilde', 'Slash', 'Dash'):
+                await playwright.expect(pane.get_by_role('button', name=name, exact=True)).to_be_visible()
+            assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        else:
+            await playwright.expect(key_bar).to_be_hidden()
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await pane.get_by_text('Connected: Main Agent', exact=True).wait_for()
+        await view.get_by_text('Chat', exact=True).click()
+        await playwright.expect(pane).to_be_hidden()
+        await playwright.expect(page.locator('.conversation')).to_be_visible()
+        assert 'view=terminal' not in page.url
+        await browser.close()

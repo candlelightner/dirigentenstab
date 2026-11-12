@@ -119,6 +119,17 @@ def vm_key(service, agent_id, vm_id):
     return token
 
 
+def shell_key(service, agent_id, created_by):
+    """The agent's reusable export token for its shell container as (key id, token); minted on first use or after revocation."""
+    row = service.store.one("SELECT id,sealed FROM mcp_export_keys WHERE agent_id=? AND label='shell' AND sealed IS NOT NULL "
+                            'AND revoked IS NULL', (agent_id,))
+    if row:
+        return row['id'], service.store.open(row['sealed'])
+    key_id, token = _mint(service, agent_id, 'shell', created_by, seal=True)
+    service.store.audit(created_by, 'mcp-key-create', key_id)
+    return key_id, token
+
+
 async def authenticate(service, authorization, path_agent):
     """Return (key, acting agent id) for a bearer token and optional /mcp/<agent_id> path."""
     match = TOKEN.fullmatch(authorization[7:].strip()) if authorization[:7].lower() == 'bearer ' else None

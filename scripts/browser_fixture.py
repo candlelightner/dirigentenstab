@@ -37,6 +37,7 @@ AGENT_ID = 'research'
 PRIVATE_VALUES = ('fixture-runtime-api-DO-NOT-EXPOSE', 'fixture-runtime-secret-DO-NOT-EXPOSE',
                   'fixture-provision-api-DO-NOT-EXPOSE', 'fixture-provision-secret-DO-NOT-EXPOSE',
                   'fixture-provider-key-DO-NOT-EXPOSE', 'fixture-VM-password-DO-NOT-EXPOSE')
+SHELL_HOST = '00000000-0000-0000-0000-000000000005'
 GPU_POOL = '00000000-0000-0000-0000-0000000000a1'
 DOMAINS = [{'id': ROOT_DOMAIN, 'name': 'ROOT', 'path': 'ROOT', 'level': 0},
            {'id': 'main-domain', 'name': 'Agents--ds-00000000000000000000', 'path': 'ROOT/Agents',
@@ -131,7 +132,8 @@ ws.onmessage = e => document.getElementById('status').textContent = e.data;
             elif command == 'listVirtualMachines':
                 value = {'virtualmachine': [{'id': '00000000-0000-0000-0000-000000000004', 'name': 'research-vm',
                                              'displayname': 'Research Worker',
-                                             'state': 'Running'}]}
+                                             'state': 'Running'},
+                                            {'id': SHELL_HOST, 'name': 'agent-shell-host', 'state': 'Running'}]}
             elif command == 'createConsoleEndpoint':
                 count_file = state / 'console-count'
                 count = int(count_file.read_text()) + 1 if count_file.exists() else 1
@@ -211,6 +213,37 @@ class FixtureService(Service):
         conn = await asyncssh.connect('127.0.0.1', self.sftp_server.get_port(), username='dirigent',
                                       known_hosts=None, config=None, agent_path=None)
         return conn, {'id': vm_id, 'name': 'research-vm'}
+
+    shell_server = None
+
+    async def open_agent_shell(self, identity, agent_id):
+        # Stand-in for the shell host: a local echo shell, still behind the real authorization and host resolution.
+        import asyncssh
+        await self.authorize(identity, agent_id)
+        if not await self.agent_shell_host(fresh=True):
+            raise ValueError('No agent shell host is configured')
+        if not self.shell_server:
+            async def shell(process):
+                process.stdout.write('agent-shell-ready\r\n')
+                while True:
+                    try:
+                        data = await process.stdin.read(1024)
+                    except asyncssh.TerminalSizeChanged:
+                        continue
+                    if not data:
+                        break
+                    process.stdout.write(data)
+
+            class Server(asyncssh.SSHServer):
+                def begin_auth(self, username):
+                    return False
+
+            self.shell_server = await asyncssh.create_server(
+                Server, '127.0.0.1', 0, server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')], process_factory=shell)
+        self.store.audit(identity['userid'], 'open-agent-shell', agent_id)
+        conn = await asyncssh.connect('127.0.0.1', self.shell_server.get_port(), username='dirigent',
+                                      known_hosts=None, config=None, agent_path=None)
+        return conn, 'fixture-shell'
 
     def client(self, credentials):
         self._remember(credentials)
@@ -358,6 +391,11 @@ def main():
             'INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
             ('00000000-0000-0000-0000-000000000004', AGENT_ID, 'dirigent',
              store.seal('fixture-vm-key'), 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGSLVRtZbt6j3blQyUYXi5uLqk2MmNJc3wB7hc4PKlkV', 22),
+        )
+        conn.execute(
+            'INSERT INTO vm_access(vm_id,owner_agent,username,private_key,host_key,port) VALUES(?,?,?,?,?,?)',
+            (SHELL_HOST, APP_ROOT_AGENT, 'dirigent', store.seal('fixture-vm-key'),
+             'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGSLVRtZbt6j3blQyUYXi5uLqk2MmNJc3wB7hc4PKlkV', 22),
         )
     settings = Settings(f'http://127.0.0.1:{api_port}/client/api', f'https://localhost:{args.port}',
                         database=str(store.path), key_file=str(master),

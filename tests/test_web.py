@@ -39,6 +39,12 @@ class AgentCapabilities:
     def escalation_request_limit(self):
         return 3
 
+    async def agent_shell_host(self, fresh=False):
+        return ''
+
+    def agent_shell_hosts(self):
+        return []
+
     async def list_escalation_requests(self, identity):
         return []
 

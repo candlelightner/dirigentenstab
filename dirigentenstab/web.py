@@ -162,6 +162,9 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .terminal-pane{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden;gap:6px}
             .terminal-container{flex:1;min-height:0;width:100%;max-width:100%;overflow:hidden}
             .terminal-container .xterm{width:100%!important;height:100%!important;min-width:0;max-width:100%}
+            .nicegui-row.key-bar{display:none;overflow-x:auto;flex-shrink:0;max-width:100%}
+            .key-bar .q-btn{min-height:36px;min-width:36px;padding:0 8px}
+            @media(pointer:coarse),(max-width:900px){.nicegui-row.key-bar{display:flex}}
             .console-frame{flex:1;min-height:0;height:100%;width:100%;max-width:100%;border:0}
             .messages{flex:1;min-height:0;width:100%;overflow:hidden}
             .messages .q-scrollarea__container{overflow-x:hidden!important}
@@ -239,6 +242,10 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
 
         if main and not state['agent']:
             await ctx.show_agent(main['id'], close_navigation=False)
+
+        if state['agent'] == requested and query.get('view') == 'terminal' and ctx.view_toggle.visible:
+            ctx.view_toggle.set_value('terminal')  # restores the toggle; the open itself runs below
+            await ctx.show_agent_terminal(requested)
 
         vm_id, skill_id = query.get('vm'), query.get('skill')
 

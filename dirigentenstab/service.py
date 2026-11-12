@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,6 +30,10 @@ _UNSET = object()
 SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
 MCP_PLACEHOLDER = re.compile(r'\{\{mcp_(key|url|hosts)\}\}')
 SECRET_PLACEHOLDER = re.compile(r'\{\{secret:([A-Za-z_][A-Za-z0-9_]{0,63})\}\}')
+SHELL_IMAGE, SHELL_NETWORK, SHELL_ENV_DIR = 'dirigentenstab-shell:latest', 'dirigentenstab-shells', '/var/lib/dirigentenstab-shells'
+SHELL_HOST_OWNERS = (APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT)  # a lower agent must not redirect other agents' keys into a VM it controls
+SHELL_TAG = 'dirigentenstab-agent-shell-host'
+SHELL_AGENT = re.compile(r'[A-Za-z0-9_-]{1,64}')
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
 DEFAULT_INSTRUCTIONS = '''\
@@ -1475,6 +1480,10 @@ class Service:
         if record['username'] == 'root':
             raise ValueError('Root SSH identities are forbidden')
         agent = await self.authorize(identity, record['owner_agent'])
+        address, vm = await self.vm_address(agent, vm_id)
+        return address, record, vm
+
+    async def vm_address(self, agent, vm_id):
         cloud = await self.cloud_client(agent)
         response = await cloud.raw('listVirtualMachines', {'id': vm_id, 'listall': True})
         machines = response.get('virtualmachine', [])
@@ -1504,7 +1513,7 @@ class Service:
                 raise PermissionError('Host addresses cannot be guest SSH targets')
         except FileNotFoundError:
             pass
-        return str(address), record, vm
+        return str(address), vm
 
     async def vm_console_url(self, identity, vm_id):
         # CloudStack authorizes the signed-in human for this VM; tickets are short-lived, so fetch per use.
@@ -1526,20 +1535,125 @@ class Service:
 
     async def open_vm_connection(self, identity, vm_id, operation=None):
         # Shared by the terminal and file browser: native authorization, managed key, pinned host key.
-        import asyncssh
         address, record, vm = await self.target_vm(identity, vm_id)
         if operation:
             self.store.audit(identity['userid'], operation, vm_id)
-        client_key = asyncssh.import_private_key(self.store.open(record['private_key']))
-        host_key = asyncssh.import_public_key(record['host_key'])
-        known_hosts = ([host_key], [], [])
-        conn = await asyncssh.connect(
+        return await self.ssh_connect(address, record), vm
+
+    async def ssh_connect(self, address, record):
+        import asyncssh
+        return await asyncssh.connect(
             address, port=record['port'], username=record['username'],
-            client_keys=[client_key], known_hosts=known_hosts,
+            client_keys=[asyncssh.import_private_key(self.store.open(record['private_key']))],
+            known_hosts=([asyncssh.import_public_key(record['host_key'])], [], []),
             config=None, agent_path=None, preferred_auth=['publickey'],
             connect_timeout=10, login_timeout=10,
         )
-        return conn, vm
+
+    def agent_shell_hosts(self):
+        """Managed, SSH-ready VMs allowed to host agent shells: owned by Global Admin or the root Main Agent."""
+        return [row['vm_id'] for row in self.store.all(
+            "SELECT vm_id FROM vm_access WHERE host_key IS NOT NULL AND username<>'root' AND vm_id NOT LIKE 'pending-%' "
+            'AND owner_agent IN (?,?)', SHELL_HOST_OWNERS)]
+
+    async def tagged_shell_hosts(self):
+        """Eligible VMs carrying the CloudStack tag, as seen by the agents allowed to own a host."""
+        eligible, found = set(self.agent_shell_hosts()), set()
+        for owner in SHELL_HOST_OWNERS:
+            agent = await self.agent(owner)
+            if not agent or not eligible:
+                continue
+            try:
+                tags = (await (await self.cloud_client(agent)).raw(
+                    'listTags', {'key': SHELL_TAG, 'resourcetype': 'UserVm', 'listall': True})).get('tag', [])
+            except Exception:
+                continue
+            found |= {tag.get('resourceid') for tag in tags if tag.get('key') == SHELL_TAG} & eligible
+        return sorted(found)
+
+    async def agent_shell_host(self, fresh=False):
+        """The Platform setting if still eligible, else the single tagged eligible VM; '' when none, error when ambiguous."""
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='agent_shell_host'")
+        if row and row['value'] in self.agent_shell_hosts():
+            return row['value']
+        cached = getattr(self, '_shell_tagged', None)
+        if fresh or not cached or time.monotonic() - cached[0] > 30:
+            cached = self._shell_tagged = (time.monotonic(), await self.tagged_shell_hosts())
+        if len(cached[1]) > 1:
+            raise ValueError('Several agent shell hosts tagged; pick one in Platform settings')
+        return cached[1][0] if cached[1] else ''
+
+    def save_agent_shell_host(self, identity, vm_id):
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Platform settings require platform administrator')
+        if vm_id and vm_id not in self.agent_shell_hosts():
+            raise ValueError('Agent shell host must be a managed VM owned by Global Admin or the root Main Agent')
+        self.store.execute("INSERT INTO platform_settings VALUES('agent_shell_host',?) "
+                           'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (vm_id or '',))
+        self.store.audit(identity['userid'], 'configure-agent-shell-host', vm_id or '')
+
+    async def install_agent_shell_skill(self, identity):
+        """Save the shipped agent-shell-host skill on the root Main Agent, only when missing or outdated."""
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Platform settings require platform administrator')
+        header, _, text = (Path(__file__).parent / 'skills' / 'agent-shell-host.md').read_text().partition('\nText:\n')
+        name, description = (line.partition(': ')[2] for line in header.strip().split('\n\n'))
+        text = text.strip()
+        row = self.store.one('SELECT id FROM skills WHERE creator_agent_id=? AND name=?', (APP_ROOT_AGENT, name))
+        return await self.save_skill(identity, APP_ROOT_AGENT, name, description, text, row['id'] if row else None)
+
+    async def open_agent_shell(self, identity, agent_id):
+        """Connect to the shell host and ensure the agent's container; returns (connection, fixed exec command).
+
+        The hub's managed key runs fixed docker commands only; the human is authorized for the agent, never the host VM.
+        """
+        from .mcp_export import export_hosts, export_url, shell_key
+        if not isinstance(agent_id, str) or not SHELL_AGENT.fullmatch(agent_id):
+            raise ValueError('Invalid agent')
+        agent = await self.authorize(identity, agent_id)
+        host = await self.agent_shell_host(fresh=True)
+        record = host and self.store.one('SELECT * FROM vm_access WHERE vm_id=?', (host,))
+        if not record:
+            raise ValueError('No agent shell host is configured')
+        self.store.audit(identity['userid'], 'open-agent-shell', agent_id)
+        address, _ = await self.vm_address(await self.agent(record['owner_agent']), host)
+        key_id, token = shell_key(self, agent_id, identity['userid'])
+        hosts = await asyncio.to_thread(export_hosts, self)
+        conn = await self.ssh_connect(address, record)
+        try:
+            await self.ensure_agent_shell(conn, agent, key_id, f'{export_url(self)}/{agent_id}', token, hosts)
+        except BaseException:
+            conn.close()
+            raise
+        return conn, f'sudo -n docker exec -it -u dev -w /home/dev ws-{agent_id} bash -l'
+
+    async def ensure_agent_shell(self, conn, agent, key_id, url, token, hosts=''):
+        """Idempotently create or start the agent's container; the token travels only over SSH stdin into a root-only file."""
+        async def docker(*args, run=False, input=None):
+            command = 'sudo -n ' + ' '.join(shlex.quote(a) for a in (args if run else ('docker', *args)))
+            return await conn.run(command, input=input, check=False)
+        for kind, ref in (('image', SHELL_IMAGE), ('network', SHELL_NETWORK)):
+            if (await docker(kind, 'inspect', ref)).returncode:
+                raise RuntimeError('Agent shell host is not set up: run the agent-shell-host skill')
+        name, env_file = 'ws-' + agent['id'], f"{SHELL_ENV_DIR}/{agent['id']}.env"
+        found = await docker('inspect', '-f', '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}}', name)
+        state = found.stdout.split() if not found.returncode else None
+        if state and state[1:] == [key_id]:  # a revoked or replaced key falls through to recreation
+            if state[0] != 'true' and (started := await docker('start', name)).returncode:
+                raise RuntimeError('Could not start the agent shell: ' + (started.stderr or '').strip()[:200])
+            return
+        if state:
+            await docker('rm', '-f', name)
+        written = await docker('install', '-D', '-m', '600', '/dev/stdin', env_file, run=True,
+                               input=f'DIRIGENTENSTAB_MCP_URL={url}\nDIRIGENTENSTAB_MCP_KEY={token}\n')
+        address, _, host = hosts.partition(' ')
+        slug = re.sub(r'[^a-z0-9]+', '-', agent['name'].lower()).strip('-')[:32] or 'agent'
+        created = written if written.returncode else await docker(
+            'run', '-d', '--name', name, '--hostname', slug, '--restart', 'unless-stopped', '--network', SHELL_NETWORK,
+            '--label', 'dirigentenstab.key=' + key_id, '--env-file', env_file, '-v', f"ws-home-{agent['id']}:/home/dev",
+            *(['--add-host', f'{host}:{address}'] if host else []), SHELL_IMAGE)
+        if created.returncode:
+            raise RuntimeError('Could not create the agent shell: ' + (created.stderr or '').strip()[:200])
 
     async def configure_agent(self, actor_id, target_id, settings=None):
         identity = await self.execution_identity(actor_id, actor_id)
