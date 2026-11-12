@@ -118,3 +118,46 @@ async def test_runtime_summarizes_title_on_first_message(service, monkeypatch):
     await asyncio.sleep(0.1)
     row = service.store.one('SELECT title FROM conversations WHERE id=?', (conv_id,))
     assert row['title'] == 'Summarized Conversation Title'
+
+
+async def _title_request(service, monkeypatch, stream_error):
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from dirigentenstab import runtime as runtime_module
+
+    admin = {'userid': 'admin', 'type': 1}
+    service.save_summary_settings(admin, 'summary-prov', 'summary-model', 'Summarize')
+    service.store.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
+                          ('conv', 'agent', 'admin', 'Untitled', 1, service.store.seal([])))
+    calls = []
+
+    async def stream(messages, info):
+        calls.append('stream')
+        raise stream_error
+        yield  # pragma: no cover
+
+    def request(messages, info):
+        calls.append('request')
+        return ModelResponse(parts=[TextPart('Fallback Title')])
+
+    monkeypatch.setattr(runtime_module, 'build_model',
+                        lambda *args, **kwargs: FunctionModel(function=request, stream_function=stream))
+    await Runtime(service)._summarize_title('conv', 'Long user request')
+    return calls, service.store.one('SELECT title FROM conversations WHERE id=?', ('conv',))['title']
+
+
+@pytest.mark.asyncio
+async def test_title_summary_does_not_retry_after_provider_http_error(service, monkeypatch):
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    calls, title = await _title_request(service, monkeypatch, ModelHTTPError(402, 'summary-model', 'out of credit'))
+
+    assert calls == ['stream']
+    assert title == 'Untitled'
+
+
+@pytest.mark.asyncio
+async def test_title_summary_falls_back_once_on_non_http_stream_failure(service, monkeypatch):
+    calls, title = await _title_request(service, monkeypatch, RuntimeError('streaming unsupported'))
+
+    assert calls == ['stream', 'request']
+    assert title == 'Fallback Title'
