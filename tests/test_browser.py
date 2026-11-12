@@ -2183,6 +2183,9 @@ async def test_agent_shell_toggle_switches_chat_and_terminal_with_key_bar(browse
             await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'true')
             await ctrl.click()
             await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'false')
+            await ctrl.click()
+            await pane.get_by_role('button', name='Slash', exact=True).click()
+            await playwright.expect(ctrl).to_have_attribute('aria-pressed', 'false')
             for name in ('Escape', 'Tab', 'Alt', 'Left arrow', 'Up arrow', 'Down arrow', 'Right arrow', 'Pipe', 'Tilde', 'Slash', 'Dash'):
                 await playwright.expect(pane.get_by_role('button', name=name, exact=True)).to_be_visible()
             assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')

@@ -236,18 +236,29 @@ def setup_vm(ctx):
         data = getattr(e, 'data', None)
         if data is None:
             data = getattr(e, 'args', '')
-        send_input(modified(data, mods['Ctrl'], mods['Alt']) if isinstance(data, str) else data)
+        if isinstance(data, str):
+            data = modified(data, mods['Ctrl'], mods['Alt'])
+            release_mods()
+        send_input(data)
+
+    def set_mod(label, on):
+        mods[label] = on
+        button = ctx.key_buttons[label]
+        button.props(f'aria-pressed={str(on).lower()}')
+        button.classes(add='bg-primary text-white') if on else button.classes(remove='bg-primary text-white')
+
+    def release_mods():
+        for label in mods:
+            if mods[label]:
+                set_mod(label, False)
 
     def press_key(label):
-        if label in mods:  # Ctrl and Alt latch until tapped again
-            mods[label] = not mods[label]
-            button = ctx.key_buttons[label]
-            button.props(f'aria-pressed={str(mods[label]).lower()}')
-            button.classes(add='bg-primary text-white') if mods[label] else button.classes(remove='bg-primary text-white')
-        elif label in ARROWS:
-            send_input(arrow(next(data for key, _, data in KEYS if key == label), mods['Ctrl'], mods['Alt']))
-        else:
-            send_input(modified(next(data for key, _, data in KEYS if key == label), mods['Ctrl'], mods['Alt']))
+        if label in mods:  # Ctrl and Alt latch until the next key or until tapped again
+            set_mod(label, not mods[label])
+            return
+        data = next(data for key, _, data in KEYS if key == label)
+        send_input(arrow(data, mods['Ctrl'], mods['Alt']) if label in ARROWS else modified(data, mods['Ctrl'], mods['Alt']))
+        release_mods()
     ctx.press_key = press_key
 
     def handle_term_resize(e):
