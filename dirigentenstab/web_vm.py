@@ -10,6 +10,52 @@ from .files import MAX_UPLOAD, UPLOAD_LIMIT_TEXT, store_upload
 from .web_sidebar import agent_label
 
 
+KEYS = (('Esc', 'Escape', '\x1b'), ('Tab', 'Tab', '\t'), ('Ctrl', 'Control', None), ('Alt', 'Alt', None),
+        ('←', 'Left arrow', 'D'), ('↑', 'Up arrow', 'A'), ('↓', 'Down arrow', 'B'), ('→', 'Right arrow', 'C'),
+        ('|', 'Pipe', '|'), ('~', 'Tilde', '~'), ('/', 'Slash', '/'), ('-', 'Dash', '-'))
+ARROWS = frozenset('←↑↓→')
+
+
+def modified(data, ctrl, alt):
+    """Apply latched Ctrl/Alt to xterm input: a single typed character becomes its control code, Alt prefixes ESC."""
+    if ctrl and len(data) == 1 and (data.isascii() and data.isalpha() or data in '@[\\]^_'):
+        data = chr(ord(data.upper()) & 0x1f)
+    return '\x1b' + data if alt and data else data
+
+
+def arrow(final, ctrl, alt):
+    mod = 1 + 2 * alt + 4 * ctrl
+    return f'\x1b[1;{mod}{final}' if mod > 1 else f'\x1b[{final}'
+
+
+class Mods:
+    """Ctrl/Alt key-bar state: off, armed (next key only) or locked (until tapped again)."""
+    DOUBLE_TAP = 0.4
+
+    def __init__(self):
+        self.state = {'Ctrl': 'off', 'Alt': 'off'}
+        self.tapped = {}
+
+    def tap(self, label, now=None):
+        now = time.monotonic() if now is None else now
+        if self.state[label] == 'off':
+            self.state[label], self.tapped[label] = 'armed', now
+        elif self.state[label] == 'armed' and now - self.tapped[label] <= self.DOUBLE_TAP:
+            self.state[label] = 'locked'
+        else:
+            self.state[label] = 'off'
+
+    def release(self):
+        """Release armed modifiers after a key; returns the labels that changed."""
+        released = [label for label, st in self.state.items() if st == 'armed']
+        for label in released:
+            self.state[label] = 'off'
+        return released
+
+    def active(self, label):
+        return self.state[label] != 'off'
+
+
 class TerminalSession:
     def __init__(self, user_id, vm_id, conn, chan, term):
         self.user_id = user_id
@@ -72,6 +118,13 @@ def build_vm_view(ctx):
                 ui.button(icon='close', on_click=lambda: protect(ctx.close_terminal_view)).props('flat round dense aria-label="Close terminal"').mark('terminal_close')
         ctx.terminal_error = ui.label('').classes('text-xs text-red-600 truncate').mark('terminal_error')
         ctx.terminal_error.set_visibility(False)
+        with ui.row().classes('key-bar w-full items-center gap-1 no-wrap') as ctx.key_bar:
+            ctx.key_buttons = {}
+            for label, name, _ in KEYS:
+                button = ctx.key_buttons[label] = ui.button(label, on_click=lambda _, key=label: ctx.press_key(key)).props(
+                    f'flat dense no-caps aria-label="{name}"' + (' aria-pressed=false' if label in {'Ctrl', 'Alt'} else '')).mark(
+                    'key_' + name.split()[0].lower())
+                button.on('mousedown', js_handler='(e) => e.preventDefault()')  # keep xterm focused so the soft keyboard stays up
         with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').mark('terminal_container') as ctx.terminal_container:
             ctx.term = ui.xterm(options={'cursorBlink': True, 'theme': {'background': '#000000'}}).classes('w-full h-full').mark('xterm')
         ctx.console_frame = ui.element('iframe').classes('console-frame bg-black rounded').props(
@@ -128,6 +181,9 @@ def setup_vm(ctx):
 
     client.on_disconnect(ctx.close_active_terminal)
 
+    def terminal_target():
+        return state.get('terminal_agent') or state.get('current_vm')
+
     async def connect_vm(vm_id, vm_name=None):
         ctx.close_active_terminal()
         request = ssh_request
@@ -139,8 +195,13 @@ def setup_vm(ctx):
         ctx.term.write('\x1bc')
         try:
             current = await actor()
-            conn, vm = await service.open_vm_terminal_connection(current, vm_id)
-            if request != ssh_request or state.get('current_vm') != vm_id:
+            if state.get('terminal_agent'):
+                conn, command = await service.open_agent_shell(current, vm_id)
+                vm = {'name': vm_name}
+            else:
+                conn, vm = await service.open_vm_terminal_connection(current, vm_id)
+                command = None
+            if request != ssh_request or terminal_target() != vm_id:
                 conn.close()
                 return
             session = TerminalSession(current['userid'], vm_id, conn, None, ctx.term)
@@ -166,6 +227,7 @@ def setup_vm(ctx):
                 term_type='xterm-256color',
                 term_size=(cols, rows),
                 encoding=None,
+                command=command,
             )
             if request != ssh_request:
                 chan.close()
@@ -189,15 +251,45 @@ def setup_vm(ctx):
             ctx.reconnect_btn.enable()
             ctx.disconnect_btn.disable()
 
-    def handle_term_data(e):
+    mods = Mods()
+
+    def send_input(data):
         if active_session and active_session.chan and not active_session.chan.is_closing():
-            data = getattr(e, 'data', None)
-            if data is None:
-                data = getattr(e, 'args', '')
             try:
                 active_session.chan.write(data.encode('utf-8') if isinstance(data, str) else data)
             except Exception:
                 pass
+
+    def handle_term_data(e):
+        data = getattr(e, 'data', None)
+        if data is None:
+            data = getattr(e, 'args', '')
+        if isinstance(data, str):
+            data = modified(data, mods.active('Ctrl'), mods.active('Alt'))
+            release_mods()
+        send_input(data)
+
+    def show_mod(label):
+        st = mods.state[label]
+        button = ctx.key_buttons[label]
+        button.props(f'aria-pressed={str(st != "off").lower()} data-locked={str(st == "locked").lower()}')
+        button.classes(add='bg-primary text-white') if st != 'off' else button.classes(remove='bg-primary text-white')
+        button.classes(add='underline') if st == 'locked' else button.classes(remove='underline')
+
+    def release_mods():
+        for label in mods.release():
+            show_mod(label)
+
+    def press_key(label):
+        if label in mods.state:  # tap arms for one key, double tap locks, tap again unlocks
+            mods.tap(label)
+            show_mod(label)
+            return
+        data = next(data for key, _, data in KEYS if key == label)
+        ctrl, alt = mods.active('Ctrl'), mods.active('Alt')
+        send_input(arrow(data, ctrl, alt) if label in ARROWS else modified(data, ctrl, alt))
+        release_mods()
+    ctx.press_key = press_key
 
     def handle_term_resize(e):
         cols = getattr(e, 'cols', None) or (e.args.get('cols') if hasattr(e, 'args') and isinstance(e.args, dict) else None)
@@ -228,8 +320,58 @@ def setup_vm(ctx):
         ctx.console_frame.update()
     ctx.set_console_src = set_console_src
 
-    async def show_vm(vm_id):
+    def chat_visible(shown):
+        for element in (ctx.history_select, ctx.new_button, ctx.run_details_button, ctx.conversation_card):
+            element.set_visibility(shown)
+
+    def leave_agent_terminal():
         ctx.close_active_terminal()
+        state['terminal_agent'] = None
+        ctx.terminal_pane.set_visibility(False)
+        chat_visible(True)
+        ctx.view_toggle.set_value('chat')
+    ctx.leave_agent_terminal = leave_agent_terminal
+
+    async def show_agent_terminal(agent_id):
+        ctx.close_active_terminal()
+        ctx.set_console_src()
+        state['terminal_agent'] = agent_id
+        chat_visible(False)
+        for element in (ctx.terminal_mode, ctx.console_status, ctx.console_frame, ctx.popout_btn, ctx.files_pane):
+            element.set_visibility(False)
+        for element in (ctx.terminal_status, ctx.terminal_container, ctx.key_bar, ctx.terminal_pane):
+            element.set_visibility(True)
+        ctx.terminal_error.set_visibility(False)
+        ctx.reconnect_btn.enable()
+        ctx.disconnect_btn.disable()
+        ctx.sync_url()
+        await ctx.term.fit()
+        await connect_vm(agent_id, agent_label(ctx.agents.get(agent_id, {'name': agent_id})))
+
+    ctx.show_agent_terminal = show_agent_terminal
+
+    async def set_agent_view(value):
+        if value == 'terminal' and state.get('agent') and state.get('terminal_agent') != state['agent']:
+            await show_agent_terminal(state['agent'])
+        elif value == 'chat' and state.get('terminal_agent'):
+            leave_agent_terminal()
+            ctx.sync_url()
+    ctx.view_toggle.on_value_change(lambda e: protect(lambda: set_agent_view(e.value)))
+
+    async def refresh_shell_toggle():
+        try:
+            host = bool(await service.agent_shell_host())
+        except ValueError:  # ambiguous tags: the open attempt reports it
+            host = True
+        ctx.view_toggle.set_visibility(host and not state.get('current_vm') and bool(state.get('agent')))
+        if not host and state.get('terminal_agent'):
+            leave_agent_terminal()
+            ctx.sync_url()
+    ctx.refresh_shell_toggle = refresh_shell_toggle
+
+    async def show_vm(vm_id):
+        leave_agent_terminal()
+        ctx.terminal_mode.set_visibility(True)
         name = vm_name(vm_id)
         state['current_vm'] = vm_id
         ctx.set_console_src()
@@ -412,6 +554,7 @@ def setup_vm(ctx):
             element.set_visibility(console)
         ctx.terminal_status.set_visibility(not console)
         ctx.terminal_container.set_visibility(mode == 'ssh')
+        ctx.key_bar.set_visibility(mode == 'ssh')
         ctx.files_pane.set_visibility(files)
         ctx.reconnect_btn.enable()
         ctx.disconnect_btn.set_enabled(console or files or bool(active_session))
@@ -440,9 +583,11 @@ def setup_vm(ctx):
     ctx.disconnect_terminal = disconnect_terminal
 
     async def reconnect_terminal():
-        if not state.get('current_vm'):
+        if state.get('terminal_agent'):
+            await connect_vm(state['terminal_agent'], agent_label(ctx.agents.get(state['terminal_agent'], {'name': 'agent'})))
+        elif not state.get('current_vm'):
             return
-        if ctx.terminal_mode.value == 'console':
+        elif ctx.terminal_mode.value == 'console':
             await connect_console()
         elif ctx.terminal_mode.value == 'files':
             await connect_files()
@@ -451,6 +596,10 @@ def setup_vm(ctx):
     ctx.reconnect_terminal = reconnect_terminal
 
     async def close_terminal_view():
+        if state.get('terminal_agent'):
+            leave_agent_terminal()
+            ctx.sync_url()
+            return
         ctx.close_active_terminal()
         ctx.set_console_src()
         state['current_vm'] = None

@@ -155,9 +155,12 @@ def build_chat_view(ctx):
             <span role="img" class="text-primary" :aria-label="%s[props.opt.label[0]]">{{ props.opt.label[0] }}</span></q-item-section>
             <q-item-section><q-item-label class="ellipsis">{{ %s[props.opt.label[0]] ? props.opt.label.slice(2) : props.opt.label }}
             </q-item-label></q-item-section></q-item>''' % (glyphs, glyphs, glyphs))
+        ctx.view_toggle = ui.toggle({'chat': 'Chat', 'terminal': 'Terminal'}, value='chat').props(
+            'dense no-caps aria-label="Agent view"').mark('agent_view')
+        ctx.view_toggle.set_visibility(False)
         ctx.new_button = ui.button(icon='add').props('flat round aria-label="New conversation"').mark('New conversation')
         with ui.button(icon='info_outline').props(
-                'flat round aria-label="Run details" aria-haspopup="menu"').mark('run_details_toggle'):
+                'flat round aria-label="Run details" aria-haspopup="menu"').mark('run_details_toggle') as ctx.run_details_button:
             with ui.menu().props('anchor="bottom right" self="top right"').classes(
                     'run-details-menu bg-white p-4').mark('run_details_menu').style(
                         'width:min(360px,calc(100vw - 24px));max-width:calc(100vw - 24px)') as ctx.run_details_menu:
@@ -298,12 +301,13 @@ def setup_chat(ctx):
     def sync_url(skill_id=None):
         # Keep the main pane target in the query string so a reload restores it; ids only, never secrets.
         query = ({'skill': skill_id} if skill_id else {'vm': state['current_vm'], 'mode': ctx.terminal_mode.value}
-                 if state.get('current_vm') else {'agent': state['agent']} if state['agent'] else {})
+                 if state.get('current_vm') else {'agent': state['agent']} | ({'view': 'terminal'} if state.get('terminal_agent') else {})
+                 if state['agent'] else {})
         ui.run_javascript('history.replaceState(null, "", ' + json.dumps('?' + urlencode(query)) + ')')
     ctx.sync_url = sync_url
 
     async def render_agent(agent_id, *, close_navigation=True):
-        ctx.close_active_terminal()
+        ctx.leave_agent_terminal()
         ctx.set_console_src()
         state['current_vm'] = None
         ctx.terminal_pane.set_visibility(False)
@@ -319,6 +323,7 @@ def setup_chat(ctx):
         ctx.prompt.set_value(state['drafts'].get((agent_id, None), ''))
         state.update(agent=agent_id, conversation=None, imported=False, active_operation=None, busy=False, indicator='Thinking…', activity_token=None)
         ctx.sync_url()
+        await ctx.refresh_shell_toggle()
         sync_composer()
         ctx.prompt.enable()
         reset_run_details()
@@ -627,6 +632,7 @@ def setup_chat(ctx):
 
     ui.timer(1.0, poll_activity)
     ctx.history_select.on_value_change(lambda e: protect(lambda: choose_history(e)))
+    ctx.new_conversation, ctx.send = new_conversation, send
     ctx.new_button.on_click(lambda: protect(new_conversation))
     ctx.send_button.on_click(lambda: protect(send))
     for combo in ('ctrl', 'meta'):

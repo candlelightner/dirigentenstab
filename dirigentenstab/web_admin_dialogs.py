@@ -9,6 +9,10 @@ from .runtime import provider_models, test_provider
 from .diagnostics import diagnose
 from .gpu import describe_plan
 from .web_mcp_export import keys_panel
+from .web_sidebar import agent_label
+
+SHELL_SETUP_MESSAGE = ('Please set up the agent shell host for this hub using the agent-shell-host skill: '
+                       'use an existing tagged VM if there is one, otherwise deploy a new one, and report when it is ready.')
 
 
 def setup_admin_dialogs(ctx):
@@ -138,6 +142,30 @@ def setup_admin_dialogs(ctx):
             request_limit = ui.number('Open escalation requests per agent', value=service.escalation_request_limit(),
                                       min=1, step=1, precision=0).classes('w-full')
             ui.label('Global limit across all conversations. Pending requests and commands being applied count as open.').classes('text-sm')
+            hosts = set(service.agent_shell_hosts())
+            names = {vm['id']: vm.get('displayname') or vm['name'] for vm in ctx.state['data'].get('vms', []) if vm['id'] in hosts}
+            saved = service.store.one("SELECT value FROM platform_settings WHERE name='agent_shell_host'")
+            shell_host = ui.select({'': 'Off', **names}, value=saved['value'] if saved and saved['value'] in names else '',
+                                   label='Agent shell host').classes('w-full').mark('agent-shell-host')
+            ui.label('Managed VM (owned by Global Admin or the root Main Agent) that runs each agent\'s terminal container. '
+                     'A VM tagged dirigentenstab-agent-shell-host also qualifies when this is Off.').classes('text-sm')
+            main = next((a for a in ctx.agents.values() if a.get('is_main')), None)
+            try:
+                resolved = await service.agent_shell_host(fresh=True)
+            except ValueError as exc:
+                resolved = str(exc)
+            if main and not resolved:
+                async def setup_shell_host():
+                    dialog.close()
+                    await service.install_agent_shell_skill(await actor())
+                    await ctx.show_agent(main['id'])
+                    await ctx.new_conversation()
+                    ctx.prompt.set_value(SHELL_SETUP_MESSAGE)
+                    await ctx.send()
+                ui.button('Set up with ' + agent_label(main), on_click=lambda: protect(setup_shell_host)).props(
+                    'outline no-caps').mark('setup-agent-shell-host')
+            elif resolved and resolved not in hosts:
+                ui.label(resolved).classes('text-sm text-red-600')
             ui.separator()
             ui.label('Secrets').classes('font-semibold')
             ui.label('Write-only named values injected by the hub into VM commands and files; agents see names only. '
@@ -188,6 +216,8 @@ def setup_admin_dialogs(ctx):
                 await service.save_owner_ssh_key(actor_identity, owner_key.value or '')
                 service.save_escalation_request_limit(actor_identity, int(request_limit.value))
                 service.save_dashboard_url(actor_identity, url.value or '')
+                service.save_agent_shell_host(actor_identity, shell_host.value or '')
+                await ctx.refresh_shell_toggle()
                 value = service.dashboard_url(actor_identity)
                 for link in ctx.dashboard_links:
                     link.props['href'] = value or '#'
