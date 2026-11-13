@@ -38,6 +38,7 @@ SHELL_TAG = 'dirigentenstab-agent-shell-host'
 SHELL_BUILD_SECONDS, SHELL_ERROR_CHARS = 900, 600
 SHELL_AGENT = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SHELL_HOMES, SHELL_LOGINS_VOLUME, SHELL_HOME_UID = f'{SHELL_ENV_DIR}/homes', 'ws-logins', 1000
+SHELL_HOME_DIR = '.dshome'  # the bind source lives inside the filesystem: unmounted image -> missing source -> container will not start
 SHELL_RESERVED = re.compile(r'DIRIGENTENSTAB_.*|LD_.*|LC_.*|PATH|HOME|USER|LOGNAME|SHELL|PWD|OLDPWD|HOSTNAME|TERM|LANG|IFS|ENV|BASH_ENV|PS[0-9]|PROMPT_COMMAND')
 SHELL_HOME_GIB = (1, 50, 5)  # min, max, default
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
@@ -1819,7 +1820,13 @@ class Service:
         inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}} {{.Image}} {{index .Config.Labels "dirigentenstab.config"}}'
         found = await docker('inspect', '-f', inspect_format, name)
         state = found.stdout.split() if not found.returncode else None
+        if state and state[0] != 'true':  # a stopped container on a legacy home (root bind or plain volume) is recreated so the home gets migrated
+            volume = await docker('volume', 'inspect', '-f', '{{index .Options "device"}}', f"ws-home-{agent['id']}")
+            if volume.returncode or volume.stdout.strip() != f"{SHELL_HOMES}/{agent['id']}.mnt/{SHELL_HOME_DIR}":
+                state = state[:3] + ['']
         if state and state[1:2] == [key_id] and state[2:3] == [image_id] and state[3:4] == [config]:  # revoked key, new image, changed secrets or storage settings recreate
+            if state[0] != 'true':  # a host reboot may have dropped the loop mount: remount before Docker binds the home
+                await self._mount_shell_image(docker, f"{SHELL_HOMES}/{agent['id']}.img", f"{SHELL_HOMES}/{agent['id']}.mnt", True)
             if state[0] != 'true' and (started := await docker('start', name)).returncode:
                 raise RuntimeError('Could not start the agent shell: ' + (started.stderr or '').strip()[:200])
             if built:
@@ -1853,6 +1860,29 @@ class Service:
         if skipped:
             progress('Not exported to the shell (reserved name or multi-line value): ' + ', '.join(skipped))
 
+    async def _shell_host(self, docker, *args, what):
+        result = await docker(*args, run=True)
+        if result.returncode:
+            raise RuntimeError(f'{what}: ' + (result.stderr or result.stdout or '').strip()[:200])
+        return result
+
+    async def _mount_shell_image(self, docker, path, where, persist):
+        """Loop-mount a home image (Docker's local driver cannot) and make sure the home directory exists inside it.
+
+        persist adds an fstab entry. The directory is created once, owned like the filesystem root; a root that still holds
+        files (phase-3 first layout, or a copied plain volume) has them moved into it, skipping lost+found, so an interrupted
+        move resumes on the next call.
+        """
+        await self._shell_host(docker, 'install', '-d', where, what='Could not create the home mount point')
+        await self._shell_host(docker, 'sh', '-c', 'mountpoint -q "$1" || { '
+                               + ('grep -qsF " $1 " /etc/fstab || echo "$0 $1 ext4 loop,nofail 0 0" >> /etc/fstab; mount "$1"; '
+                                  if persist else 'mount -o loop "$0" "$1"; ') + '}', path, where, what='Could not mount the home image')
+        await self._shell_host(
+            docker, 'sh', '-c',
+            f'd="$0/{SHELL_HOME_DIR}"; [ -d "$d" ] || {{ mkdir -p "$d.tmp" && chown --reference="$0" "$d.tmp" && '
+            f'chmod --reference="$0" "$d.tmp" && find "$0" -mindepth 1 -maxdepth 1 ! -name lost+found ! -name {SHELL_HOME_DIR}.tmp '
+            f'-exec mv -t "$d.tmp" {{}} + && mv "$d.tmp" "$d"; }}', where, what='Could not prepare the home directory')
+
     async def _ensure_shell_home(self, docker, agent_id, gib, progress):
         """Give the agent a fixed-size ext4 home (sparse image, loop-mounted by the hub and exposed as a bind volume). Container must be removed.
 
@@ -1862,10 +1892,7 @@ class Service:
         volume, img, tmp, size = f'ws-home-{agent_id}', f'{SHELL_HOMES}/{agent_id}.img', f'{SHELL_HOMES}/{agent_id}.img.new', f'{gib}G'
 
         async def host(*args, what):
-            result = await docker(*args, run=True)
-            if result.returncode:
-                raise RuntimeError(f'{what}: ' + (result.stderr or result.stdout or '').strip()[:200])
-            return result
+            return await self._shell_host(docker, *args, what=what)
 
         async def remapped(file):  # the container's dev (uid 1000) is base+1000 on the host under userns-remap
             out = await docker('awk', '-F:', '$1=="dockremap"{print $2; exit}', file, run=True)
@@ -1885,25 +1912,23 @@ class Service:
                 raise
 
         mnt = f'{SHELL_HOMES}/{agent_id}.mnt'
+        source = f'{mnt}/{SHELL_HOME_DIR}'
 
-        async def mount(path, where, persist):  # Docker's local driver cannot loop-mount: the hub mounts, the volume binds
-            await host('install', '-d', where, what='Could not create the home mount point')
-            await host('sh', '-c', 'mountpoint -q "$1" || { '
-                       + ('grep -qsF " $1 " /etc/fstab || echo "$0 $1 ext4 loop,nofail 0 0" >> /etc/fstab; mount "$1"; '
-                          if persist else 'mount -o loop "$0" "$1"; ') + '}', path, where, what='Could not mount the home image')
+        async def mount(path, where, persist):
+            await self._mount_shell_image(docker, path, where, persist)
 
         async def unmount(where):
             await host('sh', '-c', '! mountpoint -q "$0" || umount "$0"', where, what='Could not unmount the home image')
 
         async def attach(name):
             await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
-                       '--opt', f'device={mnt}', name, what='Could not create the home volume')
+                       '--opt', f'device={source}', name, what='Could not create the home volume')
 
         found = await docker('volume', 'inspect', '-f', '{{index .Options "device"}}', volume)
         device = found.stdout.strip() if not found.returncode else None
-        if device is not None and device not in {mnt, '', '<no value>', '<nil>'}:
+        if device is not None and device not in {source, mnt, '', '<no value>', '<nil>'}:
             raise RuntimeError(f'Home volume {volume} uses an unexpected device')
-        if device == mnt or device is None:
+        if device in {source, mnt} or device is None:
             if (await docker('test', '-f', img, run=True)).returncode:
                 await make(img)
             have = int((await host('stat', '-c', '%s', img, what='Could not inspect the home image')).stdout.strip() or 0)
@@ -1919,7 +1944,9 @@ class Service:
                     await docker('truncate', '-s', str(have), img, run=True)
                     raise
             await mount(img, mnt, True)  # also after a host reboot that dropped the mount
-            if device is None:
+            if device == mnt:  # first layout bound the filesystem root itself
+                await host('docker', 'volume', 'rm', volume, what='Could not replace the home volume')
+            if device in {None, mnt}:
                 await attach(volume)
             return
         progress('Migrating home to a size-limited volume…')
@@ -1929,7 +1956,7 @@ class Service:
         try:
             await mount(tmp, scratch, False)
             await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
-                       '--opt', f'device={scratch}', staging, what='Could not create the home volume')
+                       '--opt', f'device={scratch}/{SHELL_HOME_DIR}', staging, what='Could not create the home volume')
             await host('docker', 'run', '--rm', '--network', 'none', '--user', '0', '--entrypoint', 'cp',
                        '-v', f'{volume}:/from', '-v', f'{staging}:/to', SHELL_IMAGE, '-a', '/from/.', '/to/',
                        what='Could not copy the old home')

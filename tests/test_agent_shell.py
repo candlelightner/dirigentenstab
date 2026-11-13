@@ -162,6 +162,7 @@ async def test_ensure_creates_container_with_env_file_over_stdin_only(svc):
 async def test_ensure_starts_stopped_reuses_running_recreates_on_new_key_and_requires_setup(svc):
     agent = await svc.agent(AGENT)
     stopped = FakeConn('false key1 sha256:base ' + CONFIG)
+    stopped.volumes = {f'ws-home-{AGENT}': SRC}
     await svc.ensure_agent_shell(stopped, agent, 'key1', 'u', 't')
     assert stopped.commands[-1] == f'sudo -n docker start ws-{AGENT}' and not stopped.inputs
     running = FakeConn('true key1 sha256:base ' + CONFIG)
@@ -282,7 +283,8 @@ def test_storage_settings_validate_and_need_platform_admin(svc):
 
 IMG = f'/var/lib/dirigentenstab-shells/homes/{AGENT}.img'
 MNT = f'/var/lib/dirigentenstab-shells/homes/{AGENT}.mnt'
-BIND = f'--driver local --opt type=none --opt o=bind --opt device={MNT}'
+SRC = MNT + '/.dshome'  # bind source inside the filesystem: an unmounted image leaves it missing
+BIND = f'--driver local --opt type=none --opt o=bind --opt device={SRC}'
 
 
 async def test_new_home_is_a_sparse_ext4_image_owned_by_the_remapped_dev_user(svc, agent):
@@ -324,7 +326,7 @@ async def test_plain_volume_is_copied_before_the_old_one_is_removed(svc, agent):
     recreate = max(i for i, c in enumerate(cmds) if 'docker volume create' in c)
     assert copy < old_rm < recreate < index('docker run -d')
     assert f'sudo -n mv -f {IMG}.new {IMG}' in cmds and cmds.index(f'sudo -n mv -f {IMG}.new {IMG}') < old_rm
-    assert f'device={MNT} ws-home-{AGENT}' in cmds[recreate]
+    assert f'device={SRC} ws-home-{AGENT}' in cmds[recreate]
 
 
 async def test_failed_copy_keeps_the_old_volume(svc, agent):
@@ -348,19 +350,20 @@ async def test_migration_resumes_when_only_the_image_is_left(svc, agent):
 async def test_home_grows_on_recreation_and_never_shrinks(svc, agent):
     svc.save_agent_shell_storage(OWNER, True, 8)
     conn = FakeConn()
-    conn.volumes, conn.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
+    conn.volumes, conn.files = {f'ws-home-{AGENT}': SRC}, {IMG: 5 << 30}
     await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
     cmds = conn.commands
     grow = [cmds.index(c) for c in (f'sudo -n truncate -s 8G {IMG}', f'sudo -n e2fsck -fy {IMG}', f'sudo -n resize2fs {IMG}')]
     assert grow == sorted(grow) and grow[-1] < next(i for i, c in enumerate(cmds) if 'docker run -d' in c)
     assert not any('volume create' in c or 'mkfs' in c for c in cmds)
+    assert any('mountpoint' in c and 'mount "$1"' in c for c in cmds)
     svc.save_agent_shell_storage(OWNER, True, 2)
     smaller = FakeConn()
-    smaller.volumes, smaller.files = {f'ws-home-{AGENT}': MNT}, {IMG: 8 << 30}
+    smaller.volumes, smaller.files = {f'ws-home-{AGENT}': SRC}, {IMG: 8 << 30}
     await svc.ensure_agent_shell(smaller, agent, 'key1', 'u', 't')
     assert not any('truncate' in c or 'resize2fs' in c for c in smaller.commands)
     failing = FakeConn()
-    failing.volumes, failing.files, failing.fail = {f'ws-home-{AGENT}': MNT}, {IMG: 1 << 30}, ('resize2fs',)
+    failing.volumes, failing.files, failing.fail = {f'ws-home-{AGENT}': SRC}, {IMG: 1 << 30}, ('resize2fs',)
     with pytest.raises(RuntimeError, match='Could not resize'):
         await svc.ensure_agent_shell(failing, agent, 'key1', 'u', 't')
     assert f'sudo -n truncate -s {1 << 30} {IMG}' in failing.commands  # rolled back
@@ -488,3 +491,61 @@ def test_mods_one_shot_double_tap_lock():
     m.tap('Alt', 30)
     m.tap('Alt', 30.5)  # too slow: unarms
     assert m.state['Alt'] == 'off'
+
+
+def is_mount(command):
+    return command.startswith('sudo -n sh -c') and 'mountpoint -q' in command and 'mount "$1"' in command
+
+
+async def test_home_directory_is_created_after_every_mount_and_before_the_volume_binds(svc, agent):
+    conn = FakeConn()
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    cmds = conn.commands
+    mount = next(i for i, c in enumerate(cmds) if is_mount(c))
+    prepare = next(i for i, c in enumerate(cmds) if '.dshome.tmp' in c and c.endswith(MNT))
+    assert 'lost+found' in cmds[prepare] and '[ -d "$d" ]' in cmds[prepare]  # idempotent, skips lost+found
+    assert mount < prepare < next(i for i, c in enumerate(cmds) if 'docker volume create' in c) < next(
+        i for i, c in enumerate(cmds) if 'docker run -d' in c)
+
+
+async def test_first_layout_volume_bound_to_the_root_is_replaced_by_the_subdirectory_volume(svc, agent):
+    conn = FakeConn()
+    conn.volumes, conn.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    cmds = conn.commands
+    assert cmds.index(f'sudo -n docker volume rm ws-home-{AGENT}') < next(i for i, c in enumerate(cmds) if f'device={SRC}' in c)
+
+
+async def test_stopped_container_gets_its_mount_back_before_docker_starts_it(svc, agent):
+    stopped = FakeConn('false key1 sha256:base ' + CONFIG)
+    stopped.volumes = {f'ws-home-{AGENT}': SRC}
+    await svc.ensure_agent_shell(stopped, agent, 'key1', 'u', 't')
+    cmds = stopped.commands
+    mount = next(i for i, c in enumerate(cmds) if is_mount(c))
+    assert mount < cmds.index(f'sudo -n docker start ws-{AGENT}')
+    assert any('.dshome.tmp' in c for c in cmds[mount:])
+    running = FakeConn('true key1 sha256:base ' + CONFIG)  # nothing to mount for a container that is already running
+    await svc.ensure_agent_shell(running, agent, 'key1', 'u', 't')
+    assert not any(is_mount(c) for c in running.commands)
+    broken = FakeConn('false key1 sha256:base ' + CONFIG)
+    broken.volumes = {f'ws-home-{AGENT}': SRC}
+    broken.fail = ('mount "$1"',)
+    with pytest.raises(RuntimeError, match='Could not mount the home image'):
+        await svc.ensure_agent_shell(broken, agent, 'key1', 'u', 't')
+    assert f'sudo -n docker start ws-{AGENT}' not in broken.commands  # fails closed: never starts on a bare mount point
+
+
+async def test_stopped_container_on_a_legacy_home_is_recreated_and_migrated(svc, agent):
+    legacy = FakeConn('false key1 sha256:base ' + CONFIG)
+    legacy.volumes, legacy.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
+    await svc.ensure_agent_shell(legacy, agent, 'key1', 'u', 't')
+    cmds = legacy.commands
+    assert f'sudo -n docker rm -f ws-{AGENT}' in cmds and f'sudo -n docker volume rm ws-home-{AGENT}' in cmds
+    assert cmds.index(f'sudo -n docker rm -f ws-{AGENT}') < next(i for i, c in enumerate(cmds) if '.dshome.tmp' in c)
+
+
+async def test_second_ensure_on_a_migrated_home_changes_nothing(svc, agent):
+    conn = FakeConn()
+    conn.volumes, conn.files = {f'ws-home-{AGENT}': SRC}, {IMG: 5 << 30}
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    assert not any('volume create' in c or 'volume rm' in c or 'mkfs' in c for c in conn.commands)

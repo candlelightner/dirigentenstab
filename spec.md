@@ -387,7 +387,7 @@ current compaction settings.
   discarded, then is re-linked; configs and histories stay per agent. Two containers refreshing one OAuth
   token at the same moment can log it out; logging in again fixes it. Single human owner: every agent shares the owner's logins.
   Home: each agent's home is a fixed-size sparse ext4 image `/var/lib/dirigentenstab-shells/homes/<agent id>.img` loop-mounted by the hub
-  (fstab entry, mount point `<agent id>.mnt`; Docker's local driver cannot loop-mount) and exposed as the bind volume `ws-home-<agent id>` (Platform settings -> Agent shell home size, GiB, default 5, 1 to 50). A phase-1 plain volume is
+  (fstab entry, mount point `<agent id>.mnt`; Docker's local driver cannot loop-mount) and exposed, through its `.dshome` directory inside the filesystem, as the bind volume `ws-home-<agent id>` (an unmounted image fails closed: the container does not start; the hub remounts before every start) (Platform settings -> Agent shell home size, GiB, default 5, 1 to 50). A phase-1 plain volume is
   copied into an image and replaced only after the copy succeeded. A larger setting grows the image
   (`e2fsck`, `resize2fs`) when the container is next recreated; homes never shrink. Under userns-remap the image root is
   formatted owned by the remapped uid 1000. On touch or narrow screens a key
