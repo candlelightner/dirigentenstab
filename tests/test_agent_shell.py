@@ -281,6 +281,8 @@ def test_storage_settings_validate_and_need_platform_admin(svc):
 
 
 IMG = f'/var/lib/dirigentenstab-shells/homes/{AGENT}.img'
+MNT = f'/var/lib/dirigentenstab-shells/homes/{AGENT}.mnt'
+BIND = f'--driver local --opt type=none --opt o=bind --opt device={MNT}'
 
 
 async def test_new_home_is_a_sparse_ext4_image_owned_by_the_remapped_dev_user(svc, agent):
@@ -291,7 +293,8 @@ async def test_new_home_is_a_sparse_ext4_image_owned_by_the_remapped_dev_user(sv
     steps = [next(i for i, c in enumerate(cmds) if marker in c) for marker in (
         f'truncate -s 5G {IMG}', 'mkfs.ext4 -q -F -E root_owner=101000:101000 ' + IMG, 'docker volume create', 'docker run -d')]
     assert steps == sorted(steps)
-    assert (f'sudo -n docker volume create --driver local --opt type=ext4 --opt device={IMG} --opt o=loop ws-home-{AGENT}') in cmds
+    assert f'sudo -n docker volume create {BIND} ws-home-{AGENT}' in cmds
+    assert any(c.startswith('sudo -n sh -c') and 'loop,nofail' in c and c.endswith(f'{IMG} {MNT}') for c in cmds)
     assert f'sudo -n chmod 600 {IMG}' in cmds
 
 
@@ -321,7 +324,7 @@ async def test_plain_volume_is_copied_before_the_old_one_is_removed(svc, agent):
     recreate = max(i for i, c in enumerate(cmds) if 'docker volume create' in c)
     assert copy < old_rm < recreate < index('docker run -d')
     assert f'sudo -n mv -f {IMG}.new {IMG}' in cmds and cmds.index(f'sudo -n mv -f {IMG}.new {IMG}') < old_rm
-    assert f'device={IMG} --opt o=loop ws-home-{AGENT}' in cmds[recreate]
+    assert f'device={MNT} ws-home-{AGENT}' in cmds[recreate]
 
 
 async def test_failed_copy_keeps_the_old_volume(svc, agent):
@@ -345,7 +348,7 @@ async def test_migration_resumes_when_only_the_image_is_left(svc, agent):
 async def test_home_grows_on_recreation_and_never_shrinks(svc, agent):
     svc.save_agent_shell_storage(OWNER, True, 8)
     conn = FakeConn()
-    conn.volumes, conn.files = {f'ws-home-{AGENT}': IMG}, {IMG: 5 << 30}
+    conn.volumes, conn.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
     await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
     cmds = conn.commands
     grow = [cmds.index(c) for c in (f'sudo -n truncate -s 8G {IMG}', f'sudo -n e2fsck -fy {IMG}', f'sudo -n resize2fs {IMG}')]
@@ -353,11 +356,11 @@ async def test_home_grows_on_recreation_and_never_shrinks(svc, agent):
     assert not any('volume create' in c or 'mkfs' in c for c in cmds)
     svc.save_agent_shell_storage(OWNER, True, 2)
     smaller = FakeConn()
-    smaller.volumes, smaller.files = {f'ws-home-{AGENT}': IMG}, {IMG: 8 << 30}
+    smaller.volumes, smaller.files = {f'ws-home-{AGENT}': MNT}, {IMG: 8 << 30}
     await svc.ensure_agent_shell(smaller, agent, 'key1', 'u', 't')
     assert not any('truncate' in c or 'resize2fs' in c for c in smaller.commands)
     failing = FakeConn()
-    failing.volumes, failing.files, failing.fail = {f'ws-home-{AGENT}': IMG}, {IMG: 1 << 30}, ('resize2fs',)
+    failing.volumes, failing.files, failing.fail = {f'ws-home-{AGENT}': MNT}, {IMG: 1 << 30}, ('resize2fs',)
     with pytest.raises(RuntimeError, match='Could not resize'):
         await svc.ensure_agent_shell(failing, agent, 'key1', 'u', 't')
     assert f'sudo -n truncate -s {1 << 30} {IMG}' in failing.commands  # rolled back

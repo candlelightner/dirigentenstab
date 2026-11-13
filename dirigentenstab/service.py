@@ -1854,7 +1854,7 @@ class Service:
             progress('Not exported to the shell (reserved name or multi-line value): ' + ', '.join(skipped))
 
     async def _ensure_shell_home(self, docker, agent_id, gib, progress):
-        """Give the agent a fixed-size ext4 home (sparse image behind a loop-mounted local volume). Container must be removed.
+        """Give the agent a fixed-size ext4 home (sparse image, loop-mounted by the hub and exposed as a bind volume). Container must be removed.
 
         Plain phase-1 volumes are copied into a new image first and replaced only after the copy succeeded; a larger
         setting grows the image offline, never shrinks it.
@@ -1884,23 +1884,33 @@ class Service:
                 await docker('rm', '-f', path, run=True)
                 raise
 
-        async def attach(name, path):
-            await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=ext4', '--opt', f'device={path}',
-                       '--opt', 'o=loop', name, what='Could not create the home volume')
+        mnt = f'{SHELL_HOMES}/{agent_id}.mnt'
+
+        async def mount(path, where, persist):  # Docker's local driver cannot loop-mount: the hub mounts, the volume binds
+            await host('install', '-d', where, what='Could not create the home mount point')
+            await host('sh', '-c', 'mountpoint -q "$1" || { '
+                       + ('grep -qsF " $1 " /etc/fstab || echo "$0 $1 ext4 loop,nofail 0 0" >> /etc/fstab; mount "$1"; '
+                          if persist else 'mount -o loop "$0" "$1"; ') + '}', path, where, what='Could not mount the home image')
+
+        async def unmount(where):
+            await host('sh', '-c', '! mountpoint -q "$0" || umount "$0"', where, what='Could not unmount the home image')
+
+        async def attach(name):
+            await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
+                       '--opt', f'device={mnt}', name, what='Could not create the home volume')
 
         found = await docker('volume', 'inspect', '-f', '{{index .Options "device"}}', volume)
         device = found.stdout.strip() if not found.returncode else None
-        if device is not None and device not in {img, '', '<no value>', '<nil>'}:
+        if device is not None and device not in {mnt, '', '<no value>', '<nil>'}:
             raise RuntimeError(f'Home volume {volume} uses an unexpected device')
-        if device == img or device is None:
+        if device == mnt or device is None:
             if (await docker('test', '-f', img, run=True)).returncode:
                 await make(img)
-            if device is None:
-                await attach(volume, img)
             have = int((await host('stat', '-c', '%s', img, what='Could not inspect the home image')).stdout.strip() or 0)
             if have < gib << 30:  # grow only, offline
                 progress('Growing home…')
                 try:
+                    await unmount(mnt)
                     await host('truncate', '-s', size, img, what='Could not grow the home image')
                     if (await docker('e2fsck', '-fy', img, run=True)).returncode > 1:
                         raise RuntimeError('Home filesystem check failed')
@@ -1908,24 +1918,33 @@ class Service:
                 except BaseException:
                     await docker('truncate', '-s', str(have), img, run=True)
                     raise
+            await mount(img, mnt, True)  # also after a host reboot that dropped the mount
+            if device is None:
+                await attach(volume)
             return
         progress('Migrating home to a size-limited volume…')
-        staging = volume + '-new'
+        staging, scratch = volume + '-new', mnt + '.new'
         await docker('volume', 'rm', staging)
         await make(tmp)
         try:
-            await attach(staging, tmp)
+            await mount(tmp, scratch, False)
+            await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
+                       '--opt', f'device={scratch}', staging, what='Could not create the home volume')
             await host('docker', 'run', '--rm', '--network', 'none', '--user', '0', '--entrypoint', 'cp',
                        '-v', f'{volume}:/from', '-v', f'{staging}:/to', SHELL_IMAGE, '-a', '/from/.', '/to/',
                        what='Could not copy the old home')
         except BaseException:
             await docker('volume', 'rm', staging)
+            await docker('sh', '-c', '! mountpoint -q "$0" || umount "$0"', scratch, run=True)
             await docker('rm', '-f', tmp, run=True)
             raise
         await host('docker', 'volume', 'rm', staging, what='Could not finish the home migration')
+        await unmount(scratch)
+        await host('rmdir', scratch, what='Could not finish the home migration')
         await host('mv', '-f', tmp, img, what='Could not finish the home migration')
         await host('docker', 'volume', 'rm', volume, what='Could not replace the old home volume')  # only after the copy succeeded
-        await attach(volume, img)
+        await mount(img, mnt, True)
+        await attach(volume)
 
     async def _prune_shell_images(self, docker, agent_id, keep):
         """Remove this agent's other derived tags once the container no longer uses them."""
