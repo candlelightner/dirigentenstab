@@ -113,7 +113,7 @@ async def test_tools_list_matches_agent_enablement_and_excludes_pause_and_remote
     names = {t['name'] for t in (await rpc(e, token, 'tools/list')).json()['result']['tools']}
     assert {'execute_api', 'search_api', 'describe_api', 'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file',
             'list_skills', 'get_skill', 'save_skill', 'share_skill', 'configure_agent', 'create_subgroup',
-            'request_escalation', 'platform_status', 'recover_operation', 'execution_state'} <= names
+            'request_escalation', 'platform_status', 'recover_operation', 'execution_state', 'get_shell_image', 'set_shell_image'} <= names
     assert 'pause_work' not in names
     e.store.execute('UPDATE agents SET escalation_requests_enabled=0 WHERE id=?', ('child',))
     names = {t['name'] for t in (await rpc(e, token, 'tools/list')).json()['result']['tools']}

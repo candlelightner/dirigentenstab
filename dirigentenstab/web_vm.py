@@ -196,7 +196,7 @@ def setup_vm(ctx):
         try:
             current = await actor()
             if state.get('terminal_agent'):
-                conn, command = await service.open_agent_shell(current, vm_id)
+                conn, command = await service.open_agent_shell(current, vm_id, ctx.terminal_status.set_text)
                 vm = {'name': vm_name}
             else:
                 conn, vm = await service.open_vm_terminal_connection(current, vm_id)

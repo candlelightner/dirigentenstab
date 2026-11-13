@@ -613,7 +613,7 @@ class Runtime:
                 raise ConfigurationChanged()
             await self.service.authorize(identity, agent_id)
             tool = operation.__name__
-            read_only = (tool in {'search_api', 'describe_api', 'recover_operation', 'list_skills', 'get_skill', 'platform_status'} or
+            read_only = (tool in {'search_api', 'describe_api', 'recover_operation', 'list_skills', 'get_skill', 'platform_status', 'get_shell_image'} or
                          tool == 'configure_agent' and args[2] is None or
                          tool == 'execute' and args[1].startswith(('list', 'get', 'query')))
             invocation_key = [agent_id, tool, args, kwargs]
@@ -691,6 +691,7 @@ class Runtime:
                           'Use managed=True on createTemplate for private-template recovery. '
                           'Use managed=False for unchanged native API parameters, including custom userdata/public templates. '
                           'Use run_vm_command for enrolled guest execution. '
+                          'set_shell_image edits a terminal container image spec (yours or a descendant\'s). '
                           'To let a harness in a VM use your tools, put {{mcp_key}} (token), {{mcp_url}} and {{mcp_hosts}} (an /etc/hosts line for the hub name, when guest DNS cannot resolve it) in run_vm_command env or write_vm_secret_file content; you never see the token. '
                           'After a placement or start failure (No destination found, insufficient capacity, host errors) call platform_status before retrying; if a host is not Up, wait or report instead of retrying. '
                           'After interruption or a lost response, inspect actual infrastructure state before retrying uncertain actions. '
@@ -928,6 +929,26 @@ class Runtime:
             Edit your own prompt or a descendant; your own edits may only set instructions. Never assign work.
             """
             return await invoke(self.service.configure_agent, agent_id, target_agent_id, settings)
+
+        @agent.tool(sequential=True)
+        async def set_shell_image(ctx: RunContext, reason: str = '', target_agent_id: str | None = None, harnesses: list[str] | None = None,
+                                  apt: list[str] | None = None, apt_repos: list[dict] | None = None, npm: list[str] | None = None,
+                                  pip: list[str] | None = None, urls: list[dict] | None = None) -> dict:
+            """Edit the terminal container image spec of yourself or a descendant (target_agent_id); each list replaces that field.
+            No approval: harnesses (gemini, qwen, aider), apt (Ubuntu names), removals. New apt_repos {name,uri,suite,components,key_url},
+            npm, pip, urls {name,url} (https only) queue one owner request; give a reason."""
+            changes = {key: value for key, value in (('harnesses', harnesses), ('apt', apt), ('apt_repos', apt_repos), ('npm', npm),
+                                                    ('pip', pip), ('urls', urls)) if value is not None}
+
+            async def set_shell_image(acting_agent, target, selected, explanation):
+                return await self.service.set_shell_image(acting_agent, target, selected, explanation, conversation_id=conversation_id,
+                                                          run_id=budget['operation_id'], call_id=ctx.tool_call_id)
+            return await invoke(set_shell_image, agent_id, target_agent_id, changes, reason, call_id=ctx.tool_call_id)
+
+        @agent.tool_plain(sequential=True)
+        async def get_shell_image(target_agent_id: str | None = None) -> dict:
+            """Read the effective terminal image spec, its source (own, inherited, default) and pending requests."""
+            return await invoke(self.service.get_shell_image, agent_id, target_agent_id)
 
         if not export:
             @agent.tool_plain(sequential=True)

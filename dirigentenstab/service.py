@@ -21,6 +21,7 @@ from .headers import validate_headers
 from .settings import endpoint, dashboard_endpoint
 from .diagnostics import OperationError
 from .hierarchy import validate_child
+from . import shell_image
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .auth import NATIVE_POLL_SECONDS
 from .gpu import FLAGS, GPU_COMMANDS, GPU_CONTEXT, effective_policy, helper_call, policy_gain, validate_policy
@@ -34,6 +35,7 @@ SECRET_PLACEHOLDER = re.compile(r'\{\{secret:([A-Za-z_][A-Za-z0-9_]{0,63})\}\}')
 SHELL_IMAGE, SHELL_NETWORK, SHELL_ENV_DIR = 'dirigentenstab-shell:latest', 'dirigentenstab-shells', '/var/lib/dirigentenstab-shells'
 SHELL_HOST_OWNERS = (APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT)  # a lower agent must not redirect other agents' keys into a VM it controls
 SHELL_TAG = 'dirigentenstab-agent-shell-host'
+SHELL_BUILD_SECONDS, SHELL_ERROR_CHARS = 900, 600
 SHELL_AGENT = re.compile(r'[A-Za-z0-9_-]{1,64}')
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
@@ -112,6 +114,7 @@ class Service:
         self._clients = {}
         self._provision_lock = asyncio.Lock()
         self._deploy_lock = asyncio.Lock()
+        self._shell_locks = {}
         self._secrets = set()
         self._terminal_sessions = {}
         self._visible_domains = {}
@@ -349,7 +352,7 @@ class Service:
                 'secret_names': sorted(await self.effective_secrets(agent)),
                 'tools': ['search_api', 'describe_api', 'execute_api', 'create_subgroup',
                           'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file', 'configure_agent',
-                          'list_skills', 'get_skill', 'save_skill', 'share_skill']
+                          'list_skills', 'get_skill', 'save_skill', 'share_skill', 'get_shell_image', 'set_shell_image']
                          + (['request_escalation', 'request_skill_global', 'remove_skill'] + (['request_gpu_profiles', 'request_gpu_devices'] if getattr(self.settings, 'gpu_helper_socket', '') else [])
                             if (await self.escalation_access(agent))['enabled'] else []),
                 'owner_ssh_public_key': owner_key,
@@ -516,6 +519,82 @@ class Service:
         params = {'uuids': sorted({str(uuid.UUID(u)) for u in uuids})}
         return await self.request_escalation(agent_id, 'Assign GPU devices to this agent: ' + ', '.join(params['uuids']),
                                              reason, 'assignGpuDevices', params, **context)
+
+    async def _shell_target(self, actor_id, target_id):
+        """The target agent when the actor is it, Global Admin or one of its ancestors (same rule as configure_agent)."""
+        target = await self.authorize(await self.execution_identity(actor_id, actor_id), target_id)
+        if actor_id != target_id and actor_id != GLOBAL_ADMIN_AGENT:
+            if actor_id not in {member['id'] for member in (await self.agent_chain(target))[:-1]}:
+                raise PermissionError('Only the agent itself or an ancestor may manage a shell image')
+        return target
+
+    async def shell_image_view(self, agent):
+        """Effective spec (own, else nearest ancestor's, else empty), where it comes from, and pending approval requests."""
+        own = None
+        for member in reversed(await self.agent_chain(agent)):  # nearest first
+            raw = self.store.one('SELECT shell_image FROM agents WHERE id=?', (member['id'],))['shell_image']
+            if raw:
+                own = (member, json.loads(raw))
+                break
+        source = ('default' if not own else 'own' if own[0]['id'] == agent['id'] else 'inherited')
+        pending = []
+        for row in self.store.all("SELECT id,agent_id,description,params,created FROM escalation_requests "
+                                  "WHERE command='setShellImage' AND status='pending'"):
+            params = self.store.open(row['params'])
+            if params['agent_id'] == agent['id']:
+                pending.append({'request_id': row['id'], 'requested_by': row['agent_id'], 'description': row['description'],
+                                'additions': params['additions'], 'rendered': params['rendered']})
+        return {'spec': own[1] if own else {}, 'source': source, 'from': {'id': own[0]['id'], 'name': own[0]['name']} if own else None,
+                'pending': pending}
+
+    async def shell_spec(self, agent):
+        return (await self.shell_image_view(agent))['spec']
+
+    def _write_shell_spec(self, agent_id, spec):
+        self.store.execute('UPDATE agents SET shell_image=? WHERE id=?', (json.dumps(spec, sort_keys=True) if spec else None, agent_id))
+
+    async def get_shell_image(self, actor_id, target_id=None):
+        return await self.shell_image_view(await self._shell_target(actor_id, target_id or actor_id))
+
+    async def set_shell_image(self, actor_id, target_id, changes, reason='', **context):
+        """Apply approval-free changes now; queue one escalation for new apt_repos/npm/pip/urls entries.
+
+        `changes` maps fields to their desired final lists. Removals and harness/apt edits apply immediately.
+        """
+        target = await self._shell_target(actor_id, target_id or actor_id)
+        wanted = shell_image.normalize(changes)
+        if not changes:
+            raise ValueError('Supply at least one of: ' + ', '.join(shell_image.FIELDS))
+        view = await self.shell_image_view(target)
+        base = view['spec']
+        additions = shell_image.missing(wanted, base)
+        if additions and not (isinstance(reason, str) and reason.strip()):
+            raise ValueError('Supply a reason: apt_repos, npm, pip and urls additions need owner approval')
+        new = dict(base)
+        for field in changes:
+            new.pop(field, None)
+            kept = [i for i in wanted.get(field, []) if field not in additions or i not in additions[field]]
+            if kept:
+                new[field] = kept
+        if new != base:
+            self._write_shell_spec(target['id'], new)
+            self.store.audit(actor_id, 'set-shell-image', target['id'])
+        request = None
+        if additions:
+            row = await self.request_escalation(
+                actor_id, ('Shell image of ' + target['name'] + ' - add ' + shell_image.describe(additions))[:500], reason, 'setShellImage',
+                {'agent_id': target['id'], 'additions': additions, 'rendered': shell_image.steps(additions, False)}, **context)
+            request = {'request_id': row['id'], 'status': row['status']}
+        return {'spec': new, 'applied': new != base, 'request': request}
+
+    def save_shell_image(self, identity, agent_id, spec):
+        """Owner edit: no approval. A spec with no entries clears the agent's own spec so it inherits again."""
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Only the platform administrator edits a shell image directly')
+        if not self.store.one('SELECT 1 FROM agents WHERE id=? AND enabled=1', (agent_id,)):
+            raise PermissionError('Agent is unavailable')
+        self._write_shell_spec(agent_id, shell_image.normalize(spec))
+        self.store.audit(identity['userid'], 'save-shell-image', agent_id)
 
     async def gpu_assign_devices(self, identity, agent, uuids):
         owners = {p['uuid']: p['domain_id'] for p in (await self.gpu_admin(identity))['pools']}
@@ -1261,6 +1340,13 @@ class Service:
             if (not isinstance(ids, list) or not 1 <= len(ids) <= 16 or ids != sorted(set(ids))
                     or not all(isinstance(u, str) and len(u) == 36 and str(uuid.UUID(u)) == u for u in ids)):
                 raise ValueError('Name 1-16 unique sorted canonical host GPU device UUIDs')
+        elif command == 'setShellImage':
+            if not isinstance(params, dict) or set(params) != {'agent_id', 'additions', 'rendered'} or not isinstance(params['agent_id'], str):
+                raise ValueError('Invalid shell image request')
+            await self._shell_target(agent_id, params['agent_id'])
+            additions = shell_image.normalize(params['additions'])
+            if not additions or set(additions) - set(shell_image.APPROVAL_FIELDS) or params['rendered'] != shell_image.steps(additions, False):
+                raise ValueError('Request only owner-approval fields with their exact rendered steps')
         else:
             validate(None, params)
         if len(json.dumps(params)) > (400000 if command in {'shareSkillGlobally', 'removeSkill'} else 65536):
@@ -1340,6 +1426,26 @@ class Service:
                                    (status, self.store.seal(self.redact(result)), time.time(), request_id))
             else:
                 self.store.execute('UPDATE escalation_requests SET status=?,updated=? WHERE id=?', (status, time.time(), request_id))
+            self.store.audit(current['userid'], 'decide-escalation', request_id, status)
+            return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
+        if command == 'setShellImage':
+            if not self.store.execute("UPDATE escalation_requests SET status=?,updated=? WHERE id=? AND status='pending'",
+                                      ('applying' if approve else 'deferred', time.time(), request_id)):
+                return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
+            status, result = 'deferred', None
+            if approve:
+                try:
+                    if not (await self.escalation_access(agent))['enabled']:
+                        raise PermissionError('Escalation requests are disabled by this agent or an ancestor')
+                    target = await self._shell_target(row['agent_id'], params['agent_id'])
+                    await self.authorize(current, target['id'])
+                    spec = shell_image.merge(await self.shell_spec(target), shell_image.normalize(params['additions']))
+                    self._write_shell_spec(target['id'], spec)
+                    status, result = 'approved', {'agent_id': target['id'], 'spec': spec}
+                except Exception as exc:
+                    status, result = 'failed', {'error': self.redact(str(exc))}
+                self.store.execute('UPDATE escalation_requests SET result=? WHERE id=?', (self.store.seal(self.redact(result)), request_id))
+            self.store.execute('UPDATE escalation_requests SET status=?,updated=? WHERE id=?', (status, time.time(), request_id))
             self.store.audit(current['userid'], 'decide-escalation', request_id, status)
             return self._escalation_request(self.store.one('SELECT * FROM escalation_requests WHERE id=?', (request_id,)))
         if command in {'shareSkillGlobally', 'removeSkill'}:
@@ -1603,7 +1709,7 @@ class Service:
         row = self.store.one('SELECT id FROM skills WHERE creator_agent_id=? AND name=?', (APP_ROOT_AGENT, name))
         return await self.save_skill(identity, APP_ROOT_AGENT, name, description, text, row['id'] if row else None)
 
-    async def open_agent_shell(self, identity, agent_id):
+    async def open_agent_shell(self, identity, agent_id, progress=None):
         """Connect to the shell host and ensure the agent's container; returns (connection, fixed exec command).
 
         The hub's managed key runs fixed docker commands only; the human is authorized for the agent, never the host VM.
@@ -1622,27 +1728,60 @@ class Service:
         hosts = await asyncio.to_thread(export_hosts, self)
         conn = await self.ssh_connect(address, record)
         try:
-            await self.ensure_agent_shell(conn, agent, key_id, f'{export_url(self)}/{agent_id}', token, hosts)
+            await self.ensure_agent_shell(conn, agent, key_id, f'{export_url(self)}/{agent_id}', token, hosts, progress)
         except BaseException:
             conn.close()
             raise
         return conn, f'sudo -n docker exec -it -u dev -w /home/dev ws-{agent_id} bash -l'
 
-    async def ensure_agent_shell(self, conn, agent, key_id, url, token, hosts=''):
-        """Idempotently create or start the agent's container; the token travels only over SSH stdin into a root-only file."""
+    async def ensure_agent_shell(self, conn, agent, key_id, url, token, hosts='', progress=None):
+        """Idempotently build the agent's image, create or start its container; the token travels only over SSH stdin.
+
+        One lock per agent so two tabs never build or create twice. A container whose image differs from the expected
+        one (spec change, base rebuild) is recreated; the home volume stays.
+        """
+        lock = self._shell_locks.setdefault(agent['id'], asyncio.Lock())
+        if lock.locked() and progress:
+            progress('Waiting for another build of this agent image…')
+        async with lock:
+            await self._ensure_agent_shell(conn, agent, key_id, url, token, hosts, progress or (lambda text: None))
+
+    async def _ensure_agent_shell(self, conn, agent, key_id, url, token, hosts, progress):
         async def docker(*args, run=False, input=None):
             command = 'sudo -n ' + ' '.join(shlex.quote(a) for a in (args if run else ('docker', *args)))
             return await conn.run(command, input=input, check=False)
-        for kind, ref in (('image', SHELL_IMAGE), ('network', SHELL_NETWORK)):
-            if (await docker(kind, 'inspect', ref)).returncode:
-                raise RuntimeError('Agent shell host is not set up: run the agent-shell-host skill')
+        base = await docker('image', 'inspect', '-f', '{{.Id}}', SHELL_IMAGE)
+        if base.returncode or (await docker('network', 'inspect', SHELL_NETWORK)).returncode:
+            raise RuntimeError('Agent shell host is not set up: run the agent-shell-host skill')
+        dockerfile = shell_image.render(await self.shell_spec(agent))
+        image = SHELL_IMAGE
+        image_id = base.stdout.strip()
+        built = False
+        if dockerfile:
+            image = shell_image.tag(agent['id'], dockerfile, image_id)
+            found = await docker('image', 'inspect', '-f', '{{.Id}}', image)
+            if found.returncode:
+                progress('Building image…')
+                try:
+                    async with asyncio.timeout(SHELL_BUILD_SECONDS):
+                        result = await docker('timeout', str(SHELL_BUILD_SECONDS), 'docker', 'build', '-t', image, '-', run=True, input=dockerfile)
+                except Exception as exc:  # timeout and connection loss
+                    raise RuntimeError(f'Image build failed or timed out after {SHELL_BUILD_SECONDS // 60} minutes: {exc}'[:300]) from exc
+                if result.returncode:
+                    raise RuntimeError('Image build failed: ' + ((result.stderr or result.stdout or '').strip()[-SHELL_ERROR_CHARS:]))
+                found = await docker('image', 'inspect', '-f', '{{.Id}}', image)
+                built = True
+            image_id = found.stdout.strip()
+        progress('Starting container…')
         name, env_file = 'ws-' + agent['id'], f"{SHELL_ENV_DIR}/{agent['id']}.env"
-        inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}}'
+        inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}} {{.Image}}'
         found = await docker('inspect', '-f', inspect_format, name)
         state = found.stdout.split() if not found.returncode else None
-        if state and state[1:] == [key_id]:  # a revoked or replaced key falls through to recreation
+        if state and state[1:2] == [key_id] and state[2:3] == [image_id]:  # a revoked key or a new image falls through to recreation
             if state[0] != 'true' and (started := await docker('start', name)).returncode:
                 raise RuntimeError('Could not start the agent shell: ' + (started.stderr or '').strip()[:200])
+            if built:
+                await self._prune_shell_images(docker, agent['id'], image)
             return
         if state:
             await docker('rm', '-f', name)
@@ -1653,16 +1792,24 @@ class Service:
         created = written if written.returncode else await docker(
             'run', '-d', '--name', name, '--hostname', slug, '--restart', 'unless-stopped', '--network', SHELL_NETWORK,
             '--label', 'dirigentenstab.key=' + key_id, '--env-file', env_file, '-v', f"ws-home-{agent['id']}:/home/dev",
-            *(['--add-host', f'{host}:{address}'] if host else []), SHELL_IMAGE)
+            *(['--add-host', f'{host}:{address}'] if host else []), image)
         if created.returncode and not written.returncode:  # a concurrent open may have created it first
             again = await docker('inspect', '-f', inspect_format, name)
             state = again.stdout.split() if not again.returncode else None
-            if state and state[1:] == [key_id]:
+            if state and state[1:2] == [key_id]:
                 created = SimpleNamespace(returncode=0, stderr='')
                 if state[0] != 'true':
                     created = await docker('start', name)
         if created.returncode:
             raise RuntimeError('Could not create the agent shell: ' + (created.stderr or '').strip()[:200])
+        await self._prune_shell_images(docker, agent['id'], image)
+
+    async def _prune_shell_images(self, docker, agent_id, keep):
+        """Remove this agent's other derived tags once the container no longer uses them."""
+        listed = await docker('image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', f'dirigentenstab-shell-{agent_id.lower()}')
+        for old in (listed.stdout or '').split():
+            if old != keep and old.startswith(f'dirigentenstab-shell-{agent_id.lower()}:'):
+                await docker('image', 'rm', old)
 
     async def configure_agent(self, actor_id, target_id, settings=None):
         identity = await self.execution_identity(actor_id, actor_id)

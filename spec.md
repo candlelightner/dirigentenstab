@@ -373,6 +373,24 @@ current compaction settings.
   Harness logins are per agent (shared logins are future work). On touch or narrow screens a key
   bar (Esc, Tab, Ctrl and Alt that arm for one key on a tap and lock on a double tap until tapped again, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
   are applied by the server to typed characters and key-bar keys (double tap = within 400 ms, measured server-side).
+- Shell images are a structured per-agent spec (`agents.shell_image`), never Dockerfile text: the hub
+  renders a Dockerfile from a fixed template (`FROM dirigentenstab-shell:latest`, apt repos, one
+  `apt-get install`, npm globals, pipx tools, `/opt/extra` downloads) with every value strictly validated and
+  shell-quoted; there is no free-form `RUN`. Fields: `harnesses` (catalog `gemini`, `qwen`, `aider`, with fixed install
+  commands, added to the base's claude/codex/opencode), `apt` (Ubuntu archive names, at most 50): both need no
+  approval; `apt_repos` (`name`, https `uri`, `suite`, `components`, https `key_url`, rendered with `signed-by`),
+  `npm`, `pip` (pipx, so the package must ship a command) and `urls` (`name`, https `url`, and a required lowercase `sha256`, saved to `/opt/extra/<name>` and verified with `sha256sum -c` during the build, so what the owner approved is what is installed) need owner approval.
+  The effective spec is the agent's own spec if set, else the nearest ancestor's, else empty (the base image). The
+  agent tools `get_shell_image` and `set_shell_image` act on the agent itself or a descendant (Global Admin: any):
+  `set_shell_image` takes the desired final list per field; approval-free fields and all removals apply at once, and
+  new approval-needing entries create exactly one escalation request showing the rendered steps; approval merges them
+  into the target's spec, dismissal changes nothing. The owner edits all fields directly in Configure agent -> Shell image
+  (no approval; clearing everything inherits again). On terminal open the hub builds
+  `dirigentenstab-shell-<agent id>:<hash of Dockerfile and base image id>` on the host (`docker build -` over SSH stdin,
+  no context, 15 minute bound enforced both by the hub and by `timeout 900` on the host, bounded error text; progress "Building image…" shows in the terminal status), serialized
+  per agent; an empty spec uses the base image. A container whose image id differs from the expected one (spec change or
+  rebuilt base) is recreated with its home volume kept, and the agent's older derived tags are pruned. Non-admin agents
+  never get exec into containers; the spec is their only lever.
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.

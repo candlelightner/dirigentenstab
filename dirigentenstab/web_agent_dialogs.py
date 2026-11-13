@@ -1,6 +1,7 @@
 import httpx
 from nicegui import ui
 
+from . import shell_image
 from .diagnostics import diagnose
 from .gpu import FLAG_LABELS, FLAGS, describe_plan
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
@@ -474,6 +475,26 @@ def setup_agent_dialogs(ctx):
             ui.button('MCP tools', icon='extension',
                       on_click=lambda: protect(lambda: mcp_dialog(agent['id']))).props('outline')
 
+            shell_save = None
+            if current.get('type') == 1 and not current.get('_agent_id'):
+                view = await service.shell_image_view(agent)
+                texts = shell_image.to_text(view['spec'])
+                with ui.expansion('Shell image', icon='terminal').classes('w-full').mark('shell-image'):
+                    ui.label({'own': 'Set on this agent.', 'default': 'Default image (nothing added).'}.get(
+                        view['source'], f"Inherited from {(view['from'] or {}).get('name')}.")).classes('text-sm').mark('shell-image-source')
+                    shell_harnesses = ui.select(list(shell_image.HARNESSES), label='Extra harnesses', multiple=True,
+                                                value=view['spec'].get('harnesses', [])).classes('w-full')
+                    shell_fields = {field: ui.textarea(label, value=texts[field]).classes('w-full').props('autogrow').mark('shell-' + field) for field, label in (
+                        ('apt', 'apt packages (Ubuntu, one per line)'), ('apt_repos', 'apt repositories: name uri suite comp1,comp2 key_url'),
+                        ('npm', 'npm global packages'), ('pip', 'pip packages (installed with pipx)'), ('urls', 'downloads: name https-url sha256 (to /opt/extra)'))}
+                    ui.label('Owner edits apply without approval. Clear every field to inherit again. The image rebuilds on the next terminal open.').classes('text-sm text-stone-600')
+                    for pending in view['pending']:
+                        ui.label('Awaiting approval: ' + pending['description']).classes('text-sm break-words')
+
+                def shell_save():
+                    spec = shell_image.from_text(shell_harnesses.value, {f: e.value for f, e in shell_fields.items()})
+                    if spec != view['spec']:
+                        service.save_shell_image(current, agent['id'], spec)
             gpu_save = None
             gpu_loading = bool(current.get('type') == 1 and service.settings.gpu_helper_socket)
             if gpu_loading:
@@ -599,6 +620,8 @@ def setup_agent_dialogs(ctx):
                                context_window=int(window_override.value) if window_override.value is not None else None)
                 if gpu_loading:
                     raise ValueError('GPU settings are still loading')
+                if shell_save:
+                    shell_save()
                 if gpu_save and not await gpu_save():
                     return
                 await service.update_agent(await actor(), agent['id'], provider.value,

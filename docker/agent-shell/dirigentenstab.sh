@@ -20,5 +20,14 @@ if [ -n "$DIRIGENTENSTAB_MCP_URL" ] && [ -n "$DIRIGENTENSTAB_MCP_KEY" ]; then
                 "$HOME/.config/opencode/opencode.json"
         fi
     fi
-    echo "Hub MCP registered. Log in once: claude -> /login, codex login --device-auth, opencode auth login"
+    # gemini and qwen expand $VAR inside settings.json, so only the variable name is stored. aider has no MCP support.
+    for pair in gemini:.gemini qwen:.qwen; do
+        tool=${pair%%:*}; dir="$HOME/${pair#*:}"
+        if command -v "$tool" >/dev/null 2>&1 && ! grep -qs '"dirigentenstab"' "$dir/settings.json"; then
+            mkdir -p "$dir"
+            node -e 'const fs=require("fs"),f=process.argv[1];let c={};try{c=JSON.parse(fs.readFileSync(f))}catch{}
+c.mcpServers={...c.mcpServers,dirigentenstab:{httpUrl:process.env.DIRIGENTENSTAB_MCP_URL,headers:{Authorization:"Bearer $DIRIGENTENSTAB_MCP_KEY"}}};fs.writeFileSync(f,JSON.stringify(c,null,2))' "$dir/settings.json"
+        fi
+    done
+    echo "Hub MCP registered. Log in once: claude -> /login, codex login --device-auth, opencode auth login (gemini, qwen, aider if installed: their own login)"
 fi
