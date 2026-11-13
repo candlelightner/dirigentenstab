@@ -1,0 +1,8 @@
+[Unit]
+Description=Dirigentenstab Firecracker extension worker
+
+[Service]
+ExecStart=/opt/dirigentenstab/firecracker/bin/firecracker.py --worker
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal

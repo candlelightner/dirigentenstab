@@ -1,0 +1,12 @@
+[Unit]
+Description=Dirigentenstab Firecracker extension socket (CloudStack management -> root worker)
+
+[Socket]
+ListenStream=/run/dirigentenstab-firecracker.sock
+SocketUser=root
+SocketGroup=cloud
+SocketMode=0660
+Accept=yes
+
+[Install]
+WantedBy=sockets.target
