@@ -28,6 +28,34 @@ def arrow(final, ctrl, alt):
     return f'\x1b[1;{mod}{final}' if mod > 1 else f'\x1b[{final}'
 
 
+class Mods:
+    """Ctrl/Alt key-bar state: off, armed (next key only) or locked (until tapped again)."""
+    DOUBLE_TAP = 0.4
+
+    def __init__(self):
+        self.state = {'Ctrl': 'off', 'Alt': 'off'}
+        self.tapped = {}
+
+    def tap(self, label, now=None):
+        now = time.monotonic() if now is None else now
+        if self.state[label] == 'off':
+            self.state[label], self.tapped[label] = 'armed', now
+        elif self.state[label] == 'armed' and now - self.tapped[label] <= self.DOUBLE_TAP:
+            self.state[label] = 'locked'
+        else:
+            self.state[label] = 'off'
+
+    def release(self):
+        """Release armed modifiers after a key; returns the labels that changed."""
+        released = [label for label, st in self.state.items() if st == 'armed']
+        for label in released:
+            self.state[label] = 'off'
+        return released
+
+    def active(self, label):
+        return self.state[label] != 'off'
+
+
 class TerminalSession:
     def __init__(self, user_id, vm_id, conn, chan, term):
         self.user_id = user_id
@@ -223,7 +251,7 @@ def setup_vm(ctx):
             ctx.reconnect_btn.enable()
             ctx.disconnect_btn.disable()
 
-    mods = {'Ctrl': False, 'Alt': False}
+    mods = Mods()
 
     def send_input(data):
         if active_session and active_session.chan and not active_session.chan.is_closing():
@@ -237,27 +265,29 @@ def setup_vm(ctx):
         if data is None:
             data = getattr(e, 'args', '')
         if isinstance(data, str):
-            data = modified(data, mods['Ctrl'], mods['Alt'])
+            data = modified(data, mods.active('Ctrl'), mods.active('Alt'))
             release_mods()
         send_input(data)
 
-    def set_mod(label, on):
-        mods[label] = on
+    def show_mod(label):
+        st = mods.state[label]
         button = ctx.key_buttons[label]
-        button.props(f'aria-pressed={str(on).lower()}')
-        button.classes(add='bg-primary text-white') if on else button.classes(remove='bg-primary text-white')
+        button.props(f'aria-pressed={str(st != "off").lower()} data-locked={str(st == "locked").lower()}')
+        button.classes(add='bg-primary text-white') if st != 'off' else button.classes(remove='bg-primary text-white')
+        button.classes(add='underline') if st == 'locked' else button.classes(remove='underline')
 
     def release_mods():
-        for label in mods:
-            if mods[label]:
-                set_mod(label, False)
+        for label in mods.release():
+            show_mod(label)
 
     def press_key(label):
-        if label in mods:  # Ctrl and Alt latch until the next key or until tapped again
-            set_mod(label, not mods[label])
+        if label in mods.state:  # tap arms for one key, double tap locks, tap again unlocks
+            mods.tap(label)
+            show_mod(label)
             return
         data = next(data for key, _, data in KEYS if key == label)
-        send_input(arrow(data, mods['Ctrl'], mods['Alt']) if label in ARROWS else modified(data, mods['Ctrl'], mods['Alt']))
+        ctrl, alt = mods.active('Ctrl'), mods.active('Alt')
+        send_input(arrow(data, ctrl, alt) if label in ARROWS else modified(data, ctrl, alt))
         release_mods()
     ctx.press_key = press_key
 

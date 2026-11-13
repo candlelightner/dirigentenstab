@@ -7,7 +7,7 @@ from dirigentenstab import mcp_export
 from dirigentenstab.limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT
 from dirigentenstab.service import SHELL_TAG, Service
 from dirigentenstab.store import Store
-from dirigentenstab.web_vm import arrow, modified
+from dirigentenstab.web_vm import Mods, arrow, modified
 
 OWNER = {'userid': 'owner', 'type': 1}
 AGENT = 'a' * 32
@@ -198,3 +198,20 @@ async def test_ensure_treats_concurrent_creation_as_success(svc):
                     self.existing = 'true otherkey'
                 return out
         await svc.ensure_agent_shell(Wrong(), agent, 'key1', 'u', 't')
+
+
+def test_mods_one_shot_double_tap_lock():
+    m = Mods()
+    m.tap('Ctrl', 0)
+    assert m.state['Ctrl'] == 'armed' and m.active('Ctrl')
+    assert m.release() == ['Ctrl'] and not m.active('Ctrl')
+    m.tap('Ctrl', 10)
+    m.tap('Ctrl', 10.2)
+    assert m.state['Ctrl'] == 'locked'
+    assert m.release() == [] and m.active('Ctrl')
+    assert m.release() == [] and m.active('Ctrl')
+    m.tap('Ctrl', 20)
+    assert m.state['Ctrl'] == 'off'
+    m.tap('Alt', 30)
+    m.tap('Alt', 30.5)  # too slow: unarms
+    assert m.state['Alt'] == 'off'

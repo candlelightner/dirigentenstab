@@ -371,8 +371,8 @@ current compaction settings.
   and recreates the container) and the MCP URL, which a login script registers with Claude Code,
   Codex and opencode by variable reference. Missing image or network is reported, never created.
   Harness logins are per agent (shared logins are future work). On touch or narrow screens a key
-  bar (Esc, Tab, latching Ctrl and Alt that release after one key, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
-  are applied by the server to the next typed character.
+  bar (Esc, Tab, Ctrl and Alt that arm for one key on a tap and lock on a double tap until tapped again, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
+  are applied by the server to typed characters and key-bar keys (double tap = within 400 ms, measured server-side).
 - These enrollment defaults apply to compatible new managed VMs. Existing
   machines are not silently modified; agents handle other guest setup as part
   of their assigned work. V1 does not promise automatic enrollment of every OS.
