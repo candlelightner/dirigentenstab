@@ -242,13 +242,16 @@ Each of those is refused for a domain administrator and for every agent identity
   never shown again, and is sealed with the master key. Agents see granted
   names only. Grants follow the same strict ancestor inheritance as providers
   and MCP servers, except that an unset selection grants nothing. The hub
-  injects values at execution time through exactly two sinks: `{{secret:NAME}}`
-  placeholders in the `env` of `run_vm_command`, and `write_vm_secret_file`
-  (mode 600 file on an enrolled VM). Both send values over SSH stdin, never on
+  injects values at execution time through exactly three sinks: `{{secret:NAME}}`
+  placeholders in the `env` of `run_vm_command`, `write_vm_secret_file`
+  (mode 600 file on an enrolled VM), and the agent's shell container (see Agent
+  shells): every granted secret becomes an environment variable of that name in
+  the container's root-only env file. All send values over SSH stdin, never on
   a command line. Unknown or ungranted names fail closed. All tool output,
   histories and events are scrubbed of each value and its base64 and
   URL-encoded forms. This guards against accidental leaks, not hostile agents:
-  an agent with a shell on the VM can read the value. Rotation UI, external
+  an agent with a shell on the VM can read the value, and so can the owner at the
+  terminal of an agent shell (agents never exec into containers). Rotation UI, external
   vaults, per-secret ACLs and audit dashboards are out of scope.
 - MCP export lets the human owner use a hub agent's own built-in tools from
   external harnesses (Claude Code, Codex, Gemini CLI, opencode) through one
@@ -370,7 +373,24 @@ current compaction settings.
   (minted on first use, revocable like other keys; after revocation the next open mints a new key
   and recreates the container) and the MCP URL, which a login script registers with Claude Code,
   Codex and opencode by variable reference. Missing image or network is reported, never created.
-  Harness logins are per agent (shared logins are future work). On touch or narrow screens a key
+  Logins: (1) Env logins. Every secret granted to the agent is written into the container's env file as
+  `NAME=value` (names that collide with `DIRIGENTENSTAB_*`, `PATH`, `HOME`, `LD_*`, `LC_*` and similar, and
+  values with newlines, are skipped and reported in the terminal status). The container is recreated when the
+  set of granted names or a secret's update time changes (label `dirigentenstab.config`, a SHA-256 over names,
+  update times, the sharing flag and the home size; never values). The owner stores the long-lived token of
+  `claude setup-token` as `CLAUDE_CODE_OAUTH_TOKEN`; `GH_TOKEN`, `GEMINI_API_KEY` and `OPENAI_API_KEY` work the same way. (2) File logins.
+  Docker volume `ws-logins` is mounted at `~/.logins` in every agent container (Platform settings -> Share
+  harness logins across agents, default on; off = no mount). The login script symlinks only credential files
+  (`~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, `~/.gemini/google_accounts.json`,
+  `~/.local/share/opencode/auth.json`, `~/.config/gh/hosts.yml`, `~/.claude/.credentials.json`) into it and heals on every login: a real file
+  (atomic rename replaced the link, or login predates the link) moves into the store when newer, else is
+  discarded, then is re-linked; configs and histories stay per agent. Two containers refreshing one OAuth
+  token at the same moment can log it out; logging in again fixes it. Single human owner: every agent shares the owner's logins.
+  Home: each agent's home is a fixed-size sparse ext4 image `/var/lib/dirigentenstab-shells/homes/<agent id>.img` behind a
+  loop-mounted local volume `ws-home-<agent id>` (Platform settings -> Agent shell home size, GiB, default 5, 1 to 50). A phase-1 plain volume is
+  copied into an image and replaced only after the copy succeeded. A larger setting grows the image
+  (`e2fsck`, `resize2fs`) when the container is next recreated; homes never shrink. Under userns-remap the image root is
+  formatted owned by the remapped uid 1000. On touch or narrow screens a key
   bar (Esc, Tab, Ctrl and Alt that arm for one key on a tap and lock on a double tap until tapped again, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
   are applied by the server to typed characters and key-bar keys (double tap = within 400 ms, measured server-side).
 - Shell images are a structured per-agent spec (`agents.shell_image`), never Dockerfile text: the hub

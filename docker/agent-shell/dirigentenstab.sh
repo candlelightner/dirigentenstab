@@ -1,3 +1,32 @@
+# Shared logins: credential files (never configs or histories) live in the shared volume ~/.logins and each harness path is a
+# symlink into it. Runs on every login and self-heals: a real file (atomic rename replaced the link, or the user logged in
+# before the link existed) moves into the store when it is newer than the stored copy, else it is discarded; then it is re-linked.
+dirigentenstab_share_login() {  # $1 path under $HOME, $2 path under ~/.logins
+    local path="$HOME/$1" store="$HOME/.logins/$2"
+    if [ -z "$DIRIGENTENSTAB_SHARED_LOGINS" ]; then  # sharing is off: drop links that would dangle
+        if [ -L "$path" ] && [ ! -e "$path" ] && [ "$(readlink "$path")" = "$store" ]; then rm -f "$path"; fi
+        return 0
+    fi
+    if [ -f "$path" ] && [ ! -L "$path" ]; then
+        mkdir -p "$(dirname "$store")" && chmod 700 "$(dirname "$store")"
+        if [ ! -e "$store" ] || [ "$path" -nt "$store" ]; then mv -f "$path" "$store"; else rm -f "$path"; fi
+    fi
+    [ -e "$store" ] && chmod 600 "$store"
+    if [ ! -e "$path" ] && [ ! -L "$path" ] && [ -e "$store" ]; then
+        mkdir -p "$(dirname "$path")" && ln -s "$store" "$path"
+    fi
+    return 0
+}
+if [ -d "$HOME/.logins" ] || [ -z "$DIRIGENTENSTAB_SHARED_LOGINS" ]; then
+    dirigentenstab_share_login .codex/auth.json codex/auth.json
+    dirigentenstab_share_login .gemini/oauth_creds.json gemini/oauth_creds.json
+    dirigentenstab_share_login .gemini/google_accounts.json gemini/google_accounts.json
+    dirigentenstab_share_login .local/share/opencode/auth.json opencode/auth.json
+    dirigentenstab_share_login .config/gh/hosts.yml gh/hosts.yml
+    dirigentenstab_share_login .claude/.credentials.json claude/.credentials.json
+fi
+unset -f dirigentenstab_share_login
+
 # Register the hub MCP server with each installed harness that lacks it (idempotent). The key stays in the container
 # environment: configs reference it by variable and never store or print it.
 if [ -n "$DIRIGENTENSTAB_MCP_URL" ] && [ -n "$DIRIGENTENSTAB_MCP_KEY" ]; then
@@ -30,4 +59,8 @@ c.mcpServers={...c.mcpServers,dirigentenstab:{httpUrl:process.env.DIRIGENTENSTAB
         fi
     done
     echo "Hub MCP registered. Log in once: claude -> /login, codex login --device-auth, opencode auth login (gemini, qwen, aider if installed: their own login)"
+    echo "Env logins: a granted secret becomes an environment variable here (Claude Code reads CLAUDE_CODE_OAUTH_TOKEN from 'claude setup-token'; also GH_TOKEN, GEMINI_API_KEY, OPENAI_API_KEY)."
+    if [ -n "$DIRIGENTENSTAB_SHARED_LOGINS" ]; then
+        echo "File logins (codex, gemini, opencode, gh) are shared across agents via ~/.logins; two agents refreshing one token at once can log it out, then log in again."
+    fi
 fi

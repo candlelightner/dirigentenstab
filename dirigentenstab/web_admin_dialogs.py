@@ -8,6 +8,7 @@ from nicegui import ui
 from .runtime import provider_models, test_provider
 from .diagnostics import diagnose
 from .gpu import describe_plan
+from .service import SHELL_HOME_GIB
 from .web_mcp_export import keys_panel
 from .web_sidebar import agent_label
 
@@ -149,6 +150,12 @@ def setup_admin_dialogs(ctx):
                                    label='Agent shell host').classes('w-full').mark('agent-shell-host')
             ui.label('Managed VM (owned by Global Admin or the root Main Agent) that runs each agent\'s terminal container. '
                      'A VM tagged dirigentenstab-agent-shell-host also qualifies when this is Off.').classes('text-sm')
+            share_logins = ui.switch('Share harness logins across agents', value=service.shell_share_logins()).mark('shell-share-logins')
+            ui.label('File logins (Codex, Gemini, opencode, gh) live in one volume shared by every agent shell; env-var logins use secrets. '
+                     'Applies when a shell container is next recreated.').classes('text-sm')
+            home_gib = ui.number('Agent shell home size (GiB)', value=service.shell_home_gib(), min=SHELL_HOME_GIB[0],
+                                 max=SHELL_HOME_GIB[1], step=1, precision=0).classes('w-full').mark('shell-home-gib')
+            ui.label('Fixed per agent; a larger value grows homes on their next container recreation, homes never shrink.').classes('text-sm')
             main = next((a for a in ctx.agents.values() if a.get('is_main')), None)
             try:
                 resolved = await service.agent_shell_host(fresh=True)
@@ -217,6 +224,9 @@ def setup_admin_dialogs(ctx):
                 service.save_escalation_request_limit(actor_identity, int(request_limit.value))
                 service.save_dashboard_url(actor_identity, url.value or '')
                 service.save_agent_shell_host(actor_identity, shell_host.value or '')
+                if type(home_gib.value) not in {int, float} or int(home_gib.value) != home_gib.value:
+                    raise ValueError('Agent shell home size must be a whole number of GiB')
+                service.save_agent_shell_storage(actor_identity, bool(share_logins.value), int(home_gib.value))
                 await ctx.refresh_shell_toggle()
                 value = service.dashboard_url(actor_identity)
                 for link in ctx.dashboard_links:
