@@ -2153,6 +2153,29 @@ async def test_agent_shell_setup_button_only_without_host_and_starts_conversatio
         await browser.close()
 
 
+async def test_platform_settings_save_shell_logins_and_home_size(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await open_platform_settings(page)
+        share, size = page.get_by_role('switch', name='Share harness logins across agents'), page.get_by_label('Agent shell home size (GiB)')
+        await playwright.expect(share).to_be_checked()
+        await playwright.expect(size).to_have_value('5')
+        await share.click()
+        await size.fill('8')
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await open_platform_settings(page)
+        await playwright.expect(share).not_to_be_checked()
+        await playwright.expect(size).to_have_value('8')
+        await size.fill('99')
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_text('from 1 to 50').wait_for()
+        await browser.close()
+
+
 @pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
 async def test_agent_shell_toggle_switches_chat_and_terminal_with_key_bar(browser_app, width, height):
     url, _ = browser_app

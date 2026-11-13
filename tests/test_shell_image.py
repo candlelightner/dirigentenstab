@@ -7,7 +7,7 @@ from cryptography.fernet import Fernet
 from dirigentenstab import shell_image
 from dirigentenstab.service import Service
 from dirigentenstab.store import Store
-from tests.test_agent_shell import FakeConn
+from tests.test_agent_shell import CONFIG, FakeConn
 
 OWNER = {'userid': 'owner', 'type': 1}
 SHA = 'ab' * 32
@@ -255,7 +255,7 @@ async def test_build_recreate_prune_sequence_and_progress(env):
     agent = await shell_env(env)
     env.service._write_shell_spec(AGENT, {'apt': ['git']})
     tag = shell_image.tag(AGENT, shell_image.render({'apt': ['git']}), 'sha256:base')
-    conn = FakeConn('true key1 sha256:old')
+    conn = FakeConn('true key1 sha256:old ' + CONFIG)
     conn.missing_images = {tag}
     conn.tags = [f'dirigentenstab-shell-{AGENT}:oldoldoldold', tag]
 
@@ -286,14 +286,14 @@ async def test_build_recreate_prune_sequence_and_progress(env):
 async def test_matching_image_and_key_needs_no_build_or_recreate(env):
     agent = await shell_env(env)
     env.service._write_shell_spec(AGENT, {'apt': ['git']})
-    conn = FakeConn('true key1 sha256:base')
+    conn = FakeConn('true key1 sha256:base ' + CONFIG)
     await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
     assert not any(' build ' in c or ' rm ' in c or ' run ' in c for c in conn.commands)
 
 
 async def test_base_rebuild_recreates_the_container(env):
     agent = await shell_env(env)
-    conn = FakeConn('true key1 sha256:oldbase')
+    conn = FakeConn('true key1 sha256:oldbase ' + CONFIG)
     await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in conn.commands) and any(c.startswith('sudo -n docker run') for c in conn.commands)
 
@@ -301,7 +301,7 @@ async def test_base_rebuild_recreates_the_container(env):
 async def test_build_failure_is_bounded_and_leaves_the_container(env):
     agent = await shell_env(env)
     env.service._write_shell_spec(AGENT, {'apt': ['git']})
-    conn = FakeConn('true key1 sha256:old')
+    conn = FakeConn('true key1 sha256:old ' + CONFIG)
     tag = shell_image.tag(AGENT, shell_image.render({'apt': ['git']}), 'sha256:base')
     conn.missing_images = {tag}
     conn.build_result = (1, 'x' * 5000 + 'E: Unable to locate package git')

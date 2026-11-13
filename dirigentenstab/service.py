@@ -37,6 +37,10 @@ SHELL_HOST_OWNERS = (APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT)  # a lower agent must n
 SHELL_TAG = 'dirigentenstab-agent-shell-host'
 SHELL_BUILD_SECONDS, SHELL_ERROR_CHARS = 900, 600
 SHELL_AGENT = re.compile(r'[A-Za-z0-9_-]{1,64}')
+SHELL_HOMES, SHELL_LOGINS_VOLUME, SHELL_HOME_UID = f'{SHELL_ENV_DIR}/homes', 'ws-logins', 1000
+SHELL_HOME_DIR = '.dshome'  # the bind source lives inside the filesystem: unmounted image -> missing source -> container will not start
+SHELL_RESERVED = re.compile(r'DIRIGENTENSTAB_.*|LD_.*|LC_.*|PATH|HOME|USER|LOGNAME|SHELL|PWD|OLDPWD|HOSTNAME|TERM|LANG|IFS|ENV|BASH_ENV|PS[0-9]|PROMPT_COMMAND')
+SHELL_HOME_GIB = (1, 50, 5)  # min, max, default
 _CONFIGURING = ContextVar('configuring_agents', default=frozenset())
 DEFAULT_SUMMARY_PROMPT = 'Summarize the user request into a concise 3-6 word conversation title. Return only the title text without quotes or punctuation.'
 DEFAULT_INSTRUCTIONS = '''\
@@ -1699,6 +1703,42 @@ class Service:
                            'ON CONFLICT(name) DO UPDATE SET value=excluded.value', (vm_id or '',))
         self.store.audit(identity['userid'], 'configure-agent-shell-host', vm_id or '')
 
+    def shell_share_logins(self):
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='shell_share_logins'")
+        return not row or row['value'] != '0'
+
+    def shell_home_gib(self):
+        row = self.store.one("SELECT value FROM platform_settings WHERE name='shell_home_gib'")
+        return int(row['value']) if row else SHELL_HOME_GIB[2]
+
+    def save_agent_shell_storage(self, identity, share_logins, home_gib):
+        if identity.get('_agent_id') or identity.get('type') != 1:
+            raise PermissionError('Platform settings require platform administrator')
+        low, high, _ = SHELL_HOME_GIB
+        if type(home_gib) is not int or not low <= home_gib <= high:
+            raise ValueError(f'Agent shell home size must be a whole number of GiB from {low} to {high}')
+        for name, value in (('shell_share_logins', '1' if share_logins else '0'), ('shell_home_gib', str(home_gib))):
+            self.store.execute('INSERT INTO platform_settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value', (name, value))
+        self.store.audit(identity['userid'], 'configure-agent-shell-storage', f'{int(bool(share_logins))} {home_gib}')
+
+    async def shell_secrets(self, agent):
+        """Granted secrets as env-file entries plus a salt-free fingerprint of names and update times (never values).
+
+        A secret an env file cannot hold (reserved or colliding name, multi-line value) is skipped and named in `skipped`.
+        """
+        granted = await self.effective_secrets(agent)
+        env, skipped, marks = {}, [], []
+        for row in self.store.all('SELECT name,value,updated FROM secrets ORDER BY name'):
+            if row['name'] not in granted:
+                continue
+            value = self.store.open(row['value'])
+            if SHELL_RESERVED.fullmatch(row['name']) or any(c in value for c in '\n\r\0'):
+                skipped.append(row['name'])
+                continue
+            env[row['name']] = value
+            marks.append([row['name'], row['updated']])
+        return env, skipped, marks
+
     async def install_agent_shell_skill(self, identity):
         """Save the shipped agent-shell-host skill on the root Main Agent, only when missing or outdated."""
         if identity.get('_agent_id') or identity.get('type') != 1:
@@ -1774,10 +1814,19 @@ class Service:
             image_id = found.stdout.strip()
         progress('Starting container…')
         name, env_file = 'ws-' + agent['id'], f"{SHELL_ENV_DIR}/{agent['id']}.env"
-        inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}} {{.Image}}'
+        share, gib = self.shell_share_logins(), self.shell_home_gib()
+        secrets, skipped, marks = await self.shell_secrets(agent)
+        config = hashlib.sha256(json.dumps([marks, share, gib]).encode()).hexdigest()[:32]  # names and timestamps only
+        inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}} {{.Image}} {{index .Config.Labels "dirigentenstab.config"}}'
         found = await docker('inspect', '-f', inspect_format, name)
         state = found.stdout.split() if not found.returncode else None
-        if state and state[1:2] == [key_id] and state[2:3] == [image_id]:  # a revoked key or a new image falls through to recreation
+        if state and state[0] != 'true':  # a stopped container on a legacy home (root bind or plain volume) is recreated so the home gets migrated
+            volume = await docker('volume', 'inspect', '-f', '{{index .Options "device"}}', f"ws-home-{agent['id']}")
+            if volume.returncode or volume.stdout.strip() != f"{SHELL_HOMES}/{agent['id']}.mnt/{SHELL_HOME_DIR}":
+                state = state[:3] + ['']
+        if state and state[1:2] == [key_id] and state[2:3] == [image_id] and state[3:4] == [config]:  # revoked key, new image, changed secrets or storage settings recreate
+            if state[0] != 'true':  # a host reboot may have dropped the loop mount: remount before Docker binds the home
+                await self._mount_shell_image(docker, f"{SHELL_HOMES}/{agent['id']}.img", f"{SHELL_HOMES}/{agent['id']}.mnt", True)
             if state[0] != 'true' and (started := await docker('start', name)).returncode:
                 raise RuntimeError('Could not start the agent shell: ' + (started.stderr or '').strip()[:200])
             if built:
@@ -1785,13 +1834,18 @@ class Service:
             return
         if state:
             await docker('rm', '-f', name)
+        progress('Preparing home…')
+        await self._ensure_shell_home(docker, agent['id'], gib, progress)
         written = await docker('install', '-D', '-m', '600', '/dev/stdin', env_file, run=True,
-                               input=f'DIRIGENTENSTAB_MCP_URL={url}\nDIRIGENTENSTAB_MCP_KEY={token}\n')
+                               input=f'DIRIGENTENSTAB_MCP_URL={url}\nDIRIGENTENSTAB_MCP_KEY={token}\n'
+                                     + ''.join(f'{key}={value}\n' for key, value in secrets.items()))
         address, _, host = hosts.partition(' ')
         slug = re.sub(r'[^a-z0-9]+', '-', agent['name'].lower()).strip('-')[:32] or 'agent'
         created = written if written.returncode else await docker(
             'run', '-d', '--name', name, '--hostname', slug, '--restart', 'unless-stopped', '--network', SHELL_NETWORK,
-            '--label', 'dirigentenstab.key=' + key_id, '--env-file', env_file, '-v', f"ws-home-{agent['id']}:/home/dev",
+            '--label', 'dirigentenstab.key=' + key_id, '--label', 'dirigentenstab.config=' + config, '--env-file', env_file,
+            '-v', f"ws-home-{agent['id']}:/home/dev",
+            *(['-v', f'{SHELL_LOGINS_VOLUME}:/home/dev/.logins', '-e', 'DIRIGENTENSTAB_SHARED_LOGINS=1'] if share else []),
             *(['--add-host', f'{host}:{address}'] if host else []), image)
         if created.returncode and not written.returncode:  # a concurrent open may have created it first
             again = await docker('inspect', '-f', inspect_format, name)
@@ -1803,6 +1857,121 @@ class Service:
         if created.returncode:
             raise RuntimeError('Could not create the agent shell: ' + (created.stderr or '').strip()[:200])
         await self._prune_shell_images(docker, agent['id'], image)
+        if skipped:
+            progress('Not exported to the shell (reserved name or multi-line value): ' + ', '.join(skipped))
+
+    async def _shell_host(self, docker, *args, what):
+        result = await docker(*args, run=True)
+        if result.returncode:
+            raise RuntimeError(f'{what}: ' + (result.stderr or result.stdout or '').strip()[:200])
+        return result
+
+    async def _mount_shell_image(self, docker, path, where, persist):
+        """Loop-mount a home image (Docker's local driver cannot) and make sure the home directory exists inside it.
+
+        persist adds an fstab entry. The directory is created once, owned like the filesystem root; a root that still holds
+        files (phase-3 first layout, or a copied plain volume) has them moved into it, skipping lost+found, so an interrupted
+        move resumes on the next call.
+        """
+        await self._shell_host(docker, 'install', '-d', where, what='Could not create the home mount point')
+        await self._shell_host(docker, 'sh', '-c', 'mountpoint -q "$1" || { '
+                               + ('grep -qsF " $1 " /etc/fstab || echo "$0 $1 ext4 loop,nofail 0 0" >> /etc/fstab; mount "$1"; '
+                                  if persist else 'mount -o loop "$0" "$1"; ') + '}', path, where, what='Could not mount the home image')
+        await self._shell_host(
+            docker, 'sh', '-c',
+            f'd="$0/{SHELL_HOME_DIR}"; [ -d "$d" ] || {{ mkdir -p "$d.tmp" && chown --reference="$0" "$d.tmp" && '
+            f'chmod --reference="$0" "$d.tmp" && find "$0" -mindepth 1 -maxdepth 1 ! -name lost+found ! -name {SHELL_HOME_DIR}.tmp '
+            f'-exec mv -t "$d.tmp" {{}} + && mv "$d.tmp" "$d"; }}', where, what='Could not prepare the home directory')
+
+    async def _ensure_shell_home(self, docker, agent_id, gib, progress):
+        """Give the agent a fixed-size ext4 home (sparse image, loop-mounted by the hub and exposed as a bind volume). Container must be removed.
+
+        Plain phase-1 volumes are copied into a new image first and replaced only after the copy succeeded; a larger
+        setting grows the image offline, never shrinks it.
+        """
+        volume, img, tmp, size = f'ws-home-{agent_id}', f'{SHELL_HOMES}/{agent_id}.img', f'{SHELL_HOMES}/{agent_id}.img.new', f'{gib}G'
+
+        async def host(*args, what):
+            return await self._shell_host(docker, *args, what=what)
+
+        async def remapped(file):  # the container's dev (uid 1000) is base+1000 on the host under userns-remap
+            out = await docker('awk', '-F:', '$1=="dockremap"{print $2; exit}', file, run=True)
+            return int(out.stdout.strip() if (out.stdout or '').strip().isdigit() else 0) + SHELL_HOME_UID
+
+        async def make(path):
+            owner = f'{await remapped("/etc/subuid")}:{await remapped("/etc/subgid")}'
+            await host('install', '-d', '-m', '700', SHELL_HOMES, what='Could not create the homes directory')
+            await host('rm', '-f', path, what='Could not clear the home image')
+            try:
+                await host('truncate', '-s', size, path, what='Could not create the home image')
+                await host('chmod', '600', path, what='Could not create the home image')
+                await host('mkfs.ext4', '-q', '-F', '-E', f'root_owner={owner}', path,
+                           what='Could not format the home image (is e2fsprogs installed on the shell host?)')
+            except BaseException:
+                await docker('rm', '-f', path, run=True)
+                raise
+
+        mnt = f'{SHELL_HOMES}/{agent_id}.mnt'
+        source = f'{mnt}/{SHELL_HOME_DIR}'
+
+        async def mount(path, where, persist):
+            await self._mount_shell_image(docker, path, where, persist)
+
+        async def unmount(where):
+            await host('sh', '-c', '! mountpoint -q "$0" || umount "$0"', where, what='Could not unmount the home image')
+
+        async def attach(name):
+            await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
+                       '--opt', f'device={source}', name, what='Could not create the home volume')
+
+        found = await docker('volume', 'inspect', '-f', '{{index .Options "device"}}', volume)
+        device = found.stdout.strip() if not found.returncode else None
+        if device is not None and device not in {source, mnt, '', '<no value>', '<nil>'}:
+            raise RuntimeError(f'Home volume {volume} uses an unexpected device')
+        if device in {source, mnt} or device is None:
+            if (await docker('test', '-f', img, run=True)).returncode:
+                await make(img)
+            have = int((await host('stat', '-c', '%s', img, what='Could not inspect the home image')).stdout.strip() or 0)
+            if have < gib << 30:  # grow only, offline
+                progress('Growing home…')
+                try:
+                    await unmount(mnt)
+                    await host('truncate', '-s', size, img, what='Could not grow the home image')
+                    if (await docker('e2fsck', '-fy', img, run=True)).returncode > 1:
+                        raise RuntimeError('Home filesystem check failed')
+                    await host('resize2fs', img, what='Could not resize the home filesystem')
+                except BaseException:
+                    await docker('truncate', '-s', str(have), img, run=True)
+                    raise
+            await mount(img, mnt, True)  # also after a host reboot that dropped the mount
+            if device == mnt:  # first layout bound the filesystem root itself
+                await host('docker', 'volume', 'rm', volume, what='Could not replace the home volume')
+            if device in {None, mnt}:
+                await attach(volume)
+            return
+        progress('Migrating home to a size-limited volume…')
+        staging, scratch = volume + '-new', mnt + '.new'
+        await docker('volume', 'rm', staging)
+        await make(tmp)
+        try:
+            await mount(tmp, scratch, False)
+            await host('docker', 'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
+                       '--opt', f'device={scratch}/{SHELL_HOME_DIR}', staging, what='Could not create the home volume')
+            await host('docker', 'run', '--rm', '--network', 'none', '--user', '0', '--entrypoint', 'cp',
+                       '-v', f'{volume}:/from', '-v', f'{staging}:/to', SHELL_IMAGE, '-a', '/from/.', '/to/',
+                       what='Could not copy the old home')
+        except BaseException:
+            await docker('volume', 'rm', staging)
+            await docker('sh', '-c', '! mountpoint -q "$0" || umount "$0"', scratch, run=True)
+            await docker('rm', '-f', tmp, run=True)
+            raise
+        await host('docker', 'volume', 'rm', staging, what='Could not finish the home migration')
+        await unmount(scratch)
+        await host('rmdir', scratch, what='Could not finish the home migration')
+        await host('mv', '-f', tmp, img, what='Could not finish the home migration')
+        await host('docker', 'volume', 'rm', volume, what='Could not replace the old home volume')  # only after the copy succeeded
+        await mount(img, mnt, True)
+        await attach(volume)
 
     async def _prune_shell_images(self, docker, agent_id, keep):
         """Remove this agent's other derived tags once the container no longer uses them."""

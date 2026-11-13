@@ -12,6 +12,8 @@ RUN HOME=/opt/claude curl -fsSL https://claude.ai/install.sh | HOME=/opt/claude 
     && ln -s /opt/claude/.local/bin/claude /usr/local/bin/claude && chmod -R a+rX /opt/claude
 # Google Antigravity ("agy") has no public Linux installer to pin here; add it once one exists.
 RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /bin/bash dev && echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+# Mount point of the shared logins volume; Docker copies this ownership into the empty volume on first use.
+RUN install -d -o dev -g dev -m 700 /home/dev/.logins
 COPY dirigentenstab.sh /etc/profile.d/dirigentenstab.sh
 USER dev
 WORKDIR /home/dev
