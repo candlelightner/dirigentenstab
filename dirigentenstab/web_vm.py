@@ -193,10 +193,14 @@ def setup_vm(ctx):
         ctx.disconnect_btn.disable()
         ctx.terminal_status.set_text(f'Connecting to {vm_name or vm_id}…')
         ctx.term.write('\x1bc')
+        notice = []
         try:
             current = await actor()
             if state.get('terminal_agent'):
-                conn, command = await service.open_agent_shell(current, vm_id, ctx.terminal_status.set_text)
+                def progress(text):  # a skipped-secret notice must outlive the later "Connected" status
+                    ctx.terminal_status.set_text(text)
+                    notice[:] = [text] if text.startswith('Not exported') else notice
+                conn, command = await service.open_agent_shell(current, vm_id, progress)
                 vm = {'name': vm_name}
             else:
                 conn, vm = await service.open_vm_terminal_connection(current, vm_id)
@@ -235,7 +239,7 @@ def setup_vm(ctx):
                 return
             session.chan = chan
             ssh_session.chan = chan
-            ctx.terminal_status.set_text(f"Connected: {vm.get('name', vm_id)}")
+            ctx.terminal_status.set_text(' · '.join([f"Connected: {vm.get('name', vm_id)}", *notice]))
             ctx.disconnect_btn.enable()
             ctx.reconnect_btn.enable()
             await ctx.term.fit()
