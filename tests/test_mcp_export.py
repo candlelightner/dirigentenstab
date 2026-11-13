@@ -76,7 +76,7 @@ async def test_missing_wrong_and_revoked_keys_are_rejected(e):
     assert (await rpc(e, 'dsk_0000000000000000_' + 'a' * 43, 'tools/list')).status_code == 401
     assert (await rpc(e, token, 'tools/list')).status_code == 200
     row = e.store.one('SELECT * FROM mcp_export_keys')
-    assert row['last_used'] and token.split('_')[2] not in json.dumps(row, default=str)
+    assert row['last_used'] and token.split('_', 2)[2] not in json.dumps(row, default=str)
     await mcp_export.revoke_key(e.service, OWNER, row['id'])
     assert (await rpc(e, token, 'tools/list')).status_code == 401
     ops = [r['operation'] + ':' + r['target'] for r in e.store.all('SELECT operation,target FROM audit')]
@@ -113,7 +113,7 @@ async def test_tools_list_matches_agent_enablement_and_excludes_pause_and_remote
     names = {t['name'] for t in (await rpc(e, token, 'tools/list')).json()['result']['tools']}
     assert {'execute_api', 'search_api', 'describe_api', 'run_vm_command', 'write_vm_secret_file', 'transfer_vm_file',
             'list_skills', 'get_skill', 'save_skill', 'share_skill', 'configure_agent', 'create_subgroup',
-            'request_escalation', 'platform_status', 'recover_operation', 'execution_state'} <= names
+            'request_escalation', 'platform_status', 'recover_operation', 'execution_state', 'get_shell_image', 'set_shell_image'} <= names
     assert 'pause_work' not in names
     e.store.execute('UPDATE agents SET escalation_requests_enabled=0 WHERE id=?', ('child',))
     names = {t['name'] for t in (await rpc(e, token, 'tools/list')).json()['result']['tools']}
@@ -178,7 +178,7 @@ async def test_mcp_key_placeholder_is_per_agent_vm_reused_redacted_and_regenerat
     key, acting = await mcp_export.authenticate(e.service, 'Bearer ' + token, None)
     assert (key['agent_id'], key['label'], acting) == ('child', 'vm:vm1', 'child')
     row = e.store.one("SELECT id FROM mcp_export_keys WHERE label='vm:vm1'")
-    assert token.split('_')[2].encode() not in e.store.one('SELECT hash,sealed FROM mcp_export_keys WHERE id=?',
+    assert token.split('_', 2)[2].encode() not in e.store.one('SELECT hash,sealed FROM mcp_export_keys WHERE id=?',
                                                          (row['id'],))['sealed']
     await mcp_export.revoke_key(e.service, OWNER, row['id'])
     assert await e.service.expand_secrets('child', '{{mcp_key}}', 'vm1') != token

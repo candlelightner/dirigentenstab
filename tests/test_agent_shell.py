@@ -35,6 +35,16 @@ def svc(tmp_path):
         return SimpleNamespace(raw=raw)
 
     service.cloud_client = cloud_client
+    service.parents = {}
+
+    async def agent_chain(agent):  # root first, the agent itself last
+        chain, current = [agent], agent['id']
+        while current in service.parents:
+            current = service.parents[current]
+            chain.insert(0, store.one('SELECT * FROM agents WHERE id=?', (current,)))
+        return chain
+
+    service.agent_chain = agent_chain
     return service
 
 
@@ -82,6 +92,7 @@ async def test_open_agent_shell_rejects_bad_ids_and_missing_host(svc):
 class FakeConn:
     def __init__(self, existing=None, ready=True):
         self.commands, self.inputs, self.existing, self.ready = [], [], existing, ready
+        self.missing_images, self.image_ids, self.build_result, self.tags = set(), {}, (0, ''), []
 
     async def run(self, command, input=None, check=True):
         self.commands.append(command)
@@ -90,6 +101,16 @@ class FakeConn:
         out = SimpleNamespace(returncode=0, stdout='', stderr='')
         if not self.ready and ('image inspect' in command or 'network inspect' in command):
             out.returncode = 1
+        if 'image inspect -f' in command and not out.returncode:
+            tag = command.split()[-1]
+            if tag in self.missing_images:
+                out.returncode = 1
+            else:
+                out.stdout = self.image_ids.get(tag, 'sha256:base') + '\n'
+        if 'docker build' in command:
+            out.returncode, out.stderr = self.build_result
+        if "image ls" in command:
+            out.stdout = '\n'.join(self.tags)
         if 'docker inspect -f' in command:
             if self.existing is None:
                 out.returncode = 1
@@ -107,7 +128,7 @@ async def test_ensure_creates_container_with_env_file_over_stdin_only(svc):
         f'DIRIGENTENSTAB_MCP_URL=https://hub.example/mcp/{AGENT}\nDIRIGENTENSTAB_MCP_KEY=dsk_secret\n']
     install = next(c for c in conn.commands if 'install' in c)
     assert install == f'sudo -n install -D -m 600 /dev/stdin /var/lib/dirigentenstab-shells/{AGENT}.env'
-    run = conn.commands[-1]
+    run = next(c for c in conn.commands if c.startswith('sudo -n docker run'))
     assert run.startswith('sudo -n docker run -d --name ws-' + AGENT)
     for part in ('--hostname team-alpha', '--restart unless-stopped', '--network dirigentenstab-shells',
                  '--label dirigentenstab.key=key1', f'-v ws-home-{AGENT}:/home/dev', '--add-host hub.example:10.0.0.5',
@@ -119,16 +140,16 @@ async def test_ensure_creates_container_with_env_file_over_stdin_only(svc):
 
 async def test_ensure_starts_stopped_reuses_running_recreates_on_new_key_and_requires_setup(svc):
     agent = await svc.agent(AGENT)
-    stopped = FakeConn('false key1')
+    stopped = FakeConn('false key1 sha256:base')
     await svc.ensure_agent_shell(stopped, agent, 'key1', 'u', 't')
     assert stopped.commands[-1] == f'sudo -n docker start ws-{AGENT}' and not stopped.inputs
-    running = FakeConn('true key1')
+    running = FakeConn('true key1 sha256:base')
     await svc.ensure_agent_shell(running, agent, 'key1', 'u', 't')
     assert not any(' start ' in c or ' run ' in c for c in running.commands)
-    rotated = FakeConn('true oldkey')
+    rotated = FakeConn('true oldkey sha256:base')
     await svc.ensure_agent_shell(rotated, agent, 'key2', 'u', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in rotated.commands) and rotated.inputs
-    assert rotated.commands[-1].startswith('sudo -n docker run')
+    assert any(c.startswith('sudo -n docker run') for c in rotated.commands)
     with pytest.raises(RuntimeError, match='run the agent-shell-host skill'):
         await svc.ensure_agent_shell(FakeConn(ready=False), agent, 'key1', 'u', 't')
 
@@ -184,7 +205,7 @@ async def test_ensure_treats_concurrent_creation_as_success(svc):
             out = await super().run(command, input, check)
             if 'docker run' in command:
                 out.returncode, out.stderr = 125, 'name already in use'
-                self.existing = 'true key1'
+                self.existing = 'true key1 sha256:base'
             return out
 
     conn = Racing()
@@ -195,7 +216,7 @@ async def test_ensure_treats_concurrent_creation_as_success(svc):
                 out = await FakeConn.run(self, command, input, check)
                 if 'docker run' in command:
                     out.returncode, out.stderr = 125, 'boom'
-                    self.existing = 'true otherkey'
+                    self.existing = 'true otherkey sha256:base'
                 return out
         await svc.ensure_agent_shell(Wrong(), agent, 'key1', 'u', 't')
 

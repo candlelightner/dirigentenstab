@@ -216,7 +216,7 @@ class FixtureService(Service):
 
     shell_server = None
 
-    async def open_agent_shell(self, identity, agent_id):
+    async def open_agent_shell(self, identity, agent_id, progress=None):
         # Stand-in for the shell host: a local echo shell, still behind the real authorization and host resolution.
         import asyncssh
         await self.authorize(identity, agent_id)

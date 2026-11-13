@@ -2208,3 +2208,28 @@ async def test_agent_shell_toggle_switches_chat_and_terminal_with_key_bar(browse
         await playwright.expect(page.locator('.conversation')).to_be_visible()
         assert 'view=terminal' not in page.url
         await browser.close()
+
+
+async def test_configure_shows_shell_image_source_and_owner_edit_saves(browser_app):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': 1440, 'height': 900})
+        await login(page, url)
+        await select_agent(page, 'Research Admin')
+        await open_configuration(page)
+        await page.get_by_text('Shell image', exact=True).click()
+        await page.get_by_text('Default image (nothing added).', exact=True).wait_for()
+        await page.get_by_label('Extra harnesses').click()
+        await page.get_by_role('option', name='gemini', exact=True).click()
+        await page.keyboard.press('Escape')
+        await page.get_by_label('apt packages (Ubuntu, one per line)').fill('ripgrep\njq')
+        await page.get_by_label('npm global packages').fill('typescript')
+        await page.get_by_role('button', name='Save', exact=True).click()
+        await page.get_by_role('dialog').wait_for(state='hidden')
+        await open_configuration(page)
+        await page.get_by_text('Shell image', exact=True).click()
+        await page.get_by_text('Set on this agent.', exact=True).wait_for()
+        await playwright.expect(page.get_by_label('apt packages (Ubuntu, one per line)')).to_have_value('jq\nripgrep')
+        await playwright.expect(page.get_by_label('npm global packages')).to_have_value('typescript')
+        await browser.close()
