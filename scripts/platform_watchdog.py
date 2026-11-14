@@ -69,9 +69,32 @@ def pct(used, total):
     return round(100 * used / total, 1) if total else 0.0
 
 
+def nfsd_control(command, text=None):
+    """Run cat/tee on the nfsd control file in a child: a wedged nfsd mutex leaves it in D state, so on timeout kill it and never wait."""
+    child = subprocess.Popen(command, stdin=subprocess.PIPE if text else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True)
+    try:
+        out = child.communicate(text, timeout=5)[0]
+    except subprocess.TimeoutExpired:
+        child.kill()  # no wait()/communicate(): a D-state child cannot die
+        raise
+    if child.returncode:
+        raise OSError(f'{command[0]} exited {child.returncode}')
+    return out
+
+
+def read_threads():
+    return int(nfsd_control(['cat', str(NFSD_THREADS)]))
+
+
+def write_threads(count):
+    nfsd_control(['tee', str(NFSD_THREADS)], f'{count}\n')
+
+
 def nfsd_state():
     """Loopback secondary storage: nfsd threads in uninterruptible sleep (D) and the configured thread count."""
     total = blocked = 0
+    reader_stuck = False
     for stat in Path('/proc').glob('[0-9]*/stat'):
         try:
             text = stat.read_text()
@@ -81,17 +104,26 @@ def nfsd_state():
         if name.partition('(')[2] == 'nfsd':
             total += 1
             blocked += rest.split()[0] == 'D'
-    try:
-        configured = int(NFSD_THREADS.read_text())
-    except (OSError, ValueError):
-        configured = 0
+        elif rest.split()[0] == 'D':
+            try:  # a reader left by an earlier run: do not pile up another
+                reader_stuck = reader_stuck or str(NFSD_THREADS) in stat.with_name('cmdline').read_text()
+            except OSError:
+                pass
+    hung, configured = reader_stuck, 0
+    if not hung:
+        try:
+            configured = read_threads()
+        except subprocess.TimeoutExpired:
+            hung = True
+        except (OSError, ValueError):
+            pass
     # Supporting signal only: the latest client message about the server is "not responding", not "OK".
     try:
         lines = subprocess.run(['dmesg'], capture_output=True, text=True, timeout=10).stdout.splitlines()
     except (OSError, subprocess.SubprocessError):
         lines = []
     last = [line for line in lines if re.search(r'nfs: server \S+ (not responding|OK)', line)]
-    return {'threads': configured, 'running': total, 'blocked': blocked,
+    return {'threads': None if hung else configured, 'control_hung': hung, 'running': total, 'blocked': blocked,
             'not_responding': bool(last) and 'not responding' in last[-1]}
 
 
@@ -165,8 +197,10 @@ def evaluate(data, state, now):
     # Most or all nfsd threads blocked, on consecutive runs: the loopback NFS export is deadlocked.
     blocked_now = nfsd['running'] > 0 and 4 * nfsd['blocked'] >= 3 * nfsd['running']
     runs = state.get('nfsd_blocked_runs', 0) + 1 if blocked_now else 0
-    stuck = runs >= NFSD_STUCK_RUNS
-    if stuck:
+    stuck = runs >= NFSD_STUCK_RUNS or nfsd['control_hung']
+    if nfsd['control_hung']:
+        issues.append('Secondary storage NFS stuck: nfsd control interface hung (/proc/fs/nfsd/threads not answering)')
+    elif stuck:
         issues.append(f"Secondary storage NFS stuck: {nfsd['blocked']}/{nfsd['running']} nfsd threads blocked"
                       + (' (kernel reports server not responding)' if nfsd['not_responding'] else ''))
     healthy = (bool(hosts) and not stuck and all(h['status'] == 'Up' and h['resource_state'] == 'Enabled' for h in hosts)
@@ -183,7 +217,7 @@ def plan(data, state, now):
     """Pure: the remediations due now, as (name, detail) tuples."""
     steps = []
     nfsd = data['nfsd']
-    if (state['nfsd_blocked_runs'] >= NFSD_STUCK_RUNS and 0 < nfsd['threads'] < NFSD_MAX
+    if (state['nfsd_blocked_runs'] >= NFSD_STUCK_RUNS and 0 < (nfsd['threads'] or 0) < NFSD_MAX
             and now - state.get('last_nfsd_raise', 0) >= NFSD_RAISE_INTERVAL):
         target = min(NFSD_MAX, nfsd['threads'] + NFSD_STEP)
         steps.append(('raise-nfsd-threads', f"{nfsd['blocked']}/{nfsd['running']} nfsd threads blocked; "
@@ -224,7 +258,7 @@ def execute(steps, state, now, restart=systemctl_restart):
                 result = f'{detail}; ' + fix_agent_host(now)
             elif name == 'raise-nfsd-threads':
                 state['last_nfsd_raise'] = now  # set first: a failing write must not be retried every minute
-                NFSD_THREADS.write_text(f"{detail.rpartition(' -> ')[2]}\n")
+                write_threads(detail.rpartition(' -> ')[2])
                 result = f'{detail}; raised'
             else:
                 restart('cloudstack-agent')
