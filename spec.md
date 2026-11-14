@@ -364,6 +364,8 @@ current compaction settings.
   resolves, Platform settings offers **Set up with <Main Agent>**: with the owner's click the
   hub saves or updates the shipped `agent-shell-host` skill on the root Main Agent and starts a new
   conversation asking it to prepare the host (Docker, image, isolated network, firewall, tag).
+  The feature assumes the host VM can reach the hub's origin over HTTPS; a tailnet-only hub needs the
+  VM joined to the tailnet (owner-approved login), with the container firewall still limited to the hub IP and port.
   Opening the terminal needs only the normal right to operate the agent: the hub connects with the
   host's managed key and runs fixed `sudo -n docker` commands (never a host shell for the human):
   it ensures container `ws-<agent id>` from image `dirigentenstab-shell:latest` on the
