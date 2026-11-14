@@ -27,19 +27,22 @@ if [ -d "$HOME/.logins" ] || [ -z "$DIRIGENTENSTAB_SHARED_LOGINS" ]; then
 fi
 unset -f dirigentenstab_share_login
 
-# Register the hub MCP server with each installed harness that lacks it (idempotent). The key stays in the container
-# environment: configs reference it by variable and never store or print it.
+# Register the hub MCP server with each installed harness whose config lacks this exact URL (idempotent; a changed URL
+# re-registers, since homes outlive containers). The key stays in the container environment: configs reference it by
+# variable and never store or print it. The URL comes only from the hub's tunnel; nothing here assumes a hub name or origin.
 if [ -n "$DIRIGENTENSTAB_MCP_URL" ] && [ -n "$DIRIGENTENSTAB_MCP_KEY" ]; then
-    if command -v claude >/dev/null 2>&1 && ! grep -qs '"dirigentenstab"' "$HOME/.claude.json"; then
+    if command -v claude >/dev/null 2>&1 && ! grep -qsF "\"$DIRIGENTENSTAB_MCP_URL\"" "$HOME/.claude.json"; then
+        claude mcp remove --scope user dirigentenstab >/dev/null 2>&1
         claude mcp add --scope user --transport http dirigentenstab "$DIRIGENTENSTAB_MCP_URL" \
             --header 'Authorization: Bearer ${DIRIGENTENSTAB_MCP_KEY}' >/dev/null 2>&1
     fi
-    if command -v codex >/dev/null 2>&1 && ! grep -qs 'mcp_servers.dirigentenstab' "$HOME/.codex/config.toml"; then
+    if command -v codex >/dev/null 2>&1 && ! grep -qsF "\"$DIRIGENTENSTAB_MCP_URL\"" "$HOME/.codex/config.toml"; then
         mkdir -p "$HOME/.codex"
+        sed -i '/^\[mcp_servers\.dirigentenstab\]$/,/^bearer_token_env_var/d' "$HOME/.codex/config.toml" 2>/dev/null
         printf '\n[mcp_servers.dirigentenstab]\nurl = "%s"\nbearer_token_env_var = "DIRIGENTENSTAB_MCP_KEY"\n' \
             "$DIRIGENTENSTAB_MCP_URL" >> "$HOME/.codex/config.toml"
     fi
-    if command -v opencode >/dev/null 2>&1 && ! grep -qs '"dirigentenstab"' "$HOME/.config/opencode/opencode.json"; then
+    if command -v opencode >/dev/null 2>&1 && ! grep -qsF "\"$DIRIGENTENSTAB_MCP_URL\"" "$HOME/.config/opencode/opencode.json"; then
         mkdir -p "$HOME/.config/opencode"
         if [ -s "$HOME/.config/opencode/opencode.json" ]; then
             node -e 'const f=process.argv[1],c=JSON.parse(require("fs").readFileSync(f));c.mcp={...c.mcp,dirigentenstab:{type:"remote",url:process.env.DIRIGENTENSTAB_MCP_URL,headers:{Authorization:"Bearer {env:DIRIGENTENSTAB_MCP_KEY}"},enabled:true}};require("fs").writeFileSync(f,JSON.stringify(c,null,2))' \
@@ -52,7 +55,7 @@ if [ -n "$DIRIGENTENSTAB_MCP_URL" ] && [ -n "$DIRIGENTENSTAB_MCP_KEY" ]; then
     # gemini and qwen expand $VAR inside settings.json, so only the variable name is stored. aider has no MCP support.
     for pair in gemini:.gemini qwen:.qwen; do
         tool=${pair%%:*}; dir="$HOME/${pair#*:}"
-        if command -v "$tool" >/dev/null 2>&1 && ! grep -qs '"dirigentenstab"' "$dir/settings.json"; then
+        if command -v "$tool" >/dev/null 2>&1 && ! grep -qsF "\"$DIRIGENTENSTAB_MCP_URL\"" "$dir/settings.json"; then
             mkdir -p "$dir"
             node -e 'const fs=require("fs"),f=process.argv[1];let c={};try{c=JSON.parse(fs.readFileSync(f))}catch{}
 c.mcpServers={...c.mcpServers,dirigentenstab:{httpUrl:process.env.DIRIGENTENSTAB_MCP_URL,headers:{Authorization:"Bearer $DIRIGENTENSTAB_MCP_KEY"}}};fs.writeFileSync(f,JSON.stringify(c,null,2))' "$dir/settings.json"

@@ -14,6 +14,8 @@ from .web_sidebar import agent_label
 
 SHELL_SETUP_MESSAGE = ('Please set up the agent shell host for this hub using the agent-shell-host skill: '
                        'use an existing tagged VM if there is one, otherwise deploy a new one, and report when it is ready.')
+SHELL_RERUN_MESSAGE = ('Please re-run the agent-shell-host skill on the existing agent shell host: check every step and repair '
+                       'what is missing or outdated, idempotently, and report what changed.')
 
 
 def setup_admin_dialogs(ctx):
@@ -161,17 +163,17 @@ def setup_admin_dialogs(ctx):
                 resolved = await service.agent_shell_host(fresh=True)
             except ValueError as exc:
                 resolved = str(exc)
-            if main and not resolved:
+            if main:
                 async def setup_shell_host():
                     dialog.close()
                     await service.install_agent_shell_skill(await actor())
                     await ctx.show_agent(main['id'])
                     await ctx.new_conversation()
-                    ctx.prompt.set_value(SHELL_SETUP_MESSAGE)
+                    ctx.prompt.set_value(SHELL_RERUN_MESSAGE if resolved in hosts else SHELL_SETUP_MESSAGE)
                     await ctx.send()
-                ui.button('Set up with ' + agent_label(main), on_click=lambda: protect(setup_shell_host)).props(
+                ui.button(('Re-run setup with ' if resolved in hosts else 'Set up with ') + agent_label(main), on_click=lambda: protect(setup_shell_host)).props(
                     'outline no-caps').mark('setup-agent-shell-host')
-            elif resolved and resolved not in hosts:
+            if resolved and resolved not in hosts:
                 ui.label(resolved).classes('text-sm text-red-600')
             ui.separator()
             ui.label('Secrets').classes('font-semibold')

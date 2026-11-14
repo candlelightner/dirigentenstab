@@ -361,9 +361,10 @@ current compaction settings.
   (root administrator), or, when that is Off, by CloudStack tagging exactly one such VM
   `dirigentenstab-agent-shell-host` (any value); several qualifying tagged VMs are an error until the
   setting picks one. Eligibility and ownership are re-checked on every open. When no host
-  resolves, Platform settings offers **Set up with <Main Agent>**: with the owner's click the
-  hub saves or updates the shipped `agent-shell-host` skill on the root Main Agent and starts a new
-  conversation asking it to prepare the host (Docker, image, isolated network, firewall, tag).
+  resolves, Platform settings offers **Set up with <Main Agent>**, and **Re-run setup with <Main Agent>** when one
+  does: with the owner's click the hub saves or updates (overwriting any edited revision of) the shipped
+  `agent-shell-host` skill on the root Main Agent and starts a new conversation asking it to prepare the host
+  (Docker, image, isolated network, sshd drop-in, firewall, tag) or, when re-running, to check and repair it idempotently.
   Opening the terminal needs only the normal right to operate the agent: the hub connects with the
   host's managed key and runs fixed `sudo -n docker` commands (never a host shell for the human):
   it ensures container `ws-<agent id>` from image `dirigentenstab-shell:latest` on the
@@ -372,7 +373,23 @@ current compaction settings.
   environment file (root-only, written over SSH stdin) carries a per-agent export key labelled `shell`
   (minted on first use, revocable like other keys; after revocation the next open mints a new key
   and recreates the container) and the MCP URL, which a login script registers with Claude Code,
-  Codex and opencode by variable reference. Missing image or network is reported, never created.
+  Codex and opencode by variable reference (re-registered when the URL changes). Missing image or network is reported, never created.
+  MCP tunnel: shells never use `PUBLIC_ORIGIN` or any hub address, so the host and its containers work wherever
+  the VM runs and however the hub is exposed (tailnet, loopback, proxy); the only dependency is that the hub can SSH
+  to the host. While a host is designated the hub holds one long-lived SSH connection to it (background task,
+  reconnect with backoff, restart when the designated host changes, stop when none; keepalives detect a dead
+  link) and requests a remote TCP forward that sshd listens on at the `dirigentenstab-shells` network's gateway
+  address (172.30.0.1 by default), port 3901. Each forwarded connection is handled in the hub process and piped to
+  a second in-process HTTP server on a private unix socket. Its ASGI wrapper passes only `/mcp` (and `/mcp/...`) and
+  `/healthz` to the app and answers 404 to everything else (login, UI, websockets), so a container can neither guess
+  passwords nor trip the global login rate limit. Containers
+  get `DIRIGENTENSTAB_MCP_URL=http://<gateway>:3901/mcp/<agent id>` (part of the `dirigentenstab.config` label, so existing
+  containers are recreated) and speak plain HTTP over the VM-local bridge; SSH provides confidentiality between VM
+  and hub, per-agent bearer keys still authorize every call, and nothing is exposed off the VM. sshd on the host needs
+  `GatewayPorts clientspecified` (drop-in `/etc/ssh/sshd_config.d/60-dirigentenstab-shells.conf`) and the VM firewall
+  must accept `172.30.0.0/24 -> <gateway>:3901` in INPUT before dropping container traffic to the host; the hub never edits
+  sshd or firewall, the `agent-shell-host` skill does. If the forward cannot be established the terminal still opens
+  and its status shows `MCP tunnel unavailable: <reason>; re-run the agent-shell-host setup`.
   Logins: (1) Env logins. Every secret granted to the agent is written into the container's env file as
   `NAME=value` (names that collide with `DIRIGENTENSTAB_*`, `PATH`, `HOME`, `LD_*`, `LC_*` and similar, and
   values with newlines, are skipped and reported in the terminal status). The container is recreated when the

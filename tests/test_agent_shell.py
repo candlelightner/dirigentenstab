@@ -18,7 +18,8 @@ from dirigentenstab.web_vm import Mods, arrow, modified
 
 OWNER = {'userid': 'owner', 'type': 1}
 AGENT = 'a' * 32
-CONFIG = hashlib.sha256(json.dumps([[], True, 5]).encode()).hexdigest()[:32]  # no secrets, sharing on, 5 GiB
+URL = f'http://172.30.0.1:3901/mcp/{"a" * 32}'
+CONFIG = hashlib.sha256(json.dumps([[], True, 5, URL]).encode()).hexdigest()[:32]  # no secrets, sharing on, 5 GiB, tunnel URL
 
 
 @pytest.fixture
@@ -110,6 +111,8 @@ class FakeConn:
         out = SimpleNamespace(returncode=0, stdout='', stderr='')
         if not self.ready and ('image inspect' in command or 'network inspect' in command):
             out.returncode = 1
+        if 'network inspect' in command and not out.returncode:
+            out.stdout = '172.30.0.1\n'
         if 'image inspect -f' in command and not out.returncode:
             tag = command.split()[-1]
             if tag in self.missing_images:
@@ -143,18 +146,19 @@ class FakeConn:
 async def test_ensure_creates_container_with_env_file_over_stdin_only(svc):
     agent = await svc.agent(AGENT)
     conn = FakeConn()
-    await svc.ensure_agent_shell(conn, agent, 'key1', f'https://hub.example/mcp/{AGENT}', 'dsk_secret', '10.0.0.5 hub.example')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'dsk_secret')
     joined = '\n'.join(conn.commands)
     assert 'dsk_secret' not in joined and conn.inputs == [
-        f'DIRIGENTENSTAB_MCP_URL=https://hub.example/mcp/{AGENT}\nDIRIGENTENSTAB_MCP_KEY=dsk_secret\n']
+        f'DIRIGENTENSTAB_MCP_URL={URL}\nDIRIGENTENSTAB_MCP_KEY=dsk_secret\n']
     install = next(c for c in conn.commands if 'install -D' in c)
     assert install == f'sudo -n install -D -m 600 /dev/stdin /var/lib/dirigentenstab-shells/{AGENT}.env'
     run = next(c for c in conn.commands if c.startswith('sudo -n docker run'))
     assert run.startswith('sudo -n docker run -d --name ws-' + AGENT)
     for part in ('--hostname team-alpha', '--restart unless-stopped', '--network dirigentenstab-shells',
-                 '--label dirigentenstab.key=key1', f'-v ws-home-{AGENT}:/home/dev', '--add-host hub.example:10.0.0.5',
+                 '--label dirigentenstab.key=key1', f'-v ws-home-{AGENT}:/home/dev',
                  'dirigentenstab-shell:latest'):
         assert part in run
+    assert '--add-host' not in run and 'hub.example' not in '\n'.join(conn.commands) + ''.join(conn.inputs)
     for forbidden in ('privileged', 'cap-add', 'docker.sock', '--pid', '--net=host'):
         assert forbidden not in run
 
@@ -163,17 +167,17 @@ async def test_ensure_starts_stopped_reuses_running_recreates_on_new_key_and_req
     agent = await svc.agent(AGENT)
     stopped = FakeConn('false key1 sha256:base ' + CONFIG)
     stopped.volumes = {f'ws-home-{AGENT}': SRC}
-    await svc.ensure_agent_shell(stopped, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(stopped, agent, 'key1', 't')
     assert stopped.commands[-1] == f'sudo -n docker start ws-{AGENT}' and not stopped.inputs
     running = FakeConn('true key1 sha256:base ' + CONFIG)
-    await svc.ensure_agent_shell(running, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(running, agent, 'key1', 't')
     assert not any(' start ' in c or ' run ' in c for c in running.commands)
     rotated = FakeConn('true oldkey sha256:base ' + CONFIG)
-    await svc.ensure_agent_shell(rotated, agent, 'key2', 'u', 't')
+    await svc.ensure_agent_shell(rotated, agent, 'key2', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in rotated.commands) and rotated.inputs
     assert any(c.startswith('sudo -n docker run') for c in rotated.commands)
     with pytest.raises(RuntimeError, match='run the agent-shell-host skill'):
-        await svc.ensure_agent_shell(FakeConn(ready=False), agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(FakeConn(ready=False), agent, 'key1', 't')
 
 
 def test_shell_key_is_minted_once_reused_and_reminted_after_revocation(svc):
@@ -219,8 +223,8 @@ async def test_granted_secrets_go_into_env_file_only_over_stdin_and_bad_ones_are
     grant(svc, ['CLAUDE_CODE_OAUTH_TOKEN', 'PATH', 'DIRIGENTENSTAB_MCP_KEY', 'MULTI', 'GH_TOKEN'])
     seen = []
     conn = FakeConn()
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 'tok', progress=seen.append)
-    assert conn.inputs[0] == ('DIRIGENTENSTAB_MCP_URL=u\nDIRIGENTENSTAB_MCP_KEY=tok\n'
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'tok', progress=seen.append)
+    assert conn.inputs[0] == ('DIRIGENTENSTAB_MCP_URL=' + URL + '\nDIRIGENTENSTAB_MCP_KEY=tok\n'
                               'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-secret\nGH_TOKEN=ghp_abcdefgh\n')
     joined = '\n'.join(conn.commands)
     assert not any(v in joined for v in ('sk-ant-oat-secret', 'ghp_abcdefgh', 'line1'))
@@ -231,7 +235,7 @@ async def test_granted_secrets_go_into_env_file_only_over_stdin_and_bad_ones_are
 async def test_config_label_changes_on_grant_value_or_setting_and_holds_no_values(svc, agent):
     async def label(conn_existing=None):
         conn = FakeConn(conn_existing)
-        await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(conn, agent, 'key1', 't')
         run = run_cmd(conn, 'sudo -n docker run')
         return run, run.split('dirigentenstab.config=')[1].split()[0] if 'dirigentenstab.config=' in run else None
     svc.save_secret(OWNER, 'GH_TOKEN', 'ghp_abcdefgh')
@@ -248,24 +252,24 @@ async def test_config_label_changes_on_grant_value_or_setting_and_holds_no_value
     # matching label: container kept; differing label or none (phase-1/2 container): recreated
     svc.save_agent_shell_storage(OWNER, True, 5)
     stale = FakeConn(f'true key1 sha256:base {granted}')
-    await svc.ensure_agent_shell(stale, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(stale, agent, 'key1', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in stale.commands)
     legacy = FakeConn('true key1 sha256:base ' + CONFIG)
-    await svc.ensure_agent_shell(legacy, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(legacy, agent, 'key1', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in legacy.commands)
     current = (await label())[1]
     keep = FakeConn(f'true key1 sha256:base {current}')
-    await svc.ensure_agent_shell(keep, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(keep, agent, 'key1', 't')
     assert not any(' rm ' in c or ' run ' in c for c in keep.commands)
 
 
 async def test_logins_volume_follows_the_setting(svc, agent):
     on = FakeConn()
-    await svc.ensure_agent_shell(on, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(on, agent, 'key1', 't')
     assert '-v ws-logins:/home/dev/.logins' in run_cmd(on, 'sudo -n docker run')
     svc.save_agent_shell_storage(OWNER, False, 5)
     off = FakeConn()
-    await svc.ensure_agent_shell(off, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(off, agent, 'key1', 't')
     run = run_cmd(off, 'sudo -n docker run')
     assert 'ws-logins' not in run and 'SHARED_LOGINS' not in run
 
@@ -290,7 +294,7 @@ BIND = f'--driver local --opt type=none --opt o=bind --opt device={SRC}'
 async def test_new_home_is_a_sparse_ext4_image_owned_by_the_remapped_dev_user(svc, agent):
     conn = FakeConn()
     conn.subuid = '100000\n'
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     cmds = conn.commands
     steps = [next(i for i, c in enumerate(cmds) if marker in c) for marker in (
         f'truncate -s 5G {IMG}', 'mkfs.ext4 -q -F -E root_owner=101000:101000 ' + IMG, 'docker volume create', 'docker run -d')]
@@ -302,19 +306,19 @@ async def test_new_home_is_a_sparse_ext4_image_owned_by_the_remapped_dev_user(sv
 
 async def test_home_without_remap_uses_uid_1000_and_format_failure_removes_image(svc, agent):
     conn = FakeConn()
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     assert any('root_owner=1000:1000' in c for c in conn.commands)
     bad = FakeConn()
     bad.fail = ('mkfs.ext4',)
     with pytest.raises(RuntimeError, match='e2fsprogs'):
-        await svc.ensure_agent_shell(bad, agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(bad, agent, 'key1', 't')
     assert f'sudo -n rm -f {IMG}' == bad.commands[-1] and not any('docker run' in c for c in bad.commands)
 
 
 async def test_plain_volume_is_copied_before_the_old_one_is_removed(svc, agent):
     conn = FakeConn()
     conn.volumes = {f'ws-home-{AGENT}': '<no value>'}
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     cmds = conn.commands
 
     def index(marker):
@@ -334,7 +338,7 @@ async def test_failed_copy_keeps_the_old_volume(svc, agent):
     conn.volumes = {f'ws-home-{AGENT}': ''}
     conn.fail = ('--entrypoint cp',)
     with pytest.raises(RuntimeError, match='Could not copy the old home'):
-        await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     assert f'sudo -n docker volume rm ws-home-{AGENT}' not in conn.commands
     assert f'sudo -n docker volume rm ws-home-{AGENT}-new' in conn.commands and not any('docker run -d' in c for c in conn.commands)
 
@@ -342,7 +346,7 @@ async def test_failed_copy_keeps_the_old_volume(svc, agent):
 async def test_migration_resumes_when_only_the_image_is_left(svc, agent):
     conn = FakeConn()
     conn.files = {IMG: 5 << 30}
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     assert not any('mkfs' in c or 'truncate' in c for c in conn.commands)  # existing image reused, volume re-attached
     assert any(c.endswith(f'ws-home-{AGENT}') and 'volume create' in c for c in conn.commands)
 
@@ -351,7 +355,7 @@ async def test_home_grows_on_recreation_and_never_shrinks(svc, agent):
     svc.save_agent_shell_storage(OWNER, True, 8)
     conn = FakeConn()
     conn.volumes, conn.files = {f'ws-home-{AGENT}': SRC}, {IMG: 5 << 30}
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     cmds = conn.commands
     grow = [cmds.index(c) for c in (f'sudo -n truncate -s 8G {IMG}', f'sudo -n e2fsck -fy {IMG}', f'sudo -n resize2fs {IMG}')]
     assert grow == sorted(grow) and grow[-1] < next(i for i, c in enumerate(cmds) if 'docker run -d' in c)
@@ -360,12 +364,12 @@ async def test_home_grows_on_recreation_and_never_shrinks(svc, agent):
     svc.save_agent_shell_storage(OWNER, True, 2)
     smaller = FakeConn()
     smaller.volumes, smaller.files = {f'ws-home-{AGENT}': SRC}, {IMG: 8 << 30}
-    await svc.ensure_agent_shell(smaller, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(smaller, agent, 'key1', 't')
     assert not any('truncate' in c or 'resize2fs' in c for c in smaller.commands)
     failing = FakeConn()
     failing.volumes, failing.files, failing.fail = {f'ws-home-{AGENT}': SRC}, {IMG: 1 << 30}, ('resize2fs',)
     with pytest.raises(RuntimeError, match='Could not resize'):
-        await svc.ensure_agent_shell(failing, agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(failing, agent, 'key1', 't')
     assert f'sudo -n truncate -s {1 << 30} {IMG}' in failing.commands  # rolled back
 
 
@@ -464,7 +468,7 @@ async def test_ensure_treats_concurrent_creation_as_success(svc):
             return out
 
     conn = Racing()
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     with pytest.raises(RuntimeError, match='Could not create'):
         class Wrong(Racing):
             async def run(self, command, input=None, check=True):
@@ -473,7 +477,7 @@ async def test_ensure_treats_concurrent_creation_as_success(svc):
                     out.returncode, out.stderr = 125, 'boom'
                     self.existing = 'true otherkey sha256:base ' + CONFIG
                 return out
-        await svc.ensure_agent_shell(Wrong(), agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(Wrong(), agent, 'key1', 't')
 
 
 def test_mods_one_shot_double_tap_lock():
@@ -499,7 +503,7 @@ def is_mount(command):
 
 async def test_home_directory_is_created_after_every_mount_and_before_the_volume_binds(svc, agent):
     conn = FakeConn()
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     cmds = conn.commands
     mount = next(i for i, c in enumerate(cmds) if is_mount(c))
     prepare = next(i for i, c in enumerate(cmds) if '.dshome.tmp' in c and c.endswith(MNT))
@@ -511,7 +515,7 @@ async def test_home_directory_is_created_after_every_mount_and_before_the_volume
 async def test_first_layout_volume_bound_to_the_root_is_replaced_by_the_subdirectory_volume(svc, agent):
     conn = FakeConn()
     conn.volumes, conn.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     cmds = conn.commands
     assert cmds.index(f'sudo -n docker volume rm ws-home-{AGENT}') < next(i for i, c in enumerate(cmds) if f'device={SRC}' in c)
 
@@ -519,26 +523,26 @@ async def test_first_layout_volume_bound_to_the_root_is_replaced_by_the_subdirec
 async def test_stopped_container_gets_its_mount_back_before_docker_starts_it(svc, agent):
     stopped = FakeConn('false key1 sha256:base ' + CONFIG)
     stopped.volumes = {f'ws-home-{AGENT}': SRC}
-    await svc.ensure_agent_shell(stopped, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(stopped, agent, 'key1', 't')
     cmds = stopped.commands
     mount = next(i for i, c in enumerate(cmds) if is_mount(c))
     assert mount < cmds.index(f'sudo -n docker start ws-{AGENT}')
     assert any('.dshome.tmp' in c for c in cmds[mount:])
     running = FakeConn('true key1 sha256:base ' + CONFIG)  # nothing to mount for a container that is already running
-    await svc.ensure_agent_shell(running, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(running, agent, 'key1', 't')
     assert not any(is_mount(c) for c in running.commands)
     broken = FakeConn('false key1 sha256:base ' + CONFIG)
     broken.volumes = {f'ws-home-{AGENT}': SRC}
     broken.fail = ('mount "$1"',)
     with pytest.raises(RuntimeError, match='Could not mount the home image'):
-        await svc.ensure_agent_shell(broken, agent, 'key1', 'u', 't')
+        await svc.ensure_agent_shell(broken, agent, 'key1', 't')
     assert f'sudo -n docker start ws-{AGENT}' not in broken.commands  # fails closed: never starts on a bare mount point
 
 
 async def test_stopped_container_on_a_legacy_home_is_recreated_and_migrated(svc, agent):
     legacy = FakeConn('false key1 sha256:base ' + CONFIG)
     legacy.volumes, legacy.files = {f'ws-home-{AGENT}': MNT}, {IMG: 5 << 30}
-    await svc.ensure_agent_shell(legacy, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(legacy, agent, 'key1', 't')
     cmds = legacy.commands
     assert f'sudo -n docker rm -f ws-{AGENT}' in cmds and f'sudo -n docker volume rm ws-home-{AGENT}' in cmds
     assert cmds.index(f'sudo -n docker rm -f ws-{AGENT}') < next(i for i, c in enumerate(cmds) if '.dshome.tmp' in c)
@@ -547,5 +551,17 @@ async def test_stopped_container_on_a_legacy_home_is_recreated_and_migrated(svc,
 async def test_second_ensure_on_a_migrated_home_changes_nothing(svc, agent):
     conn = FakeConn()
     conn.volumes, conn.files = {f'ws-home-{AGENT}': SRC}, {IMG: 5 << 30}
-    await svc.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await svc.ensure_agent_shell(conn, agent, 'key1', 't')
     assert not any('volume create' in c or 'volume rm' in c or 'mkfs' in c for c in conn.commands)
+
+
+async def test_shell_url_uses_the_tunnel_gateway_and_changes_the_config_label(svc):
+    agent = await svc.agent(AGENT)
+    conn = FakeConn()
+    await svc.ensure_agent_shell(conn, agent, 'key1', 'tok')
+    assert conn.inputs[0].startswith(f'DIRIGENTENSTAB_MCP_URL={URL}\n')
+    assert f'--label dirigentenstab.config={CONFIG}' in next(c for c in conn.commands if c.startswith('sudo -n docker run'))
+    old = hashlib.sha256(json.dumps([[], True, 5]).encode()).hexdigest()[:32]  # config of a container made before the tunnel
+    stale = FakeConn('true key1 sha256:base ' + old)
+    await svc.ensure_agent_shell(stale, agent, 'key1', 'tok')
+    assert any(c.startswith('sudo -n docker rm -f') for c in stale.commands)

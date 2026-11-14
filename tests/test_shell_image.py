@@ -246,7 +246,7 @@ async def shell_env(env):
 async def test_empty_spec_uses_base_image_with_no_build(env):
     agent = await shell_env(env)
     conn = FakeConn()
-    await env.service.ensure_agent_shell(conn, agent, 'k', 'u', 't')
+    await env.service.ensure_agent_shell(conn, agent, 'k', 't')
     assert not any('docker build' in c for c in conn.commands)
     assert any(c.startswith('sudo -n docker run') and c.endswith(' dirigentenstab-shell:latest') for c in conn.commands)
 
@@ -271,7 +271,7 @@ async def test_build_recreate_prune_sequence_and_progress(env):
         return out
     conn.run = run
     progress = []
-    await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't', progress=progress.append)
+    await env.service.ensure_agent_shell(conn, agent, 'key1', 't', progress=progress.append)
     cmds = conn.commands
     build = next(i for i, c in enumerate(cmds) if 'docker build' in c)
     assert cmds[build] == f'sudo -n timeout 900 docker build -t {tag} -' and conn.inputs[0] == shell_image.render({'apt': ['git']})
@@ -287,14 +287,14 @@ async def test_matching_image_and_key_needs_no_build_or_recreate(env):
     agent = await shell_env(env)
     env.service._write_shell_spec(AGENT, {'apt': ['git']})
     conn = FakeConn('true key1 sha256:base ' + CONFIG)
-    await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await env.service.ensure_agent_shell(conn, agent, 'key1', 't')
     assert not any(' build ' in c or ' rm ' in c or ' run ' in c for c in conn.commands)
 
 
 async def test_base_rebuild_recreates_the_container(env):
     agent = await shell_env(env)
     conn = FakeConn('true key1 sha256:oldbase ' + CONFIG)
-    await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+    await env.service.ensure_agent_shell(conn, agent, 'key1', 't')
     assert any(c.startswith('sudo -n docker rm -f') for c in conn.commands) and any(c.startswith('sudo -n docker run') for c in conn.commands)
 
 
@@ -306,7 +306,7 @@ async def test_build_failure_is_bounded_and_leaves_the_container(env):
     conn.missing_images = {tag}
     conn.build_result = (1, 'x' * 5000 + 'E: Unable to locate package git')
     with pytest.raises(RuntimeError, match='Image build failed') as caught:
-        await env.service.ensure_agent_shell(conn, agent, 'key1', 'u', 't')
+        await env.service.ensure_agent_shell(conn, agent, 'key1', 't')
     assert len(str(caught.value)) < 700 and str(caught.value).endswith('git')
     assert not any('rm -f' in c for c in conn.commands)
 
@@ -327,8 +327,8 @@ async def test_builds_are_serialized_per_agent(env):
             return await super().run(command, input, check)
 
     waiting = []
-    await asyncio.gather(env.service.ensure_agent_shell(Conn(), agent, 'k', 'u', 't'),
-                         env.service.ensure_agent_shell(Conn(), agent, 'k', 'u', 't', progress=waiting.append))
+    await asyncio.gather(env.service.ensure_agent_shell(Conn(), agent, 'k', 't'),
+                         env.service.ensure_agent_shell(Conn(), agent, 'k', 't', progress=waiting.append))
     assert len(builds) == 1 and waiting[0].startswith('Waiting')
 
 
