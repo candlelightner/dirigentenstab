@@ -135,7 +135,7 @@ A safe cutover must inventory each workload's root disk **and every attached cus
 
 **Watchdog.** When at least 75% of `nfsd` threads are blocked on two consecutive runs, it reports the issue (`healthy` false, `secondary_nfs.stuck` true) and raises `/proc/fs/nfsd/threads` by 16, capped at 64, at most once per 15 minutes (journal and `actions`). It never restarts `nfs-server`, unmounts, or kills processes. The dmesg message is only a supporting hint in the issue text.
 
-**Hung nfsd control.** The watchdog never touches `/proc/fs/nfsd/threads` itself; it reads and writes it through a `cat`/`tee` child with a 5 s timeout and never waits for a timed-out child (a D-state process cannot be killed). A timeout, or a leftover D-state reader from an earlier run, is reported at once as stuck NFS (`secondary_nfs.nfsd_threads` null, issue "nfsd control interface hung"), `healthy` false, and no thread raise is attempted. Status keeps updating.
+**Hung nfsd control.** The watchdog never touches `/proc/fs/nfsd/threads` itself; it reads and writes it through a `cat`/`tee` child with a 5 s timeout and never waits for a timed-out child (a D-state process cannot be killed). A timeout, or a leftover D-state reader from an earlier run, is reported at once as stuck NFS (`secondary_nfs.nfsd_threads` null, issue "nfsd control interface hung"), `healthy` false, and no thread raise is attempted. Status keeps updating. The unit uses `KillMode=process` so systemd does not wait on an unkillable reader.
 
 ### Loopback NFS deadlock (2026-11-14)
 
