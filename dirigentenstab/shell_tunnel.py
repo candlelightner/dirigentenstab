@@ -1,54 +1,59 @@
 """Hub-held reverse SSH forward that lets agent-shell containers reach the hub's MCP endpoint however the hub is exposed.
 
 The hub keeps one SSH connection to the designated shell host and asks sshd to listen on the shell network's gateway
-address. Each forwarded connection is handled here and piped to the hub's own app listener, so containers speak plain
+address. Each forwarded connection is handled here and piped to a restricted in-process server (MCP export and /healthz only) on a private unix socket, so containers speak plain
 HTTP over the VM-local bridge while SSH carries it to the hub. Per-agent bearer keys still authorize every call.
 """
 
 import asyncio
 import logging
 import os
-import ssl
+import shutil
+import tempfile
 
 import asyncssh
+import uvicorn
+from starlette.responses import PlainTextResponse
 
 SHELL_TUNNEL_PORT = 3901
 GATEWAY = "{{(index .IPAM.Config 0).Gateway}}"
 log = logging.getLogger(__name__)
 
 
-async def pipe(reader, writer):
-    """Connect one forwarded connection to the hub's own app listener (self-signed TLS is not verified on loopback)."""
-    context = None
-    if os.getenv('APP_TLS_CERT'):
-        context = ssl.create_default_context()
-        context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
-    try:
-        upstream_reader, upstream_writer = await asyncio.open_connection('127.0.0.1', int(os.getenv('APP_PORT', '8088')), ssl=context)
-    except OSError:
-        writer.close()
-        return
+class Restricted:
+    """Forward only the MCP export and /healthz to the app; everything else (login, UI, websockets) is a 404."""
 
-    async def copy(source, target):
-        try:
-            while data := await source.read(65536):
-                target.write(data)
-                await target.drain()
-        except (OSError, asyncssh.Error):
-            pass
-        finally:
-            target.close()
-    await asyncio.gather(copy(reader, upstream_writer), copy(upstream_reader, writer))
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get('path', '')
+        if scope['type'] == 'http' and (path == '/healthz' or path == '/mcp' or path.startswith('/mcp/')):
+            return await self.app(scope, receive, send)
+        if scope['type'] == 'http':
+            return await PlainTextResponse('Not found', status_code=404)(scope, receive, send)
+        if scope['type'] == 'websocket':
+            await receive()
+            await send({'type': 'websocket.close', 'code': 1008})
 
 
 class ShellTunnel:
     def __init__(self, service, interval=15):
         self.service, self.interval = service, interval
-        self.supervisor = self.worker = None
+        self.supervisor = self.worker = self.local = self.socket = None
         self.host, self.up, self.error = '', False, 'not connected yet'
         self.retry = asyncio.Event()
 
-    def start(self):
+    async def start(self, app):
+        """Serve `app` (restricted) on a private unix socket and start following the designated host."""
+        if not self.local:
+            directory = tempfile.mkdtemp(prefix='dirigentenstab-tunnel-')  # mode 0700
+            self.socket = os.path.join(directory, 'app.sock')
+            config = uvicorn.Config(Restricted(app), uds=self.socket, lifespan='off', log_level='warning')
+            config.load()
+            self.local = uvicorn.Server(config)  # startup/shutdown only: serve() would take over the process's signal handlers
+            self.local.lifespan = config.lifespan_class(config)
+            await self.local.startup()
         if not self.supervisor or self.supervisor.done():
             self.supervisor = asyncio.create_task(self._supervise())
 
@@ -58,6 +63,30 @@ class ShellTunnel:
                 task.cancel()
         self.supervisor = self.worker = None
         self.host, self.up = '', False
+        if self.local:
+            self.local.should_exit = True
+            await self.local.shutdown()
+            shutil.rmtree(os.path.dirname(self.socket), ignore_errors=True)
+            self.local = self.socket = None
+
+    async def pipe(self, reader, writer):
+        """Relay one forwarded connection to the restricted local server."""
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_unix_connection(self.socket)
+        except OSError:
+            writer.close()
+            return
+
+        async def copy(source, target):
+            try:
+                while data := await source.read(65536):
+                    target.write(data)
+                    await target.drain()
+            except (OSError, asyncssh.Error):
+                pass
+            finally:
+                target.close()
+        await asyncio.gather(copy(reader, upstream_writer), copy(upstream_reader, writer))
 
     async def follow(self, host):
         """Hold the tunnel to `host` (restart when it changes or died); stop when empty."""
@@ -123,7 +152,7 @@ class ShellTunnel:
             if found.returncode or not gateway:
                 raise RuntimeError('the shell network does not exist')
             try:
-                await conn.start_server(lambda *_: pipe, gateway, SHELL_TUNNEL_PORT)
+                await conn.start_server(lambda *_: self.pipe, gateway, SHELL_TUNNEL_PORT)
             except asyncssh.ChannelListenError:
                 raise RuntimeError(f'sshd refused to listen on {gateway}:{SHELL_TUNNEL_PORT}') from None
             bound = await conn.run(f"ss -H -ltn 'sport = :{SHELL_TUNNEL_PORT}'", check=False)

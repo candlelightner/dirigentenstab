@@ -2135,7 +2135,7 @@ async def choose_shell_host(page):
         await close.click()
 
 
-async def test_agent_shell_setup_button_only_without_host_and_starts_conversation(browser_app):
+async def test_agent_shell_setup_button_becomes_rerun_with_host_and_starts_conversation(browser_app):
     url, _ = browser_app
     async with playwright.async_playwright() as p:
         browser = await p.chromium.launch()
@@ -2150,6 +2150,9 @@ async def test_agent_shell_setup_button_only_without_host_and_starts_conversatio
         await choose_shell_host(page)
         await open_platform_settings(page)
         await playwright.expect(button).to_be_hidden()
+        rerun = page.get_by_role('button', name='Re-run setup with Main Agent', exact=True)
+        await rerun.click()
+        await page.get_by_text(re.compile(r're-run the agent-shell-host skill')).first.wait_for()
         await browser.close()
 
 
