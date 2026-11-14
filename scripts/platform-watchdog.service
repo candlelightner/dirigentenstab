@@ -7,6 +7,8 @@ Type=oneshot
 EnvironmentFile=/etc/dirigentenstab-network.env
 ExecStart=/usr/bin/python3 /usr/local/libexec/dirigentenstab-platform-watchdog.py
 TimeoutStartSec=180
+# An nfsd reader stuck in D state cannot be killed; systemd must not wait on it at unit stop (would stall the 60 s timer).
+KillMode=process
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dirigentenstab/platform /etc/cloudstack/agent

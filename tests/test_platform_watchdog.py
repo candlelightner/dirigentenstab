@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ def data(status='Up', resource='Enabled', api=True, vm='Running', agent_host=Non
             'capacity': {'cpu_allocated_pct': 50.0, 'memory_allocated_pct': 40.0, 'local_storage_used_pct': None,
                          'cpu_threshold_pct': 85.0, 'memory_threshold_pct': 85.0},
             'agent_host': agent_host or f'{wd.ADDRESS}@static', 'api': api,
-            'nfsd': {'threads': nfsd[0], 'running': nfsd[1], 'blocked': nfsd[2], 'not_responding': False}}
+            'nfsd': {'threads': nfsd[0], 'control_hung': False, 'running': nfsd[1], 'blocked': nfsd[2], 'not_responding': False}}
 
 
 @pytest.fixture(autouse=True)
@@ -29,8 +30,8 @@ def paths(tmp_path, monkeypatch):
     props = tmp_path / 'agent.properties'
     props.write_text('zone=1\nhost=10.0.0.203@static\nport=8250\n')
     monkeypatch.setattr(wd, 'PROPERTIES', props)
-    monkeypatch.setattr(wd, 'NFSD_THREADS', tmp_path / 'nfsd-threads')
     (tmp_path / 'nfsd-threads').write_text('8\n')
+    monkeypatch.setattr(wd, 'write_threads', lambda count: (tmp_path / 'nfsd-threads').write_text(f'{count}\n'))
     return tmp_path
 
 
@@ -222,3 +223,18 @@ def test_nfsd_dry_run_changes_nothing(paths, capsys):
     assert nfs_threads(paths) == 8
     assert 'raise-nfsd-threads' in capsys.readouterr().out
     assert json.loads((paths / 'status.json').read_text())['updated'] == NOW
+
+
+def test_nfsd_control_hung_reports_stuck_and_never_raises(paths, monkeypatch):
+    def hang():
+        raise subprocess.TimeoutExpired('cat', 5)
+    monkeypatch.setattr(wd, 'read_threads', hang)
+    monkeypatch.setattr(wd, 'write_threads', lambda count: pytest.fail('write would hang'))
+    nfsd = wd.nfsd_state()
+    assert nfsd['threads'] is None and nfsd['control_hung'] is True
+    hung = data()
+    hung['nfsd'] = {**hung['nfsd'], 'threads': None, 'control_hung': True}
+    status, _ = run(hung)
+    assert status['healthy'] is False and status['secondary_nfs']['stuck'] is True
+    assert any('nfsd control interface hung' in issue for issue in status['issues'])
+    assert status['actions'] == [] and nfs_threads(paths) == 8

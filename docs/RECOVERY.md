@@ -135,6 +135,18 @@ A safe cutover must inventory each workload's root disk **and every attached cus
 
 **Watchdog.** When at least 75% of `nfsd` threads are blocked on two consecutive runs, it reports the issue (`healthy` false, `secondary_nfs.stuck` true) and raises `/proc/fs/nfsd/threads` by 16, capped at 64, at most once per 15 minutes (journal and `actions`). It never restarts `nfs-server`, unmounts, or kills processes. The dmesg message is only a supporting hint in the issue text.
 
+**Hung nfsd control.** The watchdog never touches `/proc/fs/nfsd/threads` itself; it reads and writes it through a `cat`/`tee` child with a 5 s timeout and never waits for a timed-out child (a D-state process cannot be killed). A timeout, or a leftover D-state reader from an earlier run, is reported at once as stuck NFS (`secondary_nfs.nfsd_threads` null, issue "nfsd control interface hung"), `healthy` false, and no thread raise is attempted. Status keeps updating. The unit uses `KillMode=process` so systemd does not wait on an unkillable reader.
+
+### Loopback NFS deadlock (2026-11-14)
+
+One nfsd thread held an ext4 inode lock, entered direct reclaim and waited on an NFS COMMIT for the loopback mount; the other threads blocked on that lock. A later `nfs-server` restart (needrestart) then hung in `svc_set_num_threads` holding the nfsd mutex, so `/proc/fs/nfsd/threads` blocked forever.
+
+1. Confirm via nfsd thread stacks (`sudo cat /proc/<pid>/stack`): one in `nfs_wb_folio`/`wait_on_commit` under `ext4_buffered_write_iter`, the rest in `ext4_buffered_write_iter`.
+2. `sudo umount -f <secondary mount under /mnt/>`. It answers "device is busy" but aborts the pending RPCs and clears the deadlock.
+3. Check `nfs-server` is active, kill leftover CloudStack agent `find / -type d -name vmware-vix-disklib-distrib` processes, then `sudo systemctl restart cloudstack-agent`.
+
+Host hardening already in place: `/etc/needrestart/conf.d/dirigentenstab-platform.conf` (no auto-restart of nfs-server, nfs-*, rpcbind, cloudstack-*, libvirt*), `/etc/sysctl.d/90-loopback-nfs-headroom.conf` (`vm.min_free_kbytes = 262144`), and `vddk.lib.dir=/opt/cloudstack-vddk-stub` in `agent.properties`. CloudStack 4.23 runs `find /` for VDDK on every agent connect; without a valid dir (`lib64/libvixDiskLib.so`) it hangs on a wedged NFS mount, the management server times out after 120 s and the host stays Alert.
+
 ## Private templates and optional GPU preparation
 
 Managed deployment and private-image recovery apply to operations explicitly requested with `managed=true`. Ordinary native API calls preserve supplied parameters and do not enroll managed SSH or approve derived images automatically. Never repeat a failed managed operation through the native path to bypass reconciliation.
