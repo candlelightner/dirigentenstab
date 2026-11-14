@@ -372,7 +372,22 @@ current compaction settings.
   environment file (root-only, written over SSH stdin) carries a per-agent export key labelled `shell`
   (minted on first use, revocable like other keys; after revocation the next open mints a new key
   and recreates the container) and the MCP URL, which a login script registers with Claude Code,
-  Codex and opencode by variable reference. Missing image or network is reported, never created.
+  Codex and opencode by variable reference (re-registered when the URL changes). Missing image or network is reported, never created.
+  MCP tunnel: shells never use `PUBLIC_ORIGIN` or any hub address, so the host and its containers work wherever
+  the VM runs and however the hub is exposed (tailnet, loopback, proxy); the only dependency is that the hub can SSH
+  to the host. While a host is designated the hub holds one long-lived SSH connection to it (background task,
+  reconnect with backoff, restart when the designated host changes, stop when none; keepalives detect a dead
+  link) and requests a remote TCP forward that sshd listens on at the `dirigentenstab-shells` network's gateway
+  address (172.30.0.1 by default), port 3901. Each forwarded connection is handled in the hub process and piped to
+  the hub's own app listener (`127.0.0.1:APP_PORT`, TLS without certificate verification on loopback). Containers
+  get `DIRIGENTENSTAB_MCP_URL=http://<gateway>:3901/mcp/<agent id>` (part of the `dirigentenstab.config` label, so existing
+  containers are recreated) and speak plain HTTP over the VM-local bridge; SSH provides confidentiality between VM
+  and hub, per-agent bearer keys still authorize every call (the forward also reaches the app's other
+  endpoints, which stay behind their own session checks), and nothing is exposed off the VM. sshd on the host needs
+  `GatewayPorts clientspecified` (drop-in `/etc/ssh/sshd_config.d/60-dirigentenstab-shells.conf`) and the VM firewall
+  must accept `172.30.0.0/24 -> <gateway>:3901` in INPUT before dropping container traffic to the host; the hub never edits
+  sshd or firewall, the `agent-shell-host` skill does. If the forward cannot be established the terminal still opens
+  and its status shows `MCP tunnel unavailable: <reason>; re-run the agent-shell-host setup`.
   Logins: (1) Env logins. Every secret granted to the agent is written into the container's env file as
   `NAME=value` (names that collide with `DIRIGENTENSTAB_*`, `PATH`, `HOME`, `LD_*`, `LC_*` and similar, and
   values with newlines, are skipped and reported in the terminal status). The container is recreated when the

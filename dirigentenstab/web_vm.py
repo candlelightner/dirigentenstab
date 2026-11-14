@@ -199,7 +199,7 @@ def setup_vm(ctx):
             if state.get('terminal_agent'):
                 def progress(text):  # a skipped-secret notice must outlive the later "Connected" status
                     ctx.terminal_status.set_text(text)
-                    notice[:] = [text] if text.startswith('Not exported') else notice
+                    notice[:] = [*notice, text] if text.startswith(('Not exported', 'MCP tunnel')) else notice
                 conn, command = await service.open_agent_shell(current, vm_id, progress)
                 vm = {'name': vm_name}
             else:

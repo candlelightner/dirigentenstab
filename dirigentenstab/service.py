@@ -22,6 +22,7 @@ from .settings import endpoint, dashboard_endpoint
 from .diagnostics import OperationError
 from .hierarchy import validate_child
 from . import shell_image
+from .shell_tunnel import SHELL_TUNNEL_PORT, ShellTunnel
 from .limits import APP_ROOT_AGENT, GLOBAL_ADMIN_AGENT, check_vm_policy, gpu_count
 from .auth import NATIVE_POLL_SECONDS
 from .gpu import FLAGS, GPU_COMMANDS, GPU_CONTEXT, effective_policy, helper_call, policy_gain, validate_policy
@@ -119,6 +120,7 @@ class Service:
         self._provision_lock = asyncio.Lock()
         self._deploy_lock = asyncio.Lock()
         self._shell_locks = {}
+        self.shell_tunnel = ShellTunnel(self)
         self._secrets = set()
         self._terminal_sessions = {}
         self._visible_domains = {}
@@ -1651,14 +1653,14 @@ class Service:
             self.store.audit(identity['userid'], operation, vm_id)
         return await self.ssh_connect(address, record), vm
 
-    async def ssh_connect(self, address, record):
+    async def ssh_connect(self, address, record, **options):
         import asyncssh
         return await asyncssh.connect(
             address, port=record['port'], username=record['username'],
             client_keys=[asyncssh.import_private_key(self.store.open(record['private_key']))],
             known_hosts=([asyncssh.import_public_key(record['host_key'])], [], []),
             config=None, agent_path=None, preferred_auth=['publickey'],
-            connect_timeout=10, login_timeout=10,
+            connect_timeout=10, login_timeout=10, **options,
         )
 
     def agent_shell_hosts(self):
@@ -1754,7 +1756,7 @@ class Service:
 
         The hub's managed key runs fixed docker commands only; the human is authorized for the agent, never the host VM.
         """
-        from .mcp_export import export_hosts, export_url, shell_key
+        from .mcp_export import shell_key
         if not isinstance(agent_id, str) or not SHELL_AGENT.fullmatch(agent_id):
             raise ValueError('Invalid agent')
         agent = await self.authorize(identity, agent_id)
@@ -1765,16 +1767,18 @@ class Service:
         self.store.audit(identity['userid'], 'open-agent-shell', agent_id)
         address, _ = await self.vm_address(await self.agent(record['owner_agent']), host)
         key_id, token = shell_key(self, agent_id, identity['userid'])
-        hosts = await asyncio.to_thread(export_hosts, self)
         conn = await self.ssh_connect(address, record)
         try:
-            await self.ensure_agent_shell(conn, agent, key_id, f'{export_url(self)}/{agent_id}', token, hosts, progress)
+            await self.ensure_agent_shell(conn, agent, key_id, token, progress)
+            await self.shell_tunnel.follow(host)
+            if reason := await self.shell_tunnel.wait_ready():
+                (progress or (lambda text: None))(f'MCP tunnel unavailable: {reason}; re-run the agent-shell-host setup')
         except BaseException:
             conn.close()
             raise
         return conn, f'sudo -n docker exec -it -u dev -w /home/dev ws-{agent_id} bash -l'
 
-    async def ensure_agent_shell(self, conn, agent, key_id, url, token, hosts='', progress=None):
+    async def ensure_agent_shell(self, conn, agent, key_id, token, progress=None):
         """Idempotently build the agent's image, create or start its container; the token travels only over SSH stdin.
 
         One lock per agent so two tabs never build or create twice. A container whose image differs from the expected
@@ -1784,15 +1788,17 @@ class Service:
         if lock.locked() and progress:
             progress('Waiting for another build of this agent image…')
         async with lock:
-            await self._ensure_agent_shell(conn, agent, key_id, url, token, hosts, progress or (lambda text: None))
+            await self._ensure_agent_shell(conn, agent, key_id, token, progress or (lambda text: None))
 
-    async def _ensure_agent_shell(self, conn, agent, key_id, url, token, hosts, progress):
+    async def _ensure_agent_shell(self, conn, agent, key_id, token, progress):
         async def docker(*args, run=False, input=None):
             command = 'sudo -n ' + ' '.join(shlex.quote(a) for a in (args if run else ('docker', *args)))
             return await conn.run(command, input=input, check=False)
         base = await docker('image', 'inspect', '-f', '{{.Id}}', SHELL_IMAGE)
-        if base.returncode or (await docker('network', 'inspect', SHELL_NETWORK)).returncode:
+        network = await docker('network', 'inspect', '-f', '{{(index .IPAM.Config 0).Gateway}}', SHELL_NETWORK)
+        if base.returncode or network.returncode or not network.stdout.strip():
             raise RuntimeError('Agent shell host is not set up: run the agent-shell-host skill')
+        url = f"http://{network.stdout.strip()}:{SHELL_TUNNEL_PORT}/mcp/{agent['id']}"  # the hub's reverse SSH forward on the bridge gateway
         dockerfile = shell_image.render(await self.shell_spec(agent))
         image = SHELL_IMAGE
         image_id = base.stdout.strip()
@@ -1816,7 +1822,7 @@ class Service:
         name, env_file = 'ws-' + agent['id'], f"{SHELL_ENV_DIR}/{agent['id']}.env"
         share, gib = self.shell_share_logins(), self.shell_home_gib()
         secrets, skipped, marks = await self.shell_secrets(agent)
-        config = hashlib.sha256(json.dumps([marks, share, gib]).encode()).hexdigest()[:32]  # names and timestamps only
+        config = hashlib.sha256(json.dumps([marks, share, gib, url]).encode()).hexdigest()[:32]  # names and timestamps only
         inspect_format = '{{.State.Running}} {{index .Config.Labels "dirigentenstab.key"}} {{.Image}} {{index .Config.Labels "dirigentenstab.config"}}'
         found = await docker('inspect', '-f', inspect_format, name)
         state = found.stdout.split() if not found.returncode else None
@@ -1839,14 +1845,13 @@ class Service:
         written = await docker('install', '-D', '-m', '600', '/dev/stdin', env_file, run=True,
                                input=f'DIRIGENTENSTAB_MCP_URL={url}\nDIRIGENTENSTAB_MCP_KEY={token}\n'
                                      + ''.join(f'{key}={value}\n' for key, value in secrets.items()))
-        address, _, host = hosts.partition(' ')
         slug = re.sub(r'[^a-z0-9]+', '-', agent['name'].lower()).strip('-')[:32] or 'agent'
         created = written if written.returncode else await docker(
             'run', '-d', '--name', name, '--hostname', slug, '--restart', 'unless-stopped', '--network', SHELL_NETWORK,
             '--label', 'dirigentenstab.key=' + key_id, '--label', 'dirigentenstab.config=' + config, '--env-file', env_file,
             '-v', f"ws-home-{agent['id']}:/home/dev",
             *(['-v', f'{SHELL_LOGINS_VOLUME}:/home/dev/.logins', '-e', 'DIRIGENTENSTAB_SHARED_LOGINS=1'] if share else []),
-            *(['--add-host', f'{host}:{address}'] if host else []), image)
+            image)
         if created.returncode and not written.returncode:  # a concurrent open may have created it first
             again = await docker('inspect', '-f', inspect_format, name)
             state = again.stdout.split() if not again.returncode else None

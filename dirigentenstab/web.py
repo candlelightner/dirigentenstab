@@ -273,6 +273,8 @@ def main():
     attach(app, auth, settings)
     app.on_startup(build_ui(service, auth).start)
     app.on_startup(lambda: setattr(service, 'reconciler', asyncio.create_task(service.reconcile_periodically())))
+    app.on_startup(service.shell_tunnel.start)
+    app.on_shutdown(service.shell_tunnel.stop)
     app.on_startup(lambda: setattr(auth, 'keepalive_task', asyncio.create_task(auth.keepalive_periodically())))
     tls = {}
     if os.getenv('APP_TLS_CERT') or os.getenv('APP_TLS_KEY'):
