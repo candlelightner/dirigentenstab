@@ -18,9 +18,22 @@ from pydantic_core import to_jsonable_python
 ESTIMATE_SOURCE = 'Estimated from UTF-8 message, instruction and tool metadata size (4 bytes per token).'
 
 
+def text_json(messages):
+    """Messages as JSON data with binary payloads (images) replaced by an `[image]` placeholder."""
+    raw = ModelMessagesTypeAdapter.dump_json(messages)
+    if b'"kind":"binary"' not in raw:
+        return raw
+
+    def walk(value):
+        if isinstance(value, dict):
+            return '[image]' if value.get('kind') == 'binary' else {key: walk(item) for key, item in value.items()}
+        return [walk(item) for item in value] if isinstance(value, list) else value
+    return json.dumps(walk(json.loads(raw)), ensure_ascii=False).encode()
+
+
 def estimate_tokens(messages, request_parameters):
     parameters = json.dumps(to_jsonable_python(request_parameters, serialize_unknown=True), ensure_ascii=False).encode()
-    return math.ceil((len(ModelMessagesTypeAdapter.dump_json(messages)) + len(parameters)) / 4)
+    return math.ceil((len(text_json(messages)) + len(parameters)) / 4)
 
 
 def _prefix_hash(messages):
@@ -123,7 +136,7 @@ class CompactionModel(WrapperModel):
         await self._event({'type': 'compaction', 'phase': 'started', 'status': 'Compacting context…',
                            'covered_messages': cut, 'context': usage})
         source = {'previous_summary': summary,
-                  'additional_messages': json.loads(ModelMessagesTypeAdapter.dump_json(messages[covered:cut]))}
+                  'additional_messages': json.loads(text_json(messages[covered:cut]))}
         try:
             output_limit = min(4096, self.response_reserve) if self.summary_model is self.wrapped else 4096
             compactor = Agent(self.summary_model, retries=0, model_settings={'max_tokens': output_limit, 'timeout': 60},

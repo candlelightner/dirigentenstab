@@ -3,20 +3,50 @@ import posixpath
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import tempfile
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+from .images import MEDIA_TYPES, validate_image
 
 PREFIX = '/vm-files/'
 GRANT_SECONDS = 60
 MAX_UPLOAD = 100 * 1024 * 1024
 CHUNK = 256 * 1024
 UPLOAD_LIMIT_TEXT = f'{MAX_UPLOAD // 1024 // 1024} MiB'
+PASTE_DIR = '/tmp/dirigentenstab-pastes'
+
+
+def paste_command(agent_id, name):
+    """Fixed command that writes stdin into the agent's container; `agent_id` is service-validated, `name` hub-generated."""
+    script = f'umask 077; mkdir -p {PASTE_DIR} && cat > {PASTE_DIR}/{name}'
+    return f'sudo -n docker exec -i -u dev {shlex.quote('ws-' + agent_id)} sh -c {shlex.quote(script)}'
+
+
+async def store_paste(conn, media_type, data, agent_id=None):
+    """Write a validated image to the terminal target (agent container over `conn`, or the VM by SFTP); returns its path."""
+    validate_image(media_type, data)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    name = f'paste-{stamp}-{secrets.token_hex(4)}.{MEDIA_TYPES[media_type]}'
+    path = f'{PASTE_DIR}/{name}'
+    if agent_id:
+        result = await conn.run(paste_command(agent_id, name), input=data, check=False, encoding=None)
+        if result.returncode:
+            raise OSError('Could not write the image in the agent container')
+    else:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(PASTE_DIR, exist_ok=True)
+            await sftp.chmod(PASTE_DIR, 0o700)
+            async with sftp.open(path, 'wb') as out:
+                await out.write(data)
+    return path
 
 
 def use_spool_dir(path):

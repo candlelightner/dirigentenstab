@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from nicegui import app, ui
 from websockets.sync.server import serve
+from pydantic_ai.messages import BinaryContent
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from dirigentenstab import runtime as runtime_module
@@ -215,6 +216,7 @@ class FixtureService(Service):
         return conn, {'id': vm_id, 'name': 'research-vm'}
 
     shell_server = None
+    paste_dir = None
 
     async def open_agent_shell(self, identity, agent_id, progress=None):
         # Stand-in for the shell host: a local echo shell, still behind the real authorization and host resolution.
@@ -224,7 +226,13 @@ class FixtureService(Service):
             raise ValueError('No agent shell host is configured')
         if not self.shell_server:
             async def shell(process):
-                process.stdout.write('agent-shell-ready\r\n')
+                if 'dirigentenstab-pastes' in (process.command or '') and 'docker exec' in process.command:
+                    # Stand-in for the container: keep what the fixed paste command would write.
+                    name = process.command.rsplit('/', 1)[-1].rstrip("'")
+                    (self.paste_dir / name).write_bytes(await process.stdin.read())
+                    process.exit(0)
+                    return
+                process.stdout.write(b'agent-shell-ready\r\n')
                 while True:
                     try:
                         data = await process.stdin.read(1024)
@@ -239,7 +247,7 @@ class FixtureService(Service):
                     return False
 
             self.shell_server = await asyncssh.create_server(
-                Server, '127.0.0.1', 0, server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')], process_factory=shell)
+                Server, '127.0.0.1', 0, server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')], process_factory=shell, encoding=None)
         self.store.audit(identity['userid'], 'open-agent-shell', agent_id)
         conn = await asyncssh.connect('127.0.0.1', self.shell_server.get_port(), username='dirigent',
                                       known_hosts=None, config=None, agent_path=None)
@@ -283,6 +291,9 @@ async def fake_model(messages, info):
                    if part.part_kind == 'user-prompt'), '')
     if 'Summarize the user request' in str(info.instructions):
         yield 'Summarized Chat Title'
+    elif seen := [item.media_type for message in messages[-1:] for part in message.parts if part.part_kind == 'user-prompt'
+                  and isinstance(part.content, list) for item in part.content if isinstance(item, BinaryContent)]:
+        yield 'Image received: ' + ', '.join(seen)
     elif 'escalation fixture' in prompt:
         requested = any(part.part_kind == 'tool-return' and part.tool_name == 'request_escalation'
                         for message in messages for part in message.parts)
@@ -403,6 +414,8 @@ def main():
                         cloudstack_ui_url='https://cloudstack.tailnet.invalid/client', gpu_helper_socket='/fixture-gpu')
     service = FixtureService(store, settings)
     service.sftp_root = args.state_dir / 'vm-files'
+    service.paste_dir = args.state_dir / 'agent-pastes'
+    service.paste_dir.mkdir()
     (service.sftp_root / 'docs').mkdir(parents=True)
     (service.sftp_root / 'docs' / 'report.txt').write_text('fixture report\n')
     (service.sftp_root / f'long-name-{"x" * 120}.txt').write_text('long\n')

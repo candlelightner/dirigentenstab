@@ -31,6 +31,7 @@ PARAM_NAME = re.compile(r'^[a-z][a-z0-9]*(?:\[\d{1,3}\]\.[a-z][a-z0-9]*)?$')
 def redact(value, secrets=()):
     if isinstance(value, dict):
         return {k: v if TOKEN_COUNT.fullmatch(str(k)) and type(v) is int and v >= 0
+                or k == 'data' and value.get('kind') == 'binary'  # base64 image payload: redaction must not corrupt it
                 else '[redacted]' if SENSITIVE_FIELD.search(str(k)) else redact(v, secrets)
                 for k, v in value.items()}
     if isinstance(value, list):

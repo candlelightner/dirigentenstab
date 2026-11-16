@@ -15,6 +15,7 @@ from pydantic_ai import Agent, RunContext, capture_run_messages
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
+    BinaryContent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessagesTypeAdapter,
@@ -42,6 +43,7 @@ from .gpu import GPU_COMMANDS, GPU_CONTEXT, helper_call, operation_id as gpu_ope
 from .mcp import MCP
 from .mcp_tools import RemoteTools
 from . import thinking
+from .images import validate_images
 from .compaction import CompactionModel
 
 
@@ -960,8 +962,9 @@ class Runtime:
 
         return agent
 
-    async def submit(self, identity, agent_id, conversation_id, prompt, on_event=None):
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32768:
+    async def submit(self, identity, agent_id, conversation_id, prompt, on_event=None, images=()):
+        images = validate_images(images)
+        if not isinstance(prompt, str) or len(prompt) > 32768 or not (prompt.strip() or images):
             raise ValueError('Message must contain 1–32768 characters')
         await self.service.authorize(identity, agent_id)
         if conversation_id:
@@ -983,7 +986,9 @@ class Runtime:
             row = self.service.store.one('SELECT messages FROM conversations WHERE id=?', (conversation_id,))
             history = load_history(self.service.store.open(row['messages'])) if row else []
             prompt = self.service.redact(prompt)
-            history.append(ModelRequest(parts=[UserPromptPart(prompt)]))
+            history.append(ModelRequest(parts=[UserPromptPart(
+                [*([prompt] if prompt.strip() else []), *(BinaryContent(data=data, media_type=kind) for kind, data in images)]
+                if images else prompt)]))
             saved = self.service.redact(json.loads(ModelMessagesTypeAdapter.dump_json(history)))
             now = time.time()
             with self.service.store.connect() as conn:
@@ -992,11 +997,11 @@ class Runtime:
                                  (self.service.store.seal(saved), conversation_id))
                 else:
                     conn.execute('INSERT INTO conversations(id,agent_id,human_id,title,created,messages) VALUES(?,?,?,?,?,?)',
-                                 (conversation_id, agent_id, identity['userid'], prompt[:80], now, self.service.store.seal(saved)))
+                                 (conversation_id, agent_id, identity['userid'], prompt[:80] or 'Image', now, self.service.store.seal(saved)))
                 operation_id = self._new_run(conn, agent_id, conversation_id, now)
             run = self.service.store.one('SELECT * FROM chat_runs WHERE id=?', (operation_id,))
             self._launch(run, on_event)
-            if not row:
+            if not row and prompt.strip():
                 asyncio.create_task(self._summarize_title(conversation_id, prompt))
         return {'conversation_id': conversation_id, 'operation_id': operation_id, 'status': 'running'}
 
