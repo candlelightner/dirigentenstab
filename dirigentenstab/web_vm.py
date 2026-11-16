@@ -6,7 +6,8 @@ import time
 import asyncssh
 from nicegui import ui
 
-from .files import MAX_UPLOAD, UPLOAD_LIMIT_TEXT, store_upload
+from .files import MAX_UPLOAD, UPLOAD_LIMIT_TEXT, store_paste, store_upload
+from .images import ACCEPT, MAX_IMAGE_BYTES
 from .web_sidebar import agent_label
 
 
@@ -110,6 +111,7 @@ def build_vm_view(ctx):
                 ctx.console_status = ui.label('').classes('text-xs text-stone-600 truncate').mark('console_status').props('role=status')
                 ctx.console_status.set_visibility(False)
             with ui.row().classes('items-center gap-1 no-wrap'):
+                ctx.upload_image_btn = ui.button(icon='image').props('flat round dense aria-label="Upload image"').mark('terminal_upload_image')
                 ctx.popout_btn = ui.button(icon='open_in_new', on_click=lambda: protect(ctx.popout_console)).props(
                     'flat round dense aria-label="Open console in new tab"').mark('console_popout')
                 ctx.popout_btn.set_visibility(False)
@@ -125,7 +127,14 @@ def build_vm_view(ctx):
                     f'flat dense no-caps aria-label="{name}"' + (' aria-pressed=false' if label in {'Ctrl', 'Alt'} else '')).mark(
                     'key_' + name.split()[0].lower())
                 button.on('mousedown', js_handler='(e) => e.preventDefault()')  # keep xterm focused so the soft keyboard stays up
-        with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').mark('terminal_container') as ctx.terminal_container:
+        ctx.terminal_image_upload = ui.upload(multiple=True, auto_upload=True, max_file_size=MAX_IMAGE_BYTES,
+                                              on_multi_upload=lambda e: protect(lambda: ctx.paste_images(e.files)),
+                                              on_rejected=lambda: ui.notify('Image too large (limit 5 MiB)', type='negative'),
+                                              ).props(f'accept="{ACCEPT}"').classes('hidden')
+        ctx.terminal_image_upload.on('failed', lambda: ui.notify('Image upload failed', type='negative'))
+        ctx.upload_image_btn.on('click', js_handler=f'() => dsImages.pick({ctx.terminal_image_upload.id})')
+        with ui.element('div').classes('terminal-container w-full flex-1 min-h-0 min-w-0 bg-black rounded overflow-hidden').props(
+                f'data-ds-upload={ctx.terminal_image_upload.id}').mark('terminal_container') as ctx.terminal_container:
             ctx.term = ui.xterm(options={'cursorBlink': True, 'theme': {'background': '#000000'}}).classes('w-full h-full').mark('xterm')
         ctx.console_frame = ui.element('iframe').classes('console-frame bg-black rounded').props(
             'title="VM console" src="about:blank" allow="clipboard-read; clipboard-write"').mark('console_frame')
@@ -343,7 +352,7 @@ def setup_vm(ctx):
         chat_visible(False)
         for element in (ctx.terminal_mode, ctx.console_status, ctx.console_frame, ctx.popout_btn, ctx.files_pane):
             element.set_visibility(False)
-        for element in (ctx.terminal_status, ctx.terminal_container, ctx.key_bar, ctx.terminal_pane):
+        for element in (ctx.terminal_status, ctx.terminal_container, ctx.key_bar, ctx.terminal_pane, ctx.upload_image_btn):
             element.set_visibility(True)
         ctx.terminal_error.set_visibility(False)
         ctx.reconnect_btn.enable()
@@ -547,6 +556,25 @@ def setup_vm(ctx):
             await ctx.list_dir(ctx.files_dir)
     ctx.upload_files = upload_files
 
+    async def paste_images(uploads):
+        """Store each image on the connected target, then paste its path (and a space) through xterm so bracketed paste applies."""
+        session, agent_id = active_session, state.get('terminal_agent')
+        try:
+            if not session or not session.chan or session.chan.is_closing() or session.vm_id != terminal_target():
+                raise ConnectionError('Terminal is not connected')
+            current = await actor()
+            if agent_id:
+                await service.authorize(current, agent_id)
+            paths = [await store_paste(session.conn, upload.content_type, await upload.read(), agent_id) for upload in uploads]
+            service.store.audit(current['userid'], 'terminal-image-paste', session.vm_id)
+            ctx.term.run_terminal_method('paste', ' '.join(paths) + ' ')
+            ctx.terminal_status.set_text(ctx.terminal_status.text.split(' · Image')[0] + f' · Image uploaded ({len(paths)})')
+        except (OSError, ValueError, ConnectionError, asyncssh.Error) as exc:
+            ui.notify(str(exc), type='negative')
+        finally:
+            ctx.terminal_image_upload.reset()
+    ctx.paste_images = paste_images
+
     async def switch_terminal_mode(mode):
         console, files = mode == 'console', mode == 'files'
         ctx.sync_url()
@@ -559,6 +587,7 @@ def setup_vm(ctx):
         ctx.terminal_status.set_visibility(not console)
         ctx.terminal_container.set_visibility(mode == 'ssh')
         ctx.key_bar.set_visibility(mode == 'ssh')
+        ctx.upload_image_btn.set_visibility(mode == 'ssh')
         ctx.files_pane.set_visibility(files)
         ctx.reconnect_btn.enable()
         ctx.disconnect_btn.set_enabled(console or files or bool(active_session))

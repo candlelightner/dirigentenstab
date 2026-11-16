@@ -211,7 +211,7 @@ async def test_real_ui_direct_chat_and_callback_reauthentication(monkeypatch, ca
             self.restored.append(conversation_id)
             return self.rows[conversation_id]
 
-        async def submit(self, identity, agent_id, conversation_id, prompt):
+        async def submit(self, identity, agent_id, conversation_id, prompt, images=()):
             self.sent.append((identity['userid'], agent_id, prompt))
             conversation_id = conversation_id or f'conversation-{len(self.rows)}'
             row = {'id': conversation_id, 'agent_id': agent_id, 'title': prompt, 'messages': [],
@@ -670,7 +670,7 @@ async def test_stop_agent_cancels_owned_run_preserves_partial_reply_and_restores
                 'runs': [{'id': 'operation', 'status': self.status, 'events': [],
                           'budget': {'reason': 'stopped', 'resumable': self.status == 'interrupted'}}]}
 
-        async def submit(self, current, agent_id, conversation_id, prompt):
+        async def submit(self, current, agent_id, conversation_id, prompt, images=()):
             return {'conversation_id': 'conversation', 'operation_id': 'operation', 'status': 'running'}
 
         async def stop(self, current, operation_id):

@@ -13,6 +13,7 @@ from .console import ConsoleProxy
 from .diagnostics import diagnose
 from .mcp_export import Exports
 from .files import VMFiles, use_spool_dir
+from .images import HELPER_JS as IMAGE_HELPER_JS
 from .platform_status import banner
 from .runtime import Runtime
 from .settings import Settings
@@ -106,7 +107,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
                     ui.notify(str(error), type='negative', timeout=15000, close_button=True)
 
         agents = {row['id']: row for row in data.get('agents', [])}
-        state = {'agent': None, 'conversation': None, 'busy': False, 'indicator': 'Thinking…', 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}}
+        state = {'agent': None, 'conversation': None, 'busy': False, 'indicator': 'Thinking…', 'data': data, 'imported': False, 'active_operation': None, 'submitting': False, 'activity_token': None, 'drafts': {}, 'attachments': {}}
         ctx = SimpleNamespace(service=service, auth=auth, runtime=runtime, console_proxy=console_proxy,
                              vm_files=vm_files, client=client, token=token, identity=identity, data=data,
                              state=state, agents=agents, actor=actor, protect=protect)
@@ -198,6 +199,7 @@ margin-top:1.5rem;color:#78716c}[role=alert]{color:#b91c1c}</style></head><body>
             .brand-user{display:none}.q-header{padding:8px!important}.nicegui-content{height:calc(var(--viewport-height,100dvh) - 61px)}
             .q-message-name{font-size:12px}.q-message{margin-bottom:6px}}
         """)
+        ui.add_body_html(IMAGE_HELPER_JS)
         # Resize the bounded workspace with the mobile visual viewport (including the virtual keyboard).
         ui.add_body_html("""<script>
             (() => { const fit = () => { const el=document.querySelector('.workspace');

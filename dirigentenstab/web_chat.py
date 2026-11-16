@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 from nicegui import ui
 
 from . import thinking
+from .images import ACCEPT, MAX_IMAGE_BYTES, MEDIA_TYPES, data_url, validate_images
 from .diagnostics import diagnose
 from .web_sidebar import agent_label, mark_attention
 
@@ -44,6 +45,9 @@ def pause_reason(*sources):
     return None
 
 
+URLSAFE_TO_STANDARD = str.maketrans('-_', '+/')  # saved binary payloads are URL-safe base64; data URLs need the standard alphabet
+
+
 def history_parts(history):
     """Keep chronological messages and correlated tools, including pre-v0.1.3 histories."""
     saved = {(e['type'], e.get('call_id')): e for run in history.get('runs', []) for e in run['events']}
@@ -60,11 +64,16 @@ def history_parts(history):
                     or kind == 'system-prompt' and part.get('dynamic_ref') == 'compute_offering_decision'):
                 yield 'notice', 'Compute offering approved and now available.'
             elif kind in {'user-prompt', 'text'}:
-                text = str(part.get('content', ''))
+                content = part.get('content', '')
+                images = [(item['media_type'], item['data'].translate(URLSAFE_TO_STANDARD)) for item in content if isinstance(item, dict)
+                          and item.get('kind') == 'binary' and item.get('media_type') in MEDIA_TYPES] if isinstance(content, list) else []
+                text = '\n'.join(item for item in content if isinstance(item, str)) if isinstance(content, list) else str(content)
                 if kind == 'text':
                     text = thinking.visible_text(text)
-                if text or kind == 'user-prompt':
+                if text or kind == 'user-prompt' and not images:
                     yield 'human' if kind == 'user-prompt' else 'agent', text
+                if images:
+                    yield 'images', images
             elif kind in {'tool-call', 'tool-return'}:
                 event_type = 'tool_call' if kind == 'tool-call' else 'tool_result'
                 key = (event_type, part.get('tool_call_id'))
@@ -183,7 +192,16 @@ def build_chat_view(ctx):
                     state, 'indicator', lambda text: text == 'Thinking…'):
                 for dot in range(3):
                     ui.element('span').classes('thinking-dot').style(f'animation-delay:{dot * .15}s')
-        with ui.row().classes('composer gap-2'):
+        ctx.attachment_row = ui.row().classes('w-full items-center gap-1')
+        ctx.attachment_row.shown = None
+        ctx.image_upload = ui.upload(multiple=True, auto_upload=True, max_file_size=MAX_IMAGE_BYTES,
+                                     on_multi_upload=lambda e: ctx.attach_images(e.files),
+                                     on_rejected=lambda: ui.notify('Image too large (limit 5 MiB)', type='negative'),
+                                     ).props(f'accept="{ACCEPT}"').classes('hidden')
+        ctx.image_upload.on('failed', lambda: ui.notify('Image upload failed', type='negative'))
+        with ui.row().classes('composer gap-2').props(f'data-ds-upload={ctx.image_upload.id}'):
+            ctx.attach_button = ui.button(icon='image').props('flat round aria-label="Attach image"').mark('attach_image')
+            ctx.attach_button.on('click', js_handler=f'() => dsImages.pick({ctx.image_upload.id})')
             ctx.prompt = ui.textarea(label='Message', placeholder='Give this agent a task').props(
                 'outlined autogrow rows=1 maxlength=16000 dense').classes('flex-1 min-w-0')
             ctx.send_button = ui.button(icon='send').props('aria-label="Send"').mark('Send')
@@ -205,14 +223,47 @@ def setup_chat(ctx):
     ctx.sync_run_details = sync_run_details
 
     def sync_composer():
-        has_text = bool((ctx.prompt.value or '').strip())
+        images = state['attachments'].get((state['agent'], state['conversation']), [])
+        has_text = bool((ctx.prompt.value or '').strip() or images)
         readonly = bool(state.get('readonly'))
         show_stop = bool(state['busy']) and not has_text and not readonly
         ctx.stop_button.set_visibility(show_stop)
         ctx.send_button.set_visibility(not show_stop)
         ctx.send_button.set_enabled(has_text and not state['submitting'] and not readonly)
         ctx.prompt.set_enabled(not readonly)
+        ctx.attach_button.set_enabled(not readonly)
+        shown = [id(item) for item in images]
+        if shown != ctx.attachment_row.shown:
+            ctx.attachment_row.shown = shown
+            ctx.attachment_row.clear()
+            with ctx.attachment_row:
+                for number, item in enumerate(images, 1):
+                    with ui.chip(removable=True).props(f'remove-aria-label="Remove image {number}"').on(
+                            'remove', lambda _, item=item: remove_image(item)).classes('attachment'):
+                        ui.element('img').props(f'src="{data_url(item["media_type"], item["data"])}" alt="Image {number}"').classes(
+                            'w-8 h-8 object-cover rounded')
+        ctx.attachment_row.set_visibility(bool(images))
         ctx.prompt.props(f'placeholder="{"Read-only log of MCP calls" if readonly else "Give this agent a task"}"')
+
+    def remove_image(item):
+        images = state['attachments'].get((state['agent'], state['conversation']), [])
+        if item in images:
+            images.remove(item)
+        sync_composer()
+
+    async def attach_images(files):
+        images = state['attachments'].setdefault((state['agent'], state['conversation']), [])
+        for file in files:
+            data = await file.read()
+            try:
+                validate_images([*((i['media_type'], i['data']) for i in images), (file.content_type, data)])
+            except ValueError as exc:
+                ui.notify(str(exc), type='negative')
+                continue
+            images.append({'media_type': file.content_type, 'data': data})
+        ctx.image_upload.reset()
+        sync_composer()
+    ctx.attach_images = attach_images
 
     ctx.prompt.on_value_change(lambda _: sync_composer())
     sync_composer()
@@ -244,10 +295,24 @@ def setup_chat(ctx):
             ui.label(json.dumps(event.get('content'), ensure_ascii=False, default=str)[:16384]).classes(
                 'whitespace-pre-wrap font-mono text-xs break-all')
 
+    def show_image(url):
+        with ui.dialog() as dialog, ui.card().style('width:900px;max-width:90vw'):
+            ui.element('img').props(f'src="{url}" alt="Image"').classes('chat-image-large w-full')
+        dialog.on('hide', dialog.delete)
+        dialog.open()
+
     def message(kind, content):
         with ctx.transcript:
             if kind == 'notice':
                 return ui.label(content).classes('w-full text-center text-sm text-stone-500').props('role=status')
+            if kind == 'images':
+                with ui.chat_message(name='You', sent=True).classes('w-full max-w-full'):
+                    with ui.row().classes('gap-2') as row:
+                        for media_type, encoded in content:
+                            ui.element('img').props(f'src="data:{media_type};base64,{encoded}" alt="Open image"').classes(
+                                'chat-image w-28 h-28 object-cover rounded cursor-pointer').on(
+                                'click', lambda _, url=f'data:{media_type};base64,{encoded}': show_image(url))
+                return row
             if kind == 'tool':
                 with ui.expansion('Tool activity', icon='terminal').classes('w-full bg-stone-50 rounded'):
                     ui.label(content[:65536]).classes('whitespace-pre-wrap font-mono text-xs break-all')
@@ -609,7 +674,8 @@ def setup_chat(ctx):
 
     async def send():
         text = (ctx.prompt.value or '').strip()
-        if state['submitting'] or not state['agent'] or not text:
+        images = list(state['attachments'].get((state['agent'], state['conversation']), []))
+        if state['submitting'] or not state['agent'] or not (text or images):
             return
         state['submitting'] = True
         sync_composer()
@@ -617,7 +683,9 @@ def setup_chat(ctx):
         try:
             current = await actor()
             await service.authorize(current, agent_id)
-            result = await runtime.submit(current, agent_id, conversation_id, text)
+            result = await runtime.submit(current, agent_id, conversation_id, text,
+                                          images=[(i['media_type'], i['data']) for i in images])
+            state['attachments'].pop((agent_id, conversation_id), None)
             if state['agent'] == agent_id and state['conversation'] == conversation_id:
                 ctx.prompt.set_value('')
                 state['drafts'].pop((agent_id, conversation_id), None)

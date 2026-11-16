@@ -381,14 +381,14 @@ async def test_mobile_deep_agent_switch_markdown_keyboard_and_models(browser_app
         message = page.get_by_label('Message', exact=True)
         assert await message.is_visible()
         assert await page.get_by_role('button', name='Send', exact=True).is_disabled()
-        assert (await message.bounding_box())['x'] < 60
+        assert (await message.bounding_box())['x'] < 100
         for name in ('Team 11 Level 3', 'Team 2 Level 3'):
             try:
                 await select_agent(page, name)
             except Exception:
                 await page.screenshot(path=str(state / 'selection-failure.png'), full_page=True)
                 raise
-            assert (await message.bounding_box())['x'] < 60
+            assert (await message.bounding_box())['x'] < 100
             assert await page.evaluate('window.scrollY === 0')
         await select_agent(page, 'Team 2 Level 3')  # re-selecting the open agent closes the drawer too
         await open_configuration(page)
@@ -2258,4 +2258,99 @@ async def test_configure_shows_shell_image_source_and_owner_edit_saves(browser_a
         await page.get_by_text('Set on this agent.', exact=True).wait_for()
         await playwright.expect(page.get_by_label('apt packages (Ubuntu, one per line)')).to_have_value('jq\nripgrep')
         await playwright.expect(page.get_by_label('npm global packages')).to_have_value('typescript')
+        await browser.close()
+
+
+def png(width, height):
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+    rows = b''.join(b'\x00' + b'\x20\x80\xc0' * width for _ in range(height))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+
+
+PASTE_IMAGE_JS = """([selector, bytes, name]) => {
+    const data = new DataTransfer(); data.items.add(new File([new Uint8Array(bytes)], name, {type: 'image/png'}));
+    document.querySelector(selector).dispatchEvent(new ClipboardEvent('paste', {clipboardData: data, bubbles: true, cancelable: true}));
+}"""
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_chat_attach_paste_remove_send_and_view_images(browser_app, width, height):
+    url, _ = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        await login(page, url)
+        send = page.get_by_role('button', name='Send', exact=True)
+        attach = page.get_by_role('button', name='Attach image', exact=True)
+        box = await attach.bounding_box()
+        assert (round(box['width']), round(box['height'])) == (44, 44)
+        small = png(4, 4)
+        await page.locator('.conversation input[type=file]').set_input_files(
+            files=[{'name': 'one.png', 'mimeType': 'image/png', 'buffer': small}])
+        chips = page.locator('.attachment')
+        await chips.first.wait_for()
+        await playwright.expect(send).to_be_enabled()  # an image alone is enough
+        await page.get_by_role('button', name='Remove image 1', exact=True).click()
+        await playwright.expect(chips).to_have_count(0)
+        await playwright.expect(send).to_be_disabled()
+        # Text paste is untouched; an image paste is queued, downscaled from 2000 px to 1568 px.
+        await page.get_by_label('Message', exact=True).click()
+        await page.evaluate(PASTE_IMAGE_JS, ['.composer textarea', list(png(2000, 1000)), 'screenshot.png'])
+        await chips.first.wait_for()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        assert await page.evaluate('[...document.querySelectorAll(".conversation, .messages")].every(e => e.scrollWidth <= e.clientWidth)')
+        await page.get_by_label('Message', exact=True).fill('What is this?')
+        await send.click()
+        await page.get_by_text('Image received: image/png', exact=True).wait_for()
+        await playwright.expect(chips).to_have_count(0)
+        thumbnail = page.locator('.chat-image').first
+        await thumbnail.wait_for()
+        await page.get_by_text('What is this?', exact=True).wait_for()
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
+        await thumbnail.click()
+        large = page.locator('.chat-image-large').last
+        await large.wait_for()
+        await large.evaluate('el => el.decode()')
+        assert await large.evaluate('el => el.naturalWidth') == 1568
+        await page.keyboard.press('Escape')
+        # The conversation survives a reload with its image.
+        await page.reload()
+        await page.wait_for_function('window.socket?.connected && window.did_handshake')
+        await page.locator('.chat-image').first.wait_for()
+        await browser.close()
+
+
+@pytest.mark.parametrize('width,height', [(1440, 900), (390, 844)])
+async def test_agent_terminal_image_upload_and_paste_writes_file_and_pastes_path(browser_app, width, height):
+    url, state = browser_app
+    async with playwright.async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(ignore_https_errors=True, viewport={'width': width, 'height': height})
+        await login(page, url)
+        await choose_shell_host(page)
+        await page.get_by_label('Agent view', exact=True).get_by_text('Terminal', exact=True).click()
+        pane = page.locator('.terminal-pane')
+        await pane.get_by_text('Connected: Main Agent', exact=True).wait_for()
+        await page.locator('.terminal-container .xterm-rows').get_by_text('agent-shell-ready').wait_for()
+        await playwright.expect(pane.get_by_role('button', name='Upload image', exact=True)).to_be_visible()
+        await pane.locator('input[type=file][accept*="image/png"]').set_input_files(
+            files=[{'name': 'x.png', 'mimeType': 'image/png', 'buffer': png(4, 4)}])
+        rows = page.locator('.terminal-container .xterm-rows')
+        await rows.get_by_text(re.compile(r'/tmp/dirigentenstab-pastes/paste-\d{8}T\d{6}Z-[0-9a-f]{8}\.png')).wait_for()
+        await pane.get_by_text(re.compile('Image uploaded')).wait_for()
+        files = list((state / 'agent-pastes').iterdir())
+        assert len(files) == 1 and files[0].read_bytes() == png(4, 4)
+        # A pasted image file is intercepted too.
+        await page.evaluate(PASTE_IMAGE_JS, ['.terminal-container .xterm-helper-textarea', list(png(8, 8)), 'image.png'])
+        for _ in range(50):
+            if len(list((state / 'agent-pastes').iterdir())) == 2:
+                break
+            await page.wait_for_timeout(100)
+        assert len(list((state / 'agent-pastes').iterdir())) == 2
+        assert await page.evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth')
         await browser.close()

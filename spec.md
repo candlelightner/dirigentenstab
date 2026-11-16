@@ -151,6 +151,18 @@ account or registration system; roles come solely from CloudStack.
   must not interrupt any other conversation.
   Ctrl+Enter (Cmd+Enter on macOS) in the message field sends, like Send; plain
   Enter inserts a newline.
+- Chat messages may carry images: an icon-only **Attach image** button, pasting an image into the
+  message field (text paste is unchanged) or dropping files on the composer queues PNG, JPEG, GIF
+  or WebP files as removable thumbnail chips, kept per draft and cleared after a successful send.
+  The browser downscales an image whose long edge exceeds 1568 px (JPEG 0.85, PNG stays PNG unless
+  still over 4 MiB; GIFs pass through) and uploads it over NiceGUI's HTTP upload, never the
+  websocket. The hub never trusts the browser: at most 4 images per message, each at most 5 MiB,
+  declared type allowed and confirmed by magic bytes; text may be empty only when an image is
+  attached. Images are stored in the sealed conversation (secret redaction skips the base64
+  payload), sent to the model as image parts (a non-vision model's provider error is shown like any
+  run error), shown as thumbnails in the transcript that open larger in a dialog, and appear as an
+  `[image]` placeholder in compaction input and the token estimate. An image-only conversation is
+  titled `Image`.
 - Keep an explicit Stop control. It stops only the current conversation and
   preserves completed work. It does not stop the agent's other conversations.
 - An already-submitted remote operation may finish after interruption. Preserve
@@ -410,6 +422,14 @@ current compaction settings.
   formatted owned by the remapped uid 1000. On touch or narrow screens a key
   bar (Esc, Tab, Ctrl and Alt that arm for one key on a tap and lock on a double tap until tapped again, arrows, `| ~ / -`) sits above every SSH terminal; modifiers
   are applied by the server to typed characters and key-bar keys (double tap = within 400 ms, measured server-side).
+- Images can be pasted (an image file in the clipboard, intercepted only then), dropped or picked with an
+  **Upload image** button in the SSH terminal of an agent shell or a VM (not the CloudStack console or Files). The browser
+  downscales and uploads over HTTP exactly as in chat and the hub applies the same validation. The hub writes the
+  file as `/tmp/dirigentenstab-pastes/paste-<UTC time>-<random>.<ext>` (hub-generated name): in the agent's
+  container with the fixed command `sudo -n docker exec -i -u dev ws-<id> sh -c 'umask 077; mkdir -p … && cat > …'`
+  over the existing managed connection, or on the VM by SFTP over the session's connection, audited as
+  `terminal-image-paste`. It then pastes the absolute path and a space through xterm.js `paste()` so bracketed paste
+  is honored and harnesses such as Claude Code or Codex attach the image.
 - Shell images are a structured per-agent spec (`agents.shell_image`), never Dockerfile text: the hub
   renders a Dockerfile from a fixed template (`FROM dirigentenstab-shell:latest`, apt repos, one
   `apt-get install`, npm globals, pipx tools, `/opt/extra` downloads) with every value strictly validated and
